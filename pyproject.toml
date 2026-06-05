@@ -7,7 +7,7 @@ requires-python = ">=3.9"
 dependencies = []
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.10.0"]
+mcp = ["mcp>=1.10.0; python_version >= '3.10'"]
 pdf = ["pypdf>=5.0.0"]
 
 [project.scripts]
@@ -16,4 +16,3 @@ kb = "kb_agent.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["kb_agent*"]
-

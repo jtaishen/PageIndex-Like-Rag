@@ -50,7 +50,7 @@ uv sync --extra pdf
 
 ```bash
 uv sync --extra mcp --extra pdf
-uv run python -m kb_agent.mcp_server
+uv run --extra mcp python -m kb_agent.mcp_server
 ```
 
 ## DeepSeek 配置
@@ -82,6 +82,11 @@ python3 -m kb_agent.cli ask "memory write gate 是什么？" --no-llm
 ```
 
 OpenCode 配置见 [opencode.json](/Users/jtai/Desktop/PageIndex-Like-Rag/opencode.json)。
+项目默认模型已设置为：
+
+```text
+deepseek/deepseek-v4-pro
+```
 
 DeepSeek 官方 OpenCode 接入方式：
 
