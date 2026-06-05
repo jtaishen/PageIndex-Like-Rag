@@ -40,9 +40,12 @@ def main(argv: Any = None) -> None:
     evidence_parser.add_argument("doc_id")
     evidence_parser.add_argument("node_ids", nargs="+")
 
-    ask_parser = subparsers.add_parser("ask", help="Return grounded evidence for a question")
+    ask_parser = subparsers.add_parser("ask", help="Answer a question using grounded evidence")
     ask_parser.add_argument("query")
     ask_parser.add_argument("--top-k", type=int, default=6)
+    ask_parser.add_argument("--no-llm", action="store_true", help="Only print evidence; do not call DeepSeek")
+    ask_parser.add_argument("--require-llm", action="store_true", help="Fail if DeepSeek cannot be called")
+    ask_parser.add_argument("--json", action="store_true", help="Print full JSON result")
 
     mem_put_parser = subparsers.add_parser("memory-put", help="Store explicit long-term memory")
     mem_put_parser.add_argument("scope")
@@ -73,8 +76,19 @@ def main(argv: Any = None) -> None:
     elif args.command == "evidence":
         _print_json([packet.to_dict() for packet in get_evidence(db_path, args.doc_id, args.node_ids)])
     elif args.command == "ask":
-        result = answer_query(db_path, args.query, top_k=args.top_k)
-        print(result["answer"])
+        result = answer_query(
+            db_path,
+            args.query,
+            top_k=args.top_k,
+            use_llm=not args.no_llm,
+            require_llm=args.require_llm,
+        )
+        if args.json:
+            _print_json(result)
+        else:
+            print(result["answer"])
+            if result.get("llm_error"):
+                print(f"\nDeepSeek 调用失败：{result['llm_error']}")
     elif args.command == "memory-put":
         _print_json(
             put_memory(
@@ -126,4 +140,3 @@ def _print_json(payload: object) -> None:
 
 if __name__ == "__main__":
     main()
-

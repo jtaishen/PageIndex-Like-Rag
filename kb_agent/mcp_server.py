@@ -57,9 +57,14 @@ if FastMCP is not None:
         ]
 
     @mcp.tool()
-    def kb_answer(query: str, top_k: int = 6, db_path: Optional[str] = None) -> Dict[str, Any]:
+    def kb_answer(
+        query: str,
+        top_k: int = 6,
+        use_llm: bool = True,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Return a grounded answer draft plus evidence packets."""
-        return answer_query(resolve_db_path(db_path), query, top_k=top_k)
+        return answer_query(resolve_db_path(db_path), query, top_k=top_k, use_llm=use_llm)
 
     @mcp.tool()
     def memory_put(
@@ -105,4 +110,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -39,10 +39,9 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(len(evidence), 1)
             self.assertIn("Agent Memory", evidence[0].node_path)
 
-            answer = answer_query(db_path, "What does it store?", top_k=2)
+            answer = answer_query(db_path, "What does it store?", top_k=2, use_llm=False)
             self.assertIn("证据", answer["answer"])
 
 
 if __name__ == "__main__":
     unittest.main()
-

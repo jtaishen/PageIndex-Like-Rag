@@ -53,7 +53,43 @@ uv sync --extra mcp --extra pdf
 uv run python -m kb_agent.mcp_server
 ```
 
+## DeepSeek 配置
+
+`kb ask` 会优先读取本地 `.env` 或系统环境变量中的 DeepSeek 配置。不要把真实 API key 提交到 GitHub。
+
+```bash
+cp .env.example .env
+```
+
+然后编辑 `.env`：
+
+```text
+DEEPSEEK_API_KEY=sk-your-key-here
+DEEPSEEK_MODEL=deepseek-v4-pro
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+```
+
+配置后运行：
+
+```bash
+python3 -m kb_agent.cli ask "这些文章关于 memory 的核心观点是什么？"
+```
+
+如果只想看证据、不调用模型：
+
+```bash
+python3 -m kb_agent.cli ask "memory write gate 是什么？" --no-llm
+```
+
 OpenCode 配置见 [opencode.json](/Users/jtai/Desktop/PageIndex-Like-Rag/opencode.json)。
+
+DeepSeek 官方 OpenCode 接入方式：
+
+1. 在项目目录执行 `opencode`。
+2. 在 OpenCode 输入框输入 `/connect`。
+3. 输入并选择 `deepseek` provider。
+4. 粘贴 DeepSeek API key。
+5. 选择 `DeepSeek-V4-Pro` 模型。
 
 ## OpenCode 使用方式
 
@@ -77,4 +113,3 @@ python3 -m unittest discover -s tests
 - 增加 doc_card、innovation.json、citation_map.json。
 - 增加跨论文比较和综述任务工件。
 - 加入 memory write gate、TTL、去重、压缩和 OpenCode plugin hook。
-
