@@ -1,0 +1,19 @@
+[project]
+name = "pageindex-like-rag"
+version = "0.1.0"
+description = "A local PageIndex-like paper knowledge base MVP for OpenCode."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.10.0"]
+pdf = ["pypdf>=5.0.0"]
+
+[project.scripts]
+kb = "kb_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kb_agent*"]
+

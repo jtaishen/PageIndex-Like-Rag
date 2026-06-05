@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "paper-kb": {
+      "type": "local",
+      "command": ["uv", "run", "python", "-m", "kb_agent.mcp_server"],
+      "enabled": true
+    }
+  }
+}
+
