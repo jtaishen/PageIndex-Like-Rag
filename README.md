@@ -17,6 +17,7 @@ parse -> normalize -> tree -> artifacts -> indexes -> evidence packet -> CLI / M
 - 使用 SQLite FTS5 做全文检索。
 - 返回带 `doc_id`、`node_id`、`node_path`、页码和 excerpt 的 evidence packet。
 - 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`extract`、`innovations`、`citations`。
+- 支持跨论文比较和综述规划任务工件，生成比较矩阵、综述大纲、章节证据表和下一步行动。
 - 提供可选 MCP server，供 OpenCode 调用。
 
 ## 快速开始
@@ -85,6 +86,41 @@ uv run python -m kb_agent.cli innovations <doc_id>
 uv run python -m kb_agent.cli citations <doc_id>
 ```
 
+## v0.5 跨论文比较与综述任务工件
+
+v0.5 将单篇论文工件升级为多论文任务工件。默认数据库下，任务运行态文件会写入项目根目录的 `.kb_state/`，该目录不提交到 Git。
+
+先同步真实论文并抽取单篇理解工件：
+
+```bash
+uv run --extra pdf python -m kb_agent.cli sync articles --force
+uv run python -m kb_agent.cli list
+uv run python -m kb_agent.cli extract <doc_id> --no-llm --force
+```
+
+生成跨论文比较矩阵：
+
+```bash
+uv run python -m kb_agent.cli compare "服务机器人与多智能体任务规划方法对比" --no-llm
+```
+
+生成综述规划工件：
+
+```bash
+uv run python -m kb_agent.cli generate-review "任务规划方法研究综述" --no-llm
+```
+
+查看任务工件：
+
+```bash
+uv run python -m kb_agent.cli task-artifact <task_id> selected_papers.json
+uv run python -m kb_agent.cli task-artifact <task_id> comparison_matrix.json
+uv run python -m kb_agent.cli task-artifact <task_id> review_outline.json
+uv run python -m kb_agent.cli task-artifact <task_id> section_evidence/background_problem.json
+```
+
+如果已配置 DeepSeek，可以去掉 `--no-llm`，让模型基于 evidence packet 生成结构化比较和综述大纲；如果必须调用模型成功，则添加 `--require-llm`。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
@@ -150,7 +186,7 @@ DeepSeek 官方 OpenCode 接入方式：
 推荐工具调用顺序：
 
 ```text
-kb_sync -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_search_tree -> kb_get_evidence -> kb_answer
+kb_sync -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_get_task_artifact
 ```
 
 ## 测试
@@ -162,5 +198,4 @@ uv run python -m unittest discover -s tests
 ## 后续阶段
 
 - 接入 GROBID / Docling / Marker 提升 PDF 解析质量。
-- 增加跨论文比较和综述任务工件。
 - 加入 memory write gate、TTL、去重、压缩和 OpenCode plugin hook。

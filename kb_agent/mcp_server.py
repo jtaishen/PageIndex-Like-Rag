@@ -10,6 +10,7 @@ from .ingest import sync_directory
 from .insights import extract_doc_insights
 from .memory import put_memory, search_memory
 from .search import get_evidence, search_nodes
+from .tasks import compare_papers, generate_review_plan, get_task_artifact
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -104,6 +105,53 @@ if FastMCP is not None:
     def kb_get_citation_map(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
         """Return the extracted citation map artifact for one document."""
         return get_citation_map(resolve_db_path(db_path), doc_id)
+
+    @mcp.tool()
+    def kb_compare(
+        query: str,
+        doc_ids: Optional[List[str]] = None,
+        top_k_docs: int = 5,
+        use_llm: bool = True,
+        require_llm: bool = False,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Compare candidate papers and write grounded comparison task artifacts."""
+        return compare_papers(
+            resolve_db_path(db_path),
+            query,
+            doc_ids=doc_ids,
+            top_k_docs=top_k_docs,
+            use_llm=use_llm,
+            require_llm=require_llm,
+        )
+
+    @mcp.tool()
+    def kb_generate_review(
+        topic: str,
+        doc_ids: Optional[List[str]] = None,
+        top_k_docs: int = 8,
+        use_llm: bool = True,
+        require_llm: bool = False,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Generate review planning artifacts with section-level evidence."""
+        return generate_review_plan(
+            resolve_db_path(db_path),
+            topic,
+            doc_ids=doc_ids,
+            top_k_docs=top_k_docs,
+            use_llm=use_llm,
+            require_llm=require_llm,
+        )
+
+    @mcp.tool()
+    def kb_get_task_artifact(
+        task_id: str,
+        name: str,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Read a whitelisted compare/review task artifact."""
+        return get_task_artifact(resolve_db_path(db_path), task_id, name)
 
     @mcp.tool()
     def kb_answer(

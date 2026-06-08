@@ -14,3 +14,4 @@ data/parsed/
 data/raw/
 data/state/
 data/logs/
+.kb_state/

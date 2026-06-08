@@ -13,6 +13,7 @@ from .ingest import sync_directory
 from .insights import extract_doc_insights
 from .memory import put_memory, search_memory
 from .search import get_evidence, search_nodes
+from .tasks import compare_papers, generate_review_plan, get_task_artifact
 
 
 def main(argv: Any = None) -> None:
@@ -59,6 +60,24 @@ def main(argv: Any = None) -> None:
 
     citations_parser = subparsers.add_parser("citations", help="Show extracted citation map artifact")
     citations_parser.add_argument("doc_id")
+
+    compare_parser = subparsers.add_parser("compare", help="Compare papers with grounded task artifacts")
+    compare_parser.add_argument("query")
+    compare_parser.add_argument("--doc-id", action="append", default=[], help="Limit comparison to a document id; repeatable")
+    compare_parser.add_argument("--top-k-docs", type=int, default=5)
+    compare_parser.add_argument("--no-llm", action="store_true", help="Use rule-based comparison only")
+    compare_parser.add_argument("--require-llm", action="store_true", help="Fail if DeepSeek cannot be called")
+
+    review_parser = subparsers.add_parser("generate-review", help="Generate review planning task artifacts")
+    review_parser.add_argument("topic")
+    review_parser.add_argument("--doc-id", action="append", default=[], help="Limit review planning to a document id; repeatable")
+    review_parser.add_argument("--top-k-docs", type=int, default=8)
+    review_parser.add_argument("--no-llm", action="store_true", help="Use rule-based planning only")
+    review_parser.add_argument("--require-llm", action="store_true", help="Fail if DeepSeek cannot be called")
+
+    task_artifact_parser = subparsers.add_parser("task-artifact", help="Read a v0.5 task artifact")
+    task_artifact_parser.add_argument("task_id")
+    task_artifact_parser.add_argument("name")
 
     evidence_parser = subparsers.add_parser("evidence", help="Get evidence packets")
     evidence_parser.add_argument("doc_id")
@@ -116,6 +135,28 @@ def main(argv: Any = None) -> None:
         _print_json(get_innovations(db_path, args.doc_id))
     elif args.command == "citations":
         _print_json(get_citation_map(db_path, args.doc_id))
+    elif args.command == "compare":
+        result = compare_papers(
+            db_path,
+            args.query,
+            doc_ids=args.doc_id,
+            top_k_docs=args.top_k_docs,
+            use_llm=not args.no_llm,
+            require_llm=args.require_llm,
+        )
+        _print_json(_task_summary(result))
+    elif args.command == "generate-review":
+        result = generate_review_plan(
+            db_path,
+            args.topic,
+            doc_ids=args.doc_id,
+            top_k_docs=args.top_k_docs,
+            use_llm=not args.no_llm,
+            require_llm=args.require_llm,
+        )
+        _print_json(_task_summary(result))
+    elif args.command == "task-artifact":
+        _print_json(get_task_artifact(db_path, args.task_id, args.name))
     elif args.command == "evidence":
         _print_json([packet.to_dict() for packet in get_evidence(db_path, args.doc_id, args.node_ids)])
     elif args.command == "ask":
@@ -207,6 +248,34 @@ def _extract_summary(result: dict) -> dict:
         },
         "llm_error": result.get("llm_error", ""),
     }
+
+
+def _task_summary(result: dict) -> dict:
+    coverage = {}
+    if result.get("comparison_matrix"):
+        coverage = result["comparison_matrix"].get("evidence_coverage", {})
+    elif result.get("review_outline"):
+        coverage = result["review_outline"].get("evidence_coverage", {})
+    return {
+        "task_id": result.get("task_id"),
+        "task_type": result.get("task_type"),
+        "status": result.get("status"),
+        "query": result.get("query") or result.get("topic"),
+        "selected_paper_count": (result.get("selected_papers") or {}).get("paper_count"),
+        "artifact_paths": result.get("artifact_paths", {}),
+        "evidence_coverage": coverage,
+        "warning_count": len(_task_warnings(result)),
+        "warnings": _task_warnings(result),
+        "llm_error": result.get("llm_error", ""),
+    }
+
+
+def _task_warnings(result: dict) -> list:
+    if result.get("comparison_matrix"):
+        return result["comparison_matrix"].get("warnings", [])
+    if result.get("review_outline"):
+        return result["review_outline"].get("warnings", [])
+    return []
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ from kb_agent.ingest import sync_directory
 from kb_agent.insights import extract_doc_insights
 from kb_agent.llm import LLMError
 from kb_agent.search import get_evidence, search_documents, search_nodes
+from kb_agent.tasks import compare_papers, generate_review_plan, get_task_artifact
 
 
 class IngestSearchTest(unittest.TestCase):
@@ -262,6 +263,149 @@ class IngestSearchTest(unittest.TestCase):
                 cli_main(["--db", str(db_path), "extract", doc_id, "--force", "--no-llm"])
             self.assertIn("innovation.v1", stdout.getvalue())
 
+    def test_compare_writes_grounded_task_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+
+            result = compare_papers(
+                db_path,
+                "服务机器人与多智能体任务规划方法对比",
+                doc_ids=doc_ids,
+                use_llm=False,
+            )
+
+            self.assertEqual(result["task_type"], "compare")
+            self.assertEqual(result["selected_papers"]["paper_count"], 2)
+            matrix = result["comparison_matrix"]
+            self.assertEqual(matrix["schema"], "comparison_matrix.v1")
+            self.assertEqual(len(matrix["dimensions"]), 6)
+            dimension_ids = {item["id"] for item in matrix["dimensions"]}
+            self.assertIn("problem_setting", dimension_ids)
+            self.assertIn("evidence_strength", dimension_ids)
+            for dimension in matrix["dimensions"]:
+                self.assertEqual(len(dimension["cells"]), 2)
+                for cell in dimension["cells"]:
+                    self.assertTrue(cell["evidence"] or cell["warnings"])
+            self.assertIn("comparison_matrix", result["artifact_paths"])
+
+            artifact = get_task_artifact(db_path, result["task_id"], "comparison_matrix.json")
+            self.assertEqual(artifact["content"]["schema"], "comparison_matrix.v1")
+            current = get_task_artifact(db_path, "current", "current_task.json")
+            self.assertEqual(current["content"]["task_id"], result["task_id"])
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main([
+                    "--db",
+                    str(db_path),
+                    "compare",
+                    "服务机器人与多智能体任务规划方法对比",
+                    "--doc-id",
+                    doc_ids[0],
+                    "--doc-id",
+                    doc_ids[1],
+                    "--no-llm",
+                ])
+            self.assertIn("task_id", stdout.getvalue())
+            self.assertIn("comparison_matrix", stdout.getvalue())
+
+    def test_generate_review_plan_writes_outline_and_section_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+
+            result = generate_review_plan(
+                db_path,
+                "任务规划方法研究综述",
+                doc_ids=doc_ids,
+                use_llm=False,
+            )
+
+            self.assertEqual(result["task_type"], "review")
+            outline = result["review_outline"]
+            self.assertEqual(outline["schema"], "review_outline.v1")
+            self.assertGreaterEqual(len(outline["sections"]), 5)
+            self.assertIn("section_evidence/background_problem.json", result["artifact_paths"])
+            background = get_task_artifact(
+                db_path,
+                result["task_id"],
+                "section_evidence/background_problem.json",
+            )
+            self.assertEqual(background["content"]["schema"], "section_evidence.v1")
+            self.assertGreaterEqual(background["content"]["source_doc_count"], 1)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main([
+                    "--db",
+                    str(db_path),
+                    "generate-review",
+                    "任务规划方法研究综述",
+                    "--doc-id",
+                    doc_ids[0],
+                    "--doc-id",
+                    doc_ids[1],
+                    "--no-llm",
+                ])
+            self.assertIn("review_outline", stdout.getvalue())
+
+    def test_llm_task_generation_and_require_llm_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+            for doc_id in doc_ids:
+                extract_doc_insights(db_path, doc_id, force=True, use_llm=False)
+
+            payload = {
+                "dimensions": [
+                    {
+                        "id": "problem_setting",
+                        "synthesis": "两篇论文都关注动态任务规划问题。",
+                        "overlaps": ["都涉及任务规划。"],
+                        "differences": ["服务机器人强调工具调用，多智能体论文强调分布式协同。"],
+                        "cells": [
+                            {
+                                "doc_id": doc_ids[0],
+                                "claim": "服务机器人论文关注大模型任务规划。",
+                                "evidence": [],
+                                "confidence": 0.82,
+                            },
+                            {
+                                "doc_id": doc_ids[1],
+                                "claim": "多智能体论文关注分布式任务分配。",
+                                "evidence": [],
+                                "confidence": 0.8,
+                            },
+                        ],
+                    }
+                ],
+                "open_questions": ["需要进一步比较真实实验设置。"],
+                "warnings": [],
+            }
+
+            with mock.patch("kb_agent.tasks.generate_json_object", return_value=payload):
+                result = compare_papers(
+                    db_path,
+                    "服务机器人与多智能体任务规划方法对比",
+                    doc_ids=doc_ids,
+                    use_llm=True,
+                )
+            self.assertEqual(result["comparison_matrix"]["source"], "llm")
+            self.assertIn("需要进一步比较", result["comparison_matrix"]["open_questions"][0])
+            self.assertIn("node_id", result["comparison_matrix"]["dimensions"][0]["cells"][0]["evidence"][0])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+            state_root = db_path.parent / ".kb_state"
+            with mock.patch("kb_agent.tasks.generate_json_object", side_effect=LLMError("boom")):
+                with self.assertRaises(LLMError):
+                    compare_papers(
+                        db_path,
+                        "服务机器人与多智能体任务规划方法对比",
+                        doc_ids=doc_ids,
+                        use_llm=True,
+                        require_llm=True,
+                    )
+            self.assertFalse(state_root.exists())
+
     def test_failed_parse_records_report_and_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -390,6 +534,57 @@ def _sync_insight_sample(root: Path) -> tuple[Path, str]:
         raise AssertionError(report["errors"])
     doc_id = str(search_documents(db_path, "动态角色", top_k=1)[0]["doc_id"])
     return db_path, doc_id
+
+
+def _sync_compare_samples(root: Path) -> tuple[Path, list[str]]:
+    papers = root / "papers"
+    papers.mkdir()
+    db_path = root / "kb.sqlite"
+    (papers / "service_robot.txt").write_text(
+        "摘要：本文研究基于大语言模型的服务机器人任务规划方法，"
+        "解决自然语言任务分解、工具调用和执行反馈中的不确定性问题。\n"
+        "关键词：服务机器人；大语言模型；任务规划；工具调用\n\n"
+        "第一章 绪论\n"
+        "服务机器人需要在家庭和公共场景中完成复杂任务，现有规划方法存在泛化能力不足的问题。\n\n"
+        "1.1 研究内容与主要贡献\n"
+        "本文提出结合大语言模型和技能库的任务规划框架，设计任务分解、工具选择和反馈修正流程，"
+        "用于提升机器人在开放环境中的任务完成率。\n\n"
+        "2.1 方法设计\n"
+        "系统通过大语言模型解析用户意图，再调用工具和技能模块生成可执行计划。\n\n"
+        "3.1 实验结果\n"
+        "实验结果表明，该方法在任务成功率和响应时间方面优于规则规划基线。\n\n"
+        "结论\n"
+        "本文仍存在真实家庭环境验证不足的局限，未来工作将扩展长期记忆和安全约束。\n\n"
+        "参考文献\n"
+        "[1] 张三. 服务机器人规划研究. 2025.\n",
+        encoding="utf-8",
+    )
+    (papers / "multi_agent.txt").write_text(
+        "摘要：本文研究多智能体系统中的分布式任务规划关键技术，"
+        "重点解决动态任务分配、协同调度和冲突消解问题。\n"
+        "关键词：多智能体；分布式任务规划；协同调度\n\n"
+        "第一章 绪论\n"
+        "多智能体系统在救援和物流场景中需要协同完成任务，通信延迟和资源约束带来规划挑战。\n\n"
+        "1.1 研究内容与主要贡献\n"
+        "本文提出动态任务重分配算法和负载均衡模型，构建面向动态环境的协同规划框架。\n\n"
+        "2.1 方法设计\n"
+        "系统通过局部决策和全局协调机制降低通信开销，并处理任务冲突。\n\n"
+        "3.1 实验结果\n"
+        "实验结果表明，该方法提升了任务完成率、负载均衡和系统鲁棒性。\n\n"
+        "结论\n"
+        "本文仍存在复杂通信约束下验证不足的局限，未来工作将扩展异构智能体场景。\n\n"
+        "参考文献\n"
+        "[1] 李四. 多智能体任务规划研究. 2024.\n",
+        encoding="utf-8",
+    )
+    report = sync_directory(papers, db_path)
+    if report["failed"]:
+        raise AssertionError(report["errors"])
+    docs = search_documents(db_path, "任务规划", top_k=5)
+    doc_ids = [str(item["doc_id"]) for item in docs]
+    if len(doc_ids) != 2:
+        raise AssertionError(docs)
+    return db_path, doc_ids
 
 
 if __name__ == "__main__":
