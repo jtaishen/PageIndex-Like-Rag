@@ -7,7 +7,7 @@ from typing import Any
 
 from . import db
 from .answer import answer_query, route_documents
-from .artifacts import get_citation_map, get_doc_card, get_innovations, get_parse_quality, list_artifacts
+from .artifacts import get_citation_map, get_doc_card, get_innovations, get_parse_quality, get_parse_report, list_artifacts
 from .config import resolve_db_path
 from .ingest import sync_directory
 from .insights import extract_doc_insights
@@ -25,6 +25,7 @@ def main(argv: Any = None) -> None:
     sync_parser = subparsers.add_parser("sync", help="Index a directory or supported file")
     sync_parser.add_argument("path")
     sync_parser.add_argument("--force", action="store_true")
+    sync_parser.add_argument("--pdf-parser", choices=["auto", "pypdf", "docling", "grobid"], default=None)
 
     subparsers.add_parser("list", help="List indexed documents")
 
@@ -49,6 +50,10 @@ def main(argv: Any = None) -> None:
 
     quality_parser = subparsers.add_parser("quality", help="Show parse quality for a document")
     quality_parser.add_argument("doc_id")
+
+    parse_report_parser = subparsers.add_parser("parse-report", help="Show parser diagnostics for a document")
+    parse_report_parser.add_argument("doc_id")
+    parse_report_parser.add_argument("--version-id", default=None)
 
     extract_parser = subparsers.add_parser("extract", help="Extract paper insight artifacts")
     extract_parser.add_argument("doc_id")
@@ -131,7 +136,7 @@ def main(argv: Any = None) -> None:
     db_path = resolve_db_path(args.db)
 
     if args.command == "sync":
-        _print_json(sync_directory(Path(args.path), db_path, force=args.force))
+        _print_json(sync_directory(Path(args.path), db_path, force=args.force, pdf_parser=args.pdf_parser))
     elif args.command == "list":
         _list_documents(db_path)
     elif args.command == "search":
@@ -146,6 +151,8 @@ def main(argv: Any = None) -> None:
         _print_json(list_artifacts(db_path, args.doc_id, args.version_id))
     elif args.command == "quality":
         _print_json(get_parse_quality(db_path, args.doc_id))
+    elif args.command == "parse-report":
+        _print_json(_parse_report_summary(get_parse_report(db_path, args.doc_id, args.version_id)))
     elif args.command == "extract":
         result = extract_doc_insights(
             db_path,
@@ -339,6 +346,27 @@ def _review_summary(result: dict) -> dict:
         "artifact_paths": result.get("artifact_paths", {}),
         "warnings": report.get("warnings", []),
         "llm_error": result.get("llm_error", ""),
+    }
+
+
+def _parse_report_summary(report: dict) -> dict:
+    return {
+        "doc_id": report.get("doc_id"),
+        "version_id": report.get("version_id"),
+        "title": report.get("title"),
+        "status": report.get("status"),
+        "parser_name": report.get("parser_name"),
+        "parser_version": report.get("parser_version"),
+        "requested_pdf_parser": report.get("requested_pdf_parser"),
+        "parser_chain": report.get("parser_chain") or [],
+        "fallback_used": report.get("fallback_used", False),
+        "external_parser_errors": report.get("external_parser_errors") or [],
+        "adapter_statuses": report.get("adapter_statuses") or {},
+        "warning_count": len(report.get("warnings") or []),
+        "warnings": report.get("warnings") or [],
+        "block_count": report.get("block_count"),
+        "node_count": report.get("node_count"),
+        "artifact_dir": report.get("artifact_dir"),
     }
 
 

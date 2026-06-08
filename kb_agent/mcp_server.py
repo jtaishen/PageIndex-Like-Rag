@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .answer import answer_query, route_documents
-from .artifacts import get_artifact, get_citation_map, get_doc_card, get_innovations, get_parse_quality
+from .artifacts import get_artifact, get_citation_map, get_doc_card, get_innovations, get_parse_quality, get_parse_report
 from .config import resolve_db_path
 from .ingest import sync_directory
 from .insights import extract_doc_insights
@@ -26,9 +26,14 @@ if FastMCP is not None:
     mcp = FastMCP("paper-kb")
 
     @mcp.tool()
-    def kb_sync(path: str, force: bool = False, db_path: Optional[str] = None) -> Dict[str, Any]:
+    def kb_sync(
+        path: str,
+        force: bool = False,
+        pdf_parser: Optional[str] = None,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Scan a directory or file and update the local knowledge base index."""
-        return sync_directory(Path(path), resolve_db_path(db_path), force=force)
+        return sync_directory(Path(path), resolve_db_path(db_path), force=force, pdf_parser=pdf_parser)
 
     @mcp.tool()
     def kb_search_docs(query: str, top_k: int = 8, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -79,6 +84,11 @@ if FastMCP is not None:
     def kb_get_parse_quality(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
         """Return parse quality metrics and warnings for one indexed document."""
         return get_parse_quality(resolve_db_path(db_path), doc_id)
+
+    @mcp.tool()
+    def kb_get_parse_report(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return parser diagnostics and fallback details for one indexed document."""
+        return get_parse_report(resolve_db_path(db_path), doc_id)
 
     @mcp.tool()
     def kb_extract_doc_insights(

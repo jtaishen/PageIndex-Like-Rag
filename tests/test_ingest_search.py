@@ -11,12 +11,13 @@ from pathlib import Path
 
 from kb_agent import db
 from kb_agent.answer import answer_query
-from kb_agent.artifacts import get_artifact, get_citation_map, get_doc_card, get_innovations, get_parse_quality, list_artifacts
+from kb_agent.artifacts import get_artifact, get_citation_map, get_doc_card, get_innovations, get_parse_quality, get_parse_report, list_artifacts
 from kb_agent.cli import main as cli_main
 from kb_agent.ingest import sync_directory
 from kb_agent.insights import extract_doc_insights
 from kb_agent.llm import LLMError
 from kb_agent.memory import compact_memory, put_memory_gated, remember_task, resume_task, search_memory
+from kb_agent.models import ParsedBlock, ParsedDocument
 from kb_agent.review import assemble_review, check_review_citations, draft_review
 from kb_agent.search import get_evidence, search_documents, search_nodes
 from kb_agent.tasks import compare_papers, generate_review_plan, get_task_artifact
@@ -643,6 +644,146 @@ class IngestSearchTest(unittest.TestCase):
                 cli_main(["--db", str(db_path), "memory-compact", "--scope", "project"])
             self.assertIn("memory_compact.v1", stdout.getvalue())
 
+    def test_pdf_parser_choice_pypdf_records_quality_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "paper.pdf").write_bytes(b"%PDF fake")
+
+            with mock.patch("kb_agent.parsers._parse_pypdf_pdf", return_value=_fake_pdf_document("pypdf")):
+                report = sync_directory(papers, db_path, force=True, pdf_parser="pypdf")
+
+            self.assertEqual(report["indexed"], 1)
+            doc_id = str(search_documents(db_path, "多解析器", top_k=1)[0]["doc_id"])
+            card = get_doc_card(db_path, doc_id)
+            self.assertEqual(card["parser_name"], "pdf_pypdf")
+            quality = get_parse_quality(db_path, doc_id)
+            self.assertEqual(quality["parser_chain"], ["pypdf"])
+            self.assertFalse(quality["fallback_used"])
+            self.assertIn(quality["quality_level"], {"good", "usable"})
+
+    def test_docling_adapter_enhances_structured_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "docling.pdf").write_bytes(b"%PDF fake")
+            parsed = _fake_pdf_document(
+                "docling",
+                structured={
+                    "schema": "structured.v0",
+                    "blocks": [],
+                    "tables": [{"caption": "表 1 解析质量对比"}],
+                    "figures": [{"caption": "图 1 解析流程"}],
+                },
+            )
+
+            with mock.patch("kb_agent.parsers._parse_docling_pdf", return_value=parsed):
+                report = sync_directory(papers, db_path, force=True, pdf_parser="docling")
+
+            self.assertEqual(report["indexed"], 1)
+            doc_id = str(search_documents(db_path, "解析质量", top_k=1)[0]["doc_id"])
+            structured = get_artifact(db_path, doc_id, "structured.json")["content"]
+            self.assertGreaterEqual(len(structured["tables"]), 1)
+            self.assertGreaterEqual(len(structured["figures"]), 1)
+            tree = get_artifact(db_path, doc_id, "tree.json")["content"]
+            types = _collect_tree_types(tree)
+            self.assertIn("section", types)
+            self.assertIn("table", types)
+            self.assertIn("figure", types)
+            parse_report = get_parse_report(db_path, doc_id)
+            self.assertEqual(parse_report["parser_chain"], ["docling"])
+            self.assertFalse(parse_report["fallback_used"])
+            self.assertTrue(parse_report["adapter_statuses"]["marker"]["placeholder"])
+
+    def test_grobid_enrichment_updates_metadata_and_references(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "grobid.pdf").write_bytes(b"%PDF fake")
+            enrichment = {
+                "metadata": {
+                    "title": "GROBID 增强论文",
+                    "authors": ["张三", "李四"],
+                    "year": 2026,
+                    "venue": "机器人学报",
+                    "doi": "10.1234/example",
+                    "abstract": "本文使用 GROBID 增强标题、作者、摘要和参考文献结构。",
+                },
+                "references": [
+                    {"ref_id": "ref_1", "raw": "[1] 张三. 解析研究. 2025.", "authors": ["张三"], "title": "解析研究", "year": 2025}
+                ],
+            }
+
+            with mock.patch("kb_agent.parsers._parse_pypdf_pdf", return_value=_fake_pdf_document("grobid")), \
+                mock.patch("kb_agent.parsers._fetch_grobid_enrichment", return_value=enrichment), \
+                mock.patch.dict("os.environ", {"GROBID_URL": "http://localhost:8070"}):
+                report = sync_directory(papers, db_path, force=True, pdf_parser="grobid")
+
+            self.assertEqual(report["indexed"], 1)
+            doc_id = str(search_documents(db_path, "GROBID", top_k=1)[0]["doc_id"])
+            card = get_doc_card(db_path, doc_id)
+            self.assertEqual(card["title"], "GROBID 增强论文")
+            self.assertEqual(card["authors"], ["张三", "李四"])
+            self.assertEqual(card["doi"], "10.1234/example")
+            references = get_artifact(db_path, doc_id, "references.json")["content"]
+            self.assertEqual(references["source"], "grobid")
+            self.assertEqual(len(references["references"]), 1)
+            parse_report = get_parse_report(db_path, doc_id)
+            self.assertEqual(parse_report["parser_chain"], ["pypdf", "grobid"])
+
+    def test_pdf_external_failure_falls_back_to_pypdf(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "fallback.pdf").write_bytes(b"%PDF fake")
+
+            with mock.patch("kb_agent.parsers._parse_docling_pdf", side_effect=RuntimeError("docling down")), \
+                mock.patch("kb_agent.parsers._parse_pypdf_pdf", return_value=_fake_pdf_document("fallback")):
+                report = sync_directory(papers, db_path, force=True, pdf_parser="auto")
+
+            self.assertEqual(report["indexed"], 1)
+            doc_id = str(search_documents(db_path, "回退", top_k=1)[0]["doc_id"])
+            parse_report = get_parse_report(db_path, doc_id)
+            self.assertEqual(parse_report["parser_name"], "pdf_auto")
+            self.assertTrue(parse_report["fallback_used"])
+            self.assertEqual(parse_report["parser_chain"], ["docling", "pypdf"])
+            self.assertTrue(parse_report["external_parser_errors"])
+            quality = get_parse_quality(db_path, doc_id)
+            self.assertTrue(quality["fallback_used"])
+            self.assertIn("external_parser_failed:docling:docling down", quality["quality_warnings"])
+
+    def test_parse_report_cli_and_pdf_parser_argument_precedence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "override.pdf").write_bytes(b"%PDF fake")
+
+            with mock.patch("kb_agent.parsers._parse_docling_pdf", side_effect=AssertionError("should not call docling")), \
+                mock.patch("kb_agent.parsers._parse_pypdf_pdf", return_value=_fake_pdf_document("override")), \
+                mock.patch.dict("os.environ", {"KB_PDF_PARSER": "docling"}):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    cli_main(["--db", str(db_path), "sync", str(papers), "--force", "--pdf-parser", "pypdf"])
+
+            self.assertIn('"indexed": 1', stdout.getvalue())
+            doc_id = str(search_documents(db_path, "多解析器", top_k=1)[0]["doc_id"])
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "parse-report", doc_id])
+            output = stdout.getvalue()
+            self.assertIn("parser_chain", output)
+            self.assertIn("pdf_pypdf", output)
+
     def test_failed_parse_records_report_and_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -737,6 +878,55 @@ def _collect_tree_types(node: dict) -> set[str]:
     for child in node.get("children", []):
         types.update(_collect_tree_types(child))
     return types
+
+
+def _fake_pdf_document(label: str, structured=None) -> ParsedDocument:  # type: ignore[no-untyped-def]
+    title = f"{label} PDF 论文"
+    blocks = [
+        ParsedBlock(kind="heading", text="", heading="摘要", level=1, page=1),
+        ParsedBlock(kind="abstract", text=f"本文研究 PDF 多解析器融合与稳定回退，用于提升解析质量。{label}", page=1),
+        ParsedBlock(kind="heading", text="", heading="关键词", level=1, page=1),
+        ParsedBlock(kind="keywords", text="PDF；多解析器；解析质量；回退", page=1),
+        ParsedBlock(kind="heading", text="", heading="1.1 方法设计", level=2, page=2),
+        ParsedBlock(kind="paragraph", text=f"系统通过 {label} 解析器识别章节、图表和参考文献，并保留证据链。", page=2),
+        ParsedBlock(kind="table", text="表 1 解析质量对比", page=2),
+        ParsedBlock(kind="figure", text="图 1 解析流程", page=2),
+        ParsedBlock(kind="heading", text="", heading="参考文献", level=1, page=3),
+        ParsedBlock(kind="reference", text="[1] 张三. PDF 解析研究. 2025.", page=3),
+    ]
+    raw_text = "\n".join(block.heading or block.text for block in blocks)
+    return ParsedDocument(
+        title=title,
+        file_type="pdf",
+        raw_text=raw_text,
+        blocks=blocks,
+        metadata={
+            "source_format": "pdf",
+            "pages": 3,
+            "title": title,
+            "authors": ["张三"],
+            "year": 2026,
+            "doi": "10.1234/fake",
+            "abstract": f"本文研究 PDF 多解析器融合与稳定回退，用于提升解析质量。{label}",
+            "keywords": ["PDF", "多解析器", "解析质量", "回退"],
+        },
+        body_md="",
+        structured=structured or {
+            "schema": "structured.v0",
+            "blocks": [],
+            "tables": [{"caption": "表 1 解析质量对比"}],
+            "figures": [{"caption": "图 1 解析流程"}],
+            "formulas": [],
+        },
+        references={
+            "schema": "references.v0",
+            "status": "extracted",
+            "references": [{"ref_id": "ref_1", "raw": "[1] 张三. PDF 解析研究. 2025."}],
+            "citation_contexts": [],
+        },
+        parser_name=f"pdf_{label}",
+        parser_version="test",
+    )
 
 
 def _sync_insight_sample(root: Path) -> tuple[Path, str]:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 
 from . import db
 from .config import DATA_DIR, SUPPORTED_EXTENSIONS, ensure_data_dirs
@@ -24,7 +24,7 @@ def discover_files(root: Path) -> List[Path]:
     return sorted(files)
 
 
-def sync_directory(path: Path, db_path: Path, force: bool = False) -> Dict[str, object]:
+def sync_directory(path: Path, db_path: Path, force: bool = False, pdf_parser: Optional[str] = None) -> Dict[str, object]:
     ensure_data_dirs()
     root = path.expanduser().resolve()
     files = discover_files(root)
@@ -40,7 +40,7 @@ def sync_directory(path: Path, db_path: Path, force: bool = False) -> Dict[str, 
     db.init_db(conn)
     try:
         for file_path in files:
-            result, error = _sync_file(conn, file_path, force=force)
+            result, error = _sync_file(conn, file_path, force=force, pdf_parser=pdf_parser)
             report[result] = int(report[result]) + 1  # type: ignore[arg-type]
             if error:
                 report["errors"].append({"path": str(file_path), "error": error})  # type: ignore[union-attr]
@@ -50,10 +50,10 @@ def sync_directory(path: Path, db_path: Path, force: bool = False) -> Dict[str, 
     return report
 
 
-def _sync_file(conn, file_path: Path, force: bool = False) -> tuple[str, str]:  # type: ignore[no-untyped-def]
+def _sync_file(conn, file_path: Path, force: bool = False, pdf_parser: Optional[str] = None) -> tuple[str, str]:  # type: ignore[no-untyped-def]
     file_hash = sha256_file(file_path)
     stat = file_path.stat()
-    parser_name, parser_version = parser_identity_for_path(file_path)
+    parser_name, parser_version = parser_identity_for_path(file_path, pdf_parser=pdf_parser)
     existing = db.get_document_by_path(conn, str(file_path))
     if (
         existing
@@ -70,7 +70,7 @@ def _sync_file(conn, file_path: Path, force: bool = False) -> tuple[str, str]:  
     db.delete_document_by_path(conn, str(file_path))
 
     try:
-        parsed = parse_document(file_path)
+        parsed = parse_document(file_path, pdf_parser=pdf_parser)
         nodes = build_document_tree(doc_id, parsed, doc_hash=file_hash)
         summary = _doc_description(parsed)
         record = DocumentRecord(
@@ -159,6 +159,11 @@ def _write_artifacts(doc_id: str, version_id: str, base: Path, source_path: Path
             "file_hash": file_hash,
             "parser_name": parsed.parser_name,
             "parser_version": parsed.parser_version,
+            "requested_pdf_parser": (parsed.metadata.get("_parse_diagnostics") or {}).get("requested_pdf_parser"),
+            "parser_chain": (parsed.metadata.get("_parse_diagnostics") or {}).get("parser_chain", [parsed.parser_name]),
+            "fallback_used": (parsed.metadata.get("_parse_diagnostics") or {}).get("fallback_used", False),
+            "external_parser_errors": (parsed.metadata.get("_parse_diagnostics") or {}).get("external_parser_errors", []),
+            "adapter_statuses": (parsed.metadata.get("_parse_diagnostics") or {}).get("adapter_statuses", {}),
             "status": "ready",
             "error": "",
             "warnings": parsed.parse_warnings,
@@ -204,6 +209,11 @@ def _write_failure_report(
             "file_hash": file_hash,
             "parser_name": parser_name,
             "parser_version": parser_version,
+            "requested_pdf_parser": parser_name.removeprefix("pdf_") if parser_name.startswith("pdf_") else "",
+            "parser_chain": [parser_name],
+            "fallback_used": False,
+            "external_parser_errors": [error] if error else [],
+            "adapter_statuses": {},
             "status": "failed",
             "error": error,
             "warnings": [],
@@ -228,16 +238,28 @@ def _build_doc_card(doc_id: str, version_id: str, base: Path, source_path: Path,
     page_only_tree = section_count == 0 and any(node.kind == "page" for node in nodes)
     missing_abstract = not bool(parsed.metadata.get("abstract"))
     quality_warnings = _quality_warnings(parsed, section_count, reference_count, page_only_tree, missing_abstract)
+    diagnostics = parsed.metadata.get("_parse_diagnostics") or {}
+    metadata_score = _metadata_score(parsed)
+    structure_score = _structure_score(section_count, paragraph_count, page_only_tree)
+    reference_score = _reference_score(reference_count, parsed)
+    quality_level = _quality_level(metadata_score, structure_score, reference_score, quality_warnings)
     parse_quality = {
         "schema": "parse_quality.v0",
         "doc_id": doc_id,
         "version_id": version_id,
+        "quality_level": quality_level,
         "page_count": page_count,
         "section_count": section_count,
         "paragraph_count": paragraph_count,
         "reference_count": reference_count,
         "figure_count": figure_count,
         "table_count": table_count,
+        "parser_chain": diagnostics.get("parser_chain", [parsed.parser_name]),
+        "fallback_used": diagnostics.get("fallback_used", False),
+        "metadata_score": metadata_score,
+        "structure_score": structure_score,
+        "reference_score": reference_score,
+        "warning_count": len(quality_warnings),
         "missing_abstract": missing_abstract,
         "page_only_tree": page_only_tree,
         "quality_warnings": quality_warnings,
@@ -312,6 +334,57 @@ def _text_excerpt(text: str, max_chars: int) -> str:
     if len(compacted) <= max_chars:
         return compacted
     return compacted[:max_chars].rstrip() + " ..."
+
+
+def _metadata_score(parsed) -> float:  # type: ignore[no-untyped-def]
+    checks = [
+        bool(parsed.title),
+        bool(parsed.metadata.get("authors")),
+        bool(parsed.metadata.get("year")),
+        bool(parsed.metadata.get("doi") or parsed.metadata.get("venue")),
+        bool(parsed.metadata.get("abstract")),
+    ]
+    return round(sum(1 for item in checks if item) / len(checks), 2)
+
+
+def _structure_score(section_count: int, paragraph_count: int, page_only_tree: bool) -> float:
+    if page_only_tree:
+        return 0.25 if paragraph_count else 0.0
+    if section_count >= 4:
+        return 1.0
+    if section_count >= 2:
+        return 0.75
+    if paragraph_count:
+        return 0.45
+    return 0.0
+
+
+def _reference_score(reference_count: int, parsed) -> float:  # type: ignore[no-untyped-def]
+    if reference_count >= 10:
+        return 1.0
+    if reference_count >= 3:
+        return 0.75
+    if reference_count >= 1:
+        return 0.5
+    if (parsed.references or {}).get("status") == "extracted":
+        return 0.45
+    return 0.0
+
+
+def _quality_level(
+    metadata_score: float,
+    structure_score: float,
+    reference_score: float,
+    warnings: List[str],
+) -> str:
+    if "parse_failed" in warnings:
+        return "failed"
+    score = (metadata_score * 0.35) + (structure_score * 0.45) + (reference_score * 0.20)
+    if score >= 0.78 and "page_only_tree" not in warnings and "missing_abstract" not in warnings:
+        return "good"
+    if score >= 0.45:
+        return "usable"
+    return "weak"
 
 
 def _quality_warnings(

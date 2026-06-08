@@ -10,13 +10,13 @@ parse -> normalize -> tree -> artifacts -> indexes -> evidence packet -> CLI / M
 
 - 递归扫描目录，支持增量同步。
 - 支持 Markdown、TXT、DOCX、HTML 基础解析。
-- PDF 解析通过可选依赖 `pypdf` 支持。
+- PDF 解析通过可选依赖 `pypdf` 支持，并可用 `KB_PDF_PARSER` 或 `--pdf-parser` 选择 `auto`、`pypdf`、`docling`、`grobid`。
 - 解析后生成 `raw_text.txt`、`body.md`、`structured.json`、`metadata.json`、`references.json`、`parse_report.json`、`tree.json`、`node_index.jsonl`、`doc_card.json` 等工件。
 - 对中文论文常见结构做规则识别，包括摘要、关键词、第 X 章、`1.1`/`1.1.1` 小节、结论、参考文献、图和表。
 - 将文档保存为 `documents` 和 `doc_nodes`。
 - 使用 SQLite FTS5 做全文检索。
 - 返回带 `doc_id`、`node_id`、`node_path`、页码和 excerpt 的 evidence packet。
-- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`extract`、`innovations`、`citations`。
+- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`parse-report`、`extract`、`innovations`、`citations`。
 - 支持跨论文比较和综述规划任务工件，生成比较矩阵、综述大纲、章节证据表和下一步行动。
 - 支持长期 memory 写入门控、任务进度记忆、任务恢复和任务进度压缩。
 - 提供可选 MCP server，供 OpenCode 调用。
@@ -193,12 +193,50 @@ uv run python -m kb_agent.cli resume-task
 uv run python -m kb_agent.cli memory-compact --scope project
 ```
 
+## v0.8 高质量 PDF 解析与质量诊断
+
+v0.8 保留 `pypdf` 作为稳定兜底，同时支持可选 Docling 和 GROBID 增强。默认 `auto` 会先尝试 Docling，本地不可用或失败时回退到 `pypdf`；配置 `GROBID_URL` 后会增强元数据和参考文献。
+
+强制使用 pypdf：
+
+```bash
+uv run --extra pdf python -m kb_agent.cli sync articles --force --pdf-parser pypdf
+```
+
+安装并使用 Docling：
+
+```bash
+uv sync --extra pdf --extra docling
+uv run --extra pdf --extra docling python -m kb_agent.cli sync articles --force --pdf-parser docling
+```
+
+配置 GROBID 服务增强元数据和参考文献：
+
+```bash
+GROBID_URL=http://localhost:8070 uv run --extra pdf python -m kb_agent.cli sync articles --force --pdf-parser auto
+```
+
+查看解析质量和解析链诊断：
+
+```bash
+uv run python -m kb_agent.cli quality <doc_id>
+uv run python -m kb_agent.cli parse-report <doc_id>
+```
+
+`parse_report.json` 会记录 `parser_chain`、`fallback_used`、外部解析器失败原因和 adapter 状态；Marker 本轮只作为可检测占位，不作为默认解析器。`parse_quality` 会输出 `metadata_score`、`structure_score`、`reference_score`、`warning_count` 和 `quality_level`。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
 
 ```bash
 uv sync --extra pdf
+```
+
+如果要启用 Docling PDF 增强：
+
+```bash
+uv sync --extra pdf --extra docling
 ```
 
 如果要启用 OpenCode MCP server：
@@ -258,7 +296,7 @@ DeepSeek 官方 OpenCode 接入方式：
 推荐工具调用顺序：
 
 ```text
-kb_sync -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
+kb_sync -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
 ```
 
 ## 测试
@@ -269,5 +307,5 @@ uv run python -m unittest discover -s tests
 
 ## 后续阶段
 
-- 接入 GROBID / Docling / Marker 提升 PDF 解析质量。
+- 增加 embedding / rerank / eval，进一步提升跨论文检索质量。
 - 增加 OpenCode plugin hook 和更完整的评测报告。

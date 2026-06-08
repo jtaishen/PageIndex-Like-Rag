@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import html
+import importlib.util
+import os
 import re
+import urllib.error
+import urllib.request
 import zipfile
 from abc import ABC, abstractmethod
 from html.parser import HTMLParser
@@ -13,11 +17,50 @@ from .models import ParsedBlock, ParsedDocument
 from .utils import compact_whitespace, read_text_lossy, split_paragraphs
 
 
-PARSER_VERSION = "0.3.0"
+PARSER_VERSION = "0.8.0"
+PDF_PARSER_CHOICES = {"auto", "pypdf", "docling", "grobid"}
+DEFAULT_PDF_PARSER = "auto"
 
 
 class ParseError(RuntimeError):
     pass
+
+
+def resolve_pdf_parser(pdf_parser: Optional[str] = None) -> str:
+    requested = (pdf_parser or os.environ.get("KB_PDF_PARSER") or DEFAULT_PDF_PARSER).strip().lower()
+    if requested not in PDF_PARSER_CHOICES:
+        choices = ", ".join(sorted(PDF_PARSER_CHOICES))
+        raise ParseError(f"Unsupported PDF parser '{requested}'. Expected one of: {choices}")
+    return requested
+
+
+def pdf_adapter_statuses() -> Dict[str, Dict[str, Any]]:
+    return {
+        "pypdf": {
+            "available": _module_available("pypdf") or _module_available("PyPDF2"),
+            "default_fallback": True,
+        },
+        "docling": {
+            "available": _module_available("docling"),
+            "default_in_auto": True,
+        },
+        "grobid": {
+            "available": bool(os.environ.get("GROBID_URL", "").strip()),
+            "configured_url": bool(os.environ.get("GROBID_URL", "").strip()),
+        },
+        "marker": {
+            "available": _module_available("marker"),
+            "placeholder": True,
+            "enabled": False,
+        },
+    }
+
+
+def _module_available(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
 
 
 class ParserAdapter(ABC):
@@ -43,7 +86,10 @@ class ParserAdapter(ABC):
         metadata: Optional[Dict[str, Any]] = None,
         body_md: str = "",
         references: Optional[Dict[str, Any]] = None,
+        structured: Optional[Dict[str, Any]] = None,
         warnings: Optional[List[str]] = None,
+        parser_name: Optional[str] = None,
+        parser_version: Optional[str] = None,
     ) -> ParsedDocument:
         normalized_blocks, normalize_warnings = normalize_blocks(blocks)
         enriched = _enrich_metadata(title, raw_text, metadata or {})
@@ -51,13 +97,17 @@ class ParserAdapter(ABC):
             enriched["abstract"] = _extract_abstract_from_blocks(normalized_blocks)
         if not enriched.get("keywords"):
             enriched["keywords"] = _extract_keywords_from_blocks(normalized_blocks)
-        structured = {
+        structured_payload = structured or {
             "schema": "structured.v0",
             "blocks": [_block_to_dict(block, index) for index, block in enumerate(normalized_blocks)],
             "tables": [],
             "figures": [],
             "formulas": [],
         }
+        structured_payload.setdefault("blocks", [_block_to_dict(block, index) for index, block in enumerate(normalized_blocks)])
+        structured_payload.setdefault("tables", [])
+        structured_payload.setdefault("figures", [])
+        structured_payload.setdefault("formulas", [])
         return ParsedDocument(
             title=enriched.get("title") or title or path.stem,
             file_type=self.file_type,
@@ -65,10 +115,10 @@ class ParserAdapter(ABC):
             blocks=normalized_blocks,
             metadata=enriched,
             body_md=body_md or blocks_to_markdown(normalized_blocks, title),
-            structured=structured,
+            structured=structured_payload,
             references=references or extract_references(raw_text),
-            parser_name=self.name,
-            parser_version=self.version,
+            parser_name=parser_name or self.name,
+            parser_version=parser_version or self.version,
             parse_warnings=[*(warnings or []), *normalize_warnings],
         )
 
@@ -222,46 +272,498 @@ class DocxParser(ParserAdapter):
 
 
 class PdfParser(ParserAdapter):
-    name = "pypdf"
+    name = "pdf_auto"
     file_type = "pdf"
     suffixes = {".pdf"}
 
-    def parse(self, path: Path) -> ParsedDocument:
-        reader = None
-        try:
-            from pypdf import PdfReader  # type: ignore
+    def parse(self, path: Path, pdf_parser: Optional[str] = None) -> ParsedDocument:
+        provider = resolve_pdf_parser(pdf_parser)
+        parser_chain: List[str] = []
+        external_errors: List[str] = []
+        fallback_used = False
 
-            reader = PdfReader(str(path))
-        except Exception:
+        doc: Optional[ParsedDocument] = None
+        if provider in {"auto", "docling"}:
             try:
-                from PyPDF2 import PdfReader  # type: ignore
-
-                reader = PdfReader(str(path))
+                parser_chain.append("docling")
+                doc = _parse_docling_pdf(path)
             except Exception as exc:
-                raise ParseError(
-                    "PDF parsing requires optional dependency pypdf. Install with: uv sync --extra pdf"
-                ) from exc
+                external_errors.append(f"docling:{exc}")
+                if provider == "docling":
+                    fallback_used = True
+                elif provider == "auto":
+                    fallback_used = True
 
-        blocks: List[ParsedBlock] = []
-        page_texts: List[str] = []
-        for index, page in enumerate(reader.pages, start=1):
+        if doc is None:
+            parser_chain.append("pypdf")
+            doc = _parse_pypdf_pdf(path)
+
+        grobid_url = os.environ.get("GROBID_URL", "").strip()
+        if provider == "grobid" or (provider == "auto" and grobid_url):
+            if grobid_url:
+                parser_chain.append("grobid")
+                try:
+                    _merge_grobid_enrichment(doc, _fetch_grobid_enrichment(path, grobid_url))
+                except Exception as exc:
+                    external_errors.append(f"grobid:{exc}")
+                    fallback_used = True
+            else:
+                external_errors.append("grobid:GROBID_URL is not configured")
+                fallback_used = True
+
+        diagnostics = {
+            "requested_pdf_parser": provider,
+            "parser_chain": parser_chain,
+            "fallback_used": fallback_used,
+            "external_parser_errors": external_errors,
+            "adapter_statuses": pdf_adapter_statuses(),
+        }
+        doc.metadata["_parse_diagnostics"] = diagnostics
+        doc.structured["parser_chain"] = parser_chain
+        doc.structured["fallback_used"] = fallback_used
+        if external_errors:
+            doc.parse_warnings.extend(f"external_parser_failed:{item}" for item in external_errors)
+        if fallback_used:
+            doc.parse_warnings.append("fallback_used")
+        doc.parser_name = f"pdf_{provider}"
+        doc.parser_version = PARSER_VERSION
+        return doc
+
+
+def _parse_pypdf_pdf(path: Path) -> ParsedDocument:
+    try:
+        from pypdf import PdfReader  # type: ignore[import-not-found]
+    except Exception as exc:  # pragma: no cover - depends on optional package
+        try:
+            from PyPDF2 import PdfReader  # type: ignore[import-not-found,no-redef]
+        except Exception as fallback_exc:  # pragma: no cover - depends on optional package
+            raise ParseError(
+                "PDF parsing requires optional dependency 'pypdf'. Install with: uv sync --extra pdf"
+            ) from fallback_exc
+
+    try:
+        reader = PdfReader(str(path))
+    except Exception as exc:
+        raise ParseError(f"Cannot read PDF: {exc}") from exc
+
+    blocks: List[ParsedBlock] = []
+    page_texts: List[str] = []
+    for page_number, page in enumerate(reader.pages, start=1):
+        try:
             text = page.extract_text() or ""
-            page_texts.append(text)
-            for paragraph in split_paragraphs(text):
-                blocks.append(ParsedBlock(kind="paragraph", text=paragraph, page=index))
+        except Exception as exc:
+            text = ""
+            blocks.append(ParsedBlock(kind="paragraph", text=f"[page_extract_error:{exc}]", page=page_number))
+        text = text.strip()
+        if not text:
+            continue
+        page_texts.append(text)
+        blocks.append(ParsedBlock(kind="paragraph", text=text, page=page_number))
 
-        raw_text = "\n\n".join(page_texts)
-        title = path.stem
-        metadata: Dict[str, Any] = {"source_format": "pdf", "pages": len(page_texts)}
-        reader_metadata = getattr(reader, "metadata", None)
-        if reader_metadata:
-            candidate = getattr(reader_metadata, "title", None) or reader_metadata.get("/Title", "")
-            if candidate:
-                title = compact_whitespace(str(candidate))
-            author = getattr(reader_metadata, "author", None) or reader_metadata.get("/Author", "")
-            if author:
-                metadata["authors"] = _split_authors(str(author))
-        return self.finish(path, title=title or path.stem, raw_text=raw_text, blocks=blocks, metadata=metadata)
+    raw_text = "\n\n".join(page_texts)
+    metadata = {
+        "source_format": "pdf",
+        "pages": len(reader.pages),
+        "pdf_parser": "pypdf",
+    }
+    pdf_metadata = getattr(reader, "metadata", None)
+    title = path.stem
+    if pdf_metadata:
+        candidate_title = getattr(pdf_metadata, "title", None) or _metadata_get(pdf_metadata, "/Title")
+        if candidate_title:
+            title = compact_whitespace(str(candidate_title))
+        author = getattr(pdf_metadata, "author", None) or _metadata_get(pdf_metadata, "/Author")
+        if author:
+            metadata["authors"] = _split_authors(str(author))
+
+    return PdfParser().finish(
+        path,
+        title=title or path.stem,
+        raw_text=raw_text,
+        blocks=blocks,
+        metadata=metadata,
+        parser_name="pdf_pypdf",
+        parser_version=PARSER_VERSION,
+    )
+
+
+def _metadata_get(metadata: Any, key: str) -> Any:
+    try:
+        return metadata.get(key)
+    except Exception:
+        return None
+
+
+def _parse_docling_pdf(path: Path) -> ParsedDocument:
+    try:
+        from docling.document_converter import DocumentConverter  # type: ignore[import-not-found]
+    except Exception as exc:  # pragma: no cover - depends on optional package
+        raise ParseError("Docling is not installed. Install with: uv sync --extra docling") from exc
+
+    try:
+        result = DocumentConverter().convert(str(path))
+    except Exception as exc:  # pragma: no cover - external parser behavior
+        raise ParseError(f"Docling conversion failed: {exc}") from exc
+
+    document = getattr(result, "document", result)
+    structured = _docling_structured_payload(document)
+    body_md = _docling_markdown(document)
+    return _parsed_document_from_pdf_payload(
+        path,
+        {
+            "title": _title_from_structured(structured) or path.stem,
+            "raw_text": body_md,
+            "body_md": body_md,
+            "structured": structured,
+            "blocks": _blocks_from_docling_structured(structured, body_md),
+            "metadata": {
+                "source_format": "pdf",
+                "pdf_parser": "docling",
+                "pages": _page_count_from_structured(structured),
+            },
+        },
+        parser_name="pdf_docling",
+    )
+
+
+def _docling_structured_payload(document: Any) -> Dict[str, Any]:
+    for method in ("export_to_dict", "to_dict", "as_dict"):
+        candidate = getattr(document, method, None)
+        if callable(candidate):
+            try:
+                payload = candidate()
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                return payload
+    if isinstance(document, dict):
+        return document
+    return {"schema": "structured.v0", "docling_repr": str(document)}
+
+
+def _docling_markdown(document: Any) -> str:
+    for method in ("export_to_markdown", "to_markdown"):
+        candidate = getattr(document, method, None)
+        if callable(candidate):
+            try:
+                text = candidate()
+            except Exception:
+                continue
+            if text:
+                return str(text)
+    return ""
+
+
+def _parsed_document_from_pdf_payload(path: Path, payload: Dict[str, Any], parser_name: str) -> ParsedDocument:
+    blocks = payload.get("blocks") or []
+    parsed_blocks = [
+        block if isinstance(block, ParsedBlock) else _block_from_payload(block)
+        for block in blocks
+        if isinstance(block, (ParsedBlock, dict))
+    ]
+    raw_text = str(payload.get("raw_text") or "")
+    if not raw_text:
+        raw_text = "\n\n".join(
+            block.heading if block.kind == "heading" else block.text
+            for block in parsed_blocks
+            if block.heading or block.text
+        )
+    if not parsed_blocks and raw_text:
+        parsed_blocks = [ParsedBlock(kind="paragraph", text=part) for part in split_paragraphs(raw_text)]
+    metadata = dict(payload.get("metadata") or {})
+    metadata.setdefault("source_format", "pdf")
+    metadata.setdefault("pdf_parser", parser_name.removeprefix("pdf_"))
+    structured = dict(payload.get("structured") or {})
+    references = payload.get("references")
+    return PdfParser().finish(
+        path,
+        title=str(payload.get("title") or metadata.get("title") or path.stem),
+        raw_text=raw_text,
+        blocks=parsed_blocks,
+        metadata=metadata,
+        body_md=str(payload.get("body_md") or ""),
+        references=references if isinstance(references, dict) else None,
+        structured=structured if structured else None,
+        warnings=list(payload.get("warnings") or []),
+        parser_name=parser_name,
+        parser_version=PARSER_VERSION,
+    )
+
+
+def _block_from_payload(payload: Dict[str, Any]) -> ParsedBlock:
+    kind = str(payload.get("kind") or payload.get("type") or payload.get("label") or "paragraph").lower()
+    if kind in {"section_header", "title", "heading"}:
+        kind = "heading"
+    if kind in {"picture", "image"}:
+        kind = "figure"
+    heading = str(payload.get("heading") or "")
+    text = str(payload.get("text") or payload.get("content") or payload.get("caption") or "")
+    if kind == "heading" and not heading:
+        heading = text
+        text = ""
+    return ParsedBlock(
+        kind=kind,
+        text=text,
+        heading=heading,
+        level=int(payload.get("level") or 1 if kind == "heading" else 0),
+        page=_page_from_payload(payload),
+        char_start=payload.get("char_start"),
+        char_end=payload.get("char_end"),
+    )
+
+
+def _blocks_from_docling_structured(structured: Dict[str, Any], markdown: str) -> List[ParsedBlock]:
+    blocks: List[ParsedBlock] = []
+    raw_blocks = structured.get("blocks")
+    if isinstance(raw_blocks, list):
+        for item in raw_blocks:
+            if isinstance(item, dict):
+                blocks.append(_block_from_payload(item))
+    raw_texts = structured.get("texts")
+    if not blocks and isinstance(raw_texts, list):
+        for item in raw_texts:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or item.get("type") or "").lower()
+            text = str(item.get("text") or item.get("orig") or item.get("content") or "").strip()
+            if not text:
+                continue
+            kind = "heading" if label in {"section_header", "title"} else "paragraph"
+            blocks.append(
+                ParsedBlock(
+                    kind=kind,
+                    text="" if kind == "heading" else text,
+                    heading=text if kind == "heading" else "",
+                    level=1 if label == "title" else 2 if kind == "heading" else 0,
+                    page=_page_from_payload(item),
+                )
+            )
+    for item in structured.get("tables") or []:
+        if isinstance(item, dict):
+            text = str(item.get("text") or item.get("caption") or item.get("name") or "table").strip()
+            blocks.append(ParsedBlock(kind="table", text=text, page=_page_from_payload(item)))
+    for item in structured.get("figures") or structured.get("pictures") or []:
+        if isinstance(item, dict):
+            text = str(item.get("text") or item.get("caption") or item.get("name") or "figure").strip()
+            blocks.append(ParsedBlock(kind="figure", text=text, page=_page_from_payload(item)))
+    if not blocks and markdown:
+        blocks = [ParsedBlock(kind="paragraph", text=part) for part in split_paragraphs(markdown)]
+    return blocks
+
+
+def _page_from_payload(payload: Dict[str, Any]) -> Optional[int]:
+    for key in ("page", "page_no", "page_number"):
+        value = payload.get(key)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    prov = payload.get("prov")
+    if isinstance(prov, list) and prov and isinstance(prov[0], dict):
+        return _page_from_payload(prov[0])
+    return None
+
+
+def _page_count_from_structured(structured: Dict[str, Any]) -> Optional[int]:
+    pages = structured.get("pages")
+    if isinstance(pages, list):
+        return len(pages)
+    if isinstance(pages, int):
+        return pages
+    max_page = 0
+    for collection in (structured.get("blocks"), structured.get("texts"), structured.get("tables"), structured.get("figures")):
+        if not isinstance(collection, list):
+            continue
+        for item in collection:
+            if isinstance(item, dict):
+                page = _page_from_payload(item)
+                if page:
+                    max_page = max(max_page, page)
+    return max_page or None
+
+
+def _title_from_structured(structured: Dict[str, Any]) -> str:
+    for key in ("title", "name"):
+        value = structured.get(key)
+        if isinstance(value, str) and value.strip():
+            return compact_whitespace(value)
+    for item in structured.get("texts") or structured.get("blocks") or []:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or item.get("kind") or item.get("type") or "").lower()
+        if label in {"title", "document_title"}:
+            return compact_whitespace(str(item.get("text") or item.get("heading") or ""))
+    return ""
+
+
+def _fetch_grobid_enrichment(path: Path, url: str) -> Dict[str, Any]:
+    endpoint = url.rstrip("/") + "/api/processFulltextDocument"
+    boundary = "----kb-agent-grobid-boundary"
+    data = path.read_bytes()
+    body = b"".join(
+        [
+            f"--{boundary}\r\n".encode("utf-8"),
+            f'Content-Disposition: form-data; name="input"; filename="{path.name}"\r\n'.encode("utf-8"),
+            b"Content-Type: application/pdf\r\n\r\n",
+            data,
+            b"\r\n",
+            f"--{boundary}--\r\n".encode("utf-8"),
+        ]
+    )
+    request = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            tei = response.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError as exc:
+        raise ParseError(f"GROBID request failed: {exc}") from exc
+    return _parse_grobid_tei(tei)
+
+
+def _merge_grobid_enrichment(doc: ParsedDocument, enrichment: Dict[str, Any]) -> None:
+    metadata = enrichment.get("metadata") or {}
+    for key in ("title", "authors", "year", "venue", "doi", "abstract"):
+        value = metadata.get(key)
+        if value:
+            doc.metadata[key] = value
+            if key == "title":
+                doc.title = str(value)
+    references = enrichment.get("references") or []
+    if references:
+        doc.references = {
+            "schema": "references.v0",
+            "status": "extracted",
+            "source": "grobid",
+            "references": references,
+            "citation_contexts": doc.references.get("citation_contexts", []),
+        }
+    doc.metadata["grobid_enriched"] = bool(metadata or references)
+
+
+def _parse_grobid_tei(tei: str) -> Dict[str, Any]:
+    try:
+        root = ElementTree.fromstring(tei)
+    except ElementTree.ParseError as exc:
+        raise ParseError(f"Invalid GROBID TEI XML: {exc}") from exc
+
+    title_stmt = _first_descendant(root, "titleStmt")
+    source_desc = _first_descendant(root, "sourceDesc")
+    top_bibl = _first_child(source_desc, "biblStruct") if source_desc is not None else None
+    analytic = _first_child(top_bibl, "analytic") if top_bibl is not None else None
+    monogr = _first_child(top_bibl, "monogr") if top_bibl is not None else None
+    abstract_el = _first_descendant(root, "abstract")
+
+    title = _text_from_first(title_stmt, "title") or _text_from_first(analytic, "title")
+    metadata = {
+        "title": title,
+        "authors": _authors_from_element(analytic),
+        "year": _year_from_element(top_bibl),
+        "venue": _text_from_first(monogr, "title"),
+        "doi": _idno_from_element(top_bibl, "doi"),
+        "abstract": _element_text(abstract_el),
+    }
+    metadata = {key: value for key, value in metadata.items() if value}
+
+    references: List[Dict[str, Any]] = []
+    list_bibl = _first_descendant(root, "listBibl")
+    if list_bibl is not None:
+        for index, bibl in enumerate(_children(list_bibl, "biblStruct"), start=1):
+            ref_analytic = _first_child(bibl, "analytic")
+            ref_monogr = _first_child(bibl, "monogr")
+            raw = _element_text(bibl)
+            references.append(
+                {
+                    "ref_id": f"ref_{index}",
+                    "raw": raw,
+                    "authors": _authors_from_element(ref_analytic),
+                    "title": _text_from_first(ref_analytic, "title") or _text_from_first(ref_monogr, "title"),
+                    "year": _year_from_element(bibl),
+                }
+            )
+    return {"metadata": metadata, "references": references}
+
+
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _children(element: Optional[ElementTree.Element], name: str) -> List[ElementTree.Element]:
+    if element is None:
+        return []
+    return [child for child in list(element) if _local_name(child.tag) == name]
+
+
+def _first_child(element: Optional[ElementTree.Element], name: str) -> Optional[ElementTree.Element]:
+    children = _children(element, name)
+    return children[0] if children else None
+
+
+def _first_descendant(element: Optional[ElementTree.Element], name: str) -> Optional[ElementTree.Element]:
+    if element is None:
+        return None
+    for child in element.iter():
+        if _local_name(child.tag) == name:
+            return child
+    return None
+
+
+def _element_text(element: Optional[ElementTree.Element]) -> str:
+    if element is None:
+        return ""
+    return compact_whitespace(" ".join(text for text in element.itertext() if text))
+
+
+def _text_from_first(element: Optional[ElementTree.Element], name: str) -> str:
+    return _element_text(_first_descendant(element, name))
+
+
+def _idno_from_element(element: Optional[ElementTree.Element], wanted_type: str) -> str:
+    if element is None:
+        return ""
+    for child in element.iter():
+        if _local_name(child.tag) != "idno":
+            continue
+        id_type = str(child.attrib.get("type") or "").lower()
+        if id_type == wanted_type.lower():
+            return compact_whitespace(child.text or "")
+    return ""
+
+
+def _year_from_element(element: Optional[ElementTree.Element]) -> Optional[int]:
+    if element is None:
+        return None
+    for child in element.iter():
+        if _local_name(child.tag) != "date":
+            continue
+        for key in ("when", "from", "notBefore"):
+            value = child.attrib.get(key)
+            if value:
+                match = re.search(r"\b(19|20)\d{2}\b", value)
+                if match:
+                    return int(match.group(0))
+        match = re.search(r"\b(19|20)\d{2}\b", _element_text(child))
+        if match:
+            return int(match.group(0))
+    return None
+
+
+def _authors_from_element(element: Optional[ElementTree.Element]) -> List[str]:
+    authors: List[str] = []
+    for author in _children(element, "author"):
+        pers = _first_descendant(author, "persName")
+        if pers is not None:
+            forenames = [_element_text(item) for item in _children(pers, "forename")]
+            surname = _text_from_first(pers, "surname")
+            name = compact_whitespace(" ".join([*forenames, surname]))
+        else:
+            name = _element_text(author)
+        if name:
+            authors.append(name)
+    return authors
 
 
 SEMANTIC_BLOCK_KINDS = {"abstract", "keywords", "figure", "table", "reference"}
@@ -487,13 +989,18 @@ def get_parser(path: Path) -> ParserAdapter:
     raise ParseError(f"Unsupported file type: {path.suffix.lower()}")
 
 
-def parser_identity_for_path(path: Path) -> tuple[str, str]:
+def parser_identity_for_path(path: Path, pdf_parser: Optional[str] = None) -> tuple[str, str]:
     parser = get_parser(path)
+    if isinstance(parser, PdfParser):
+        return f"pdf_{resolve_pdf_parser(pdf_parser)}", PARSER_VERSION
     return parser.name, parser.version
 
 
-def parse_document(path: Path) -> ParsedDocument:
-    return get_parser(path).parse(path)
+def parse_document(path: Path, pdf_parser: Optional[str] = None) -> ParsedDocument:
+    parser = get_parser(path)
+    if isinstance(parser, PdfParser):
+        return parser.parse(path, pdf_parser=pdf_parser)
+    return parser.parse(path)
 
 
 def blocks_to_markdown(blocks: List[ParsedBlock], title: str) -> str:

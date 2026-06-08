@@ -49,10 +49,21 @@ def get_parse_quality(db_path: Path, doc_id: str) -> Dict[str, Any]:
         "reference_count": None,
         "figure_count": None,
         "table_count": None,
+        "parser_chain": [card.get("parser_name")],
+        "fallback_used": False,
+        "metadata_score": None,
+        "structure_score": None,
+        "reference_score": None,
+        "quality_level": "usable" if card.get("section_count", 0) else "weak",
+        "warning_count": len(card.get("quality_warnings", [])),
         "missing_abstract": not bool(card.get("abstract")),
         "page_only_tree": bool(card.get("section_count", 0) == 0),
         "quality_warnings": card.get("quality_warnings", []),
     }
+
+
+def get_parse_report(db_path: Path, doc_id: str, version_id: Optional[str] = None) -> Dict[str, Any]:
+    return get_artifact(db_path, doc_id, "parse_report.json", version_id=version_id)["content"]
 
 
 def get_innovations(db_path: Path, doc_id: str, version_id: Optional[str] = None) -> Dict[str, Any]:
