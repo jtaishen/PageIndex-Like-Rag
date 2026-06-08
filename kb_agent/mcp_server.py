@@ -4,9 +4,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .answer import answer_query, route_documents
-from .artifacts import get_artifact, get_doc_card, get_parse_quality
+from .artifacts import get_artifact, get_citation_map, get_doc_card, get_innovations, get_parse_quality
 from .config import resolve_db_path
 from .ingest import sync_directory
+from .insights import extract_doc_insights
 from .memory import put_memory, search_memory
 from .search import get_evidence, search_nodes
 
@@ -76,6 +77,33 @@ if FastMCP is not None:
     def kb_get_parse_quality(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
         """Return parse quality metrics and warnings for one indexed document."""
         return get_parse_quality(resolve_db_path(db_path), doc_id)
+
+    @mcp.tool()
+    def kb_extract_doc_insights(
+        doc_id: str,
+        force: bool = False,
+        use_llm: bool = True,
+        require_llm: bool = False,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Extract or refresh innovation and citation-map artifacts for one document."""
+        return extract_doc_insights(
+            resolve_db_path(db_path),
+            doc_id,
+            force=force,
+            use_llm=use_llm,
+            require_llm=require_llm,
+        )
+
+    @mcp.tool()
+    def kb_get_innovations(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return the extracted innovation artifact for one document."""
+        return get_innovations(resolve_db_path(db_path), doc_id)
+
+    @mcp.tool()
+    def kb_get_citation_map(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return the extracted citation map artifact for one document."""
+        return get_citation_map(resolve_db_path(db_path), doc_id)
 
     @mcp.tool()
     def kb_answer(

@@ -55,6 +55,14 @@ def get_parse_quality(db_path: Path, doc_id: str) -> Dict[str, Any]:
     }
 
 
+def get_innovations(db_path: Path, doc_id: str, version_id: Optional[str] = None) -> Dict[str, Any]:
+    return get_artifact(db_path, doc_id, "innovation.json", version_id=version_id)["content"]
+
+
+def get_citation_map(db_path: Path, doc_id: str, version_id: Optional[str] = None) -> Dict[str, Any]:
+    return get_artifact(db_path, doc_id, "citation_map.json", version_id=version_id)["content"]
+
+
 def list_artifacts(db_path: Path, doc_id: str, version_id: Optional[str] = None) -> Dict[str, Any]:
     conn = db.connect(db_path)
     db.init_db(conn)

@@ -16,7 +16,7 @@ parse -> normalize -> tree -> artifacts -> indexes -> evidence packet -> CLI / M
 - 将文档保存为 `documents` 和 `doc_nodes`。
 - 使用 SQLite FTS5 做全文检索。
 - 返回带 `doc_id`、`node_id`、`node_path`、页码和 excerpt 的 evidence packet。
-- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`。
+- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`extract`、`innovations`、`citations`。
 - 提供可选 MCP server，供 OpenCode 调用。
 
 ## 快速开始
@@ -62,6 +62,27 @@ uv run python -m kb_agent.cli quality <doc_id>
 
 ```bash
 uv run python -m kb_agent.cli ask "这篇论文的主要研究内容是什么？" --no-llm
+```
+
+## v0.4 论文理解工件抽取
+
+生成或刷新单篇论文的创新点与引用关系工件：
+
+```bash
+uv run python -m kb_agent.cli extract <doc_id>
+```
+
+如果只使用规则抽取、不调用 DeepSeek：
+
+```bash
+uv run python -m kb_agent.cli extract <doc_id> --no-llm --force
+```
+
+查看抽取结果：
+
+```bash
+uv run python -m kb_agent.cli innovations <doc_id>
+uv run python -m kb_agent.cli citations <doc_id>
 ```
 
 ## PDF 和 MCP 可选依赖
@@ -129,7 +150,7 @@ DeepSeek 官方 OpenCode 接入方式：
 推荐工具调用顺序：
 
 ```text
-kb_sync -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_search_tree -> kb_get_evidence -> kb_answer
+kb_sync -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_search_tree -> kb_get_evidence -> kb_answer
 ```
 
 ## 测试
@@ -141,6 +162,5 @@ uv run python -m unittest discover -s tests
 ## 后续阶段
 
 - 接入 GROBID / Docling / Marker 提升 PDF 解析质量。
-- 抽取 innovation.json、citation_map.json 的真实内容。
 - 增加跨论文比较和综述任务工件。
 - 加入 memory write gate、TTL、去重、压缩和 OpenCode plugin hook。

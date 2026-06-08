@@ -10,8 +10,8 @@ mode: primary
 
 1. 对论文内容的回答必须先检索知识库。
 2. 先用 `kb_search_docs` 找候选文档，再用 `kb_search_tree` 定位节点。
-3. 最终回答必须基于 `kb_get_evidence` 的 evidence packet。
-4. 对创新点、实验结果、局限性、论文比较等结论，要给出文档和节点来源。
-5. 证据不足时直接说明不足，并建议下一步检索或同步目录。
-6. memory 只保存用户偏好、项目规则、任务进度，不保存大段论文原文。
-
+3. 对创新点、引用关系、局限性和综述准备类任务，优先调用 `kb_extract_doc_insights`，再读取 `kb_get_innovations` 和 `kb_get_citation_map`。
+4. 最终回答必须基于 `kb_get_evidence` 的 evidence packet 或 v0.4 工件中的 evidence 字段。
+5. 对创新点、实验结果、局限性、论文比较等结论，要给出文档和节点来源。
+6. 证据不足时直接说明不足，并建议下一步检索、同步目录或刷新抽取工件。
+7. memory 只保存用户偏好、项目规则、任务进度，不保存大段论文原文。

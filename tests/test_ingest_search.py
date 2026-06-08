@@ -5,13 +5,16 @@ import io
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from kb_agent import db
 from kb_agent.answer import answer_query
-from kb_agent.artifacts import get_artifact, get_doc_card, get_parse_quality, list_artifacts
+from kb_agent.artifacts import get_artifact, get_citation_map, get_doc_card, get_innovations, get_parse_quality, list_artifacts
 from kb_agent.cli import main as cli_main
 from kb_agent.ingest import sync_directory
+from kb_agent.insights import extract_doc_insights
+from kb_agent.llm import LLMError
 from kb_agent.search import get_evidence, search_documents, search_nodes
 
 
@@ -168,6 +171,97 @@ class IngestSearchTest(unittest.TestCase):
                 cli_main(["--db", str(db_path), "quality", doc_id])
             self.assertIn("section_count", stdout.getvalue())
 
+    def test_rule_based_insight_extraction_writes_v1_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_id = _sync_insight_sample(Path(tmp))
+
+            result = extract_doc_insights(db_path, doc_id, use_llm=False)
+            innovation = result["innovation"]
+            citation_map = result["citation_map"]
+
+            self.assertEqual(innovation["schema"], "innovation.v1")
+            self.assertEqual(innovation["status"], "partial")
+            self.assertGreaterEqual(len(innovation["items"]), 1)
+            self.assertIn("llm_disabled", innovation["warnings"])
+            evidence = innovation["items"][0]["evidence"][0]
+            self.assertIn("node_id", evidence)
+            self.assertIn("page_range", evidence)
+
+            self.assertEqual(citation_map["schema"], "citation_map.v1")
+            self.assertEqual(citation_map["status"], "extracted")
+            self.assertGreaterEqual(len(citation_map["references"]), 3)
+            ref_ids = {item["ref_id"] for item in citation_map["in_text_citations"]}
+            self.assertIn("ref_1", ref_ids)
+            self.assertIn("ref_2", ref_ids)
+            self.assertIn("ref_3", ref_ids)
+            self.assertGreaterEqual(len(citation_map["relations"]), 3)
+            self.assertIn("node_id", citation_map["relations"][0])
+
+            self.assertEqual(get_innovations(db_path, doc_id)["schema"], "innovation.v1")
+            self.assertEqual(get_citation_map(db_path, doc_id)["schema"], "citation_map.v1")
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "innovations", doc_id])
+            self.assertIn("innovation.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "citations", doc_id])
+            self.assertIn("citation_map.v1", stdout.getvalue())
+
+    def test_llm_insight_extraction_normalizes_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_id = _sync_insight_sample(Path(tmp))
+            first_node = get_artifact(db_path, doc_id, "node_index.jsonl")["content"][2]["node_id"]
+            payload = {
+                "items": [
+                    {
+                        "title": "动态角色发现机制",
+                        "type": "method",
+                        "claim": "提出动态角色发现机制以提升任务分解效率。",
+                        "problem": "静态角色难以适应动态任务。",
+                        "approach": "使用动作编码器和聚类构建角色模型。",
+                        "evidence": [first_node],
+                        "confidence": 0.82,
+                    }
+                ],
+                "limitations": ["真实场景仍需要更多验证。"],
+                "open_questions": ["复杂通信约束下如何扩展？"],
+                "warnings": [],
+            }
+
+            with mock.patch("kb_agent.insights.generate_json_object", return_value=payload):
+                result = extract_doc_insights(db_path, doc_id, force=True, use_llm=True)
+
+            innovation = result["innovation"]
+            self.assertEqual(innovation["status"], "extracted")
+            self.assertEqual(innovation["source"], "llm")
+            self.assertEqual(innovation["items"][0]["confidence"], 0.82)
+            self.assertIn("node_id", innovation["items"][0]["evidence"][0])
+            self.assertIn("真实场景", innovation["limitations"][0])
+
+    def test_extract_requires_llm_does_not_overwrite_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_id = _sync_insight_sample(Path(tmp))
+
+            with mock.patch("kb_agent.insights.generate_json_object", side_effect=LLMError("boom")):
+                with self.assertRaises(LLMError):
+                    extract_doc_insights(db_path, doc_id, force=True, use_llm=True, require_llm=True)
+
+            innovation = get_artifact(db_path, doc_id, "innovation.json")["content"]
+            self.assertEqual(innovation["schema"], "innovation.v0")
+
+            with mock.patch("kb_agent.insights.generate_json_object", side_effect=LLMError("boom")):
+                result = extract_doc_insights(db_path, doc_id, force=True, use_llm=True)
+            self.assertEqual(result["innovation"]["status"], "partial")
+            self.assertTrue(any("llm_unavailable" in item for item in result["innovation"]["warnings"]))
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "extract", doc_id, "--force", "--no-llm"])
+            self.assertIn("innovation.v1", stdout.getvalue())
+
     def test_failed_parse_records_report_and_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -262,6 +356,40 @@ def _collect_tree_types(node: dict) -> set[str]:
     for child in node.get("children", []):
         types.update(_collect_tree_types(child))
     return types
+
+
+def _sync_insight_sample(root: Path) -> tuple[Path, str]:
+    papers = root / "papers"
+    papers.mkdir()
+    db_path = root / "kb.sqlite"
+    (papers / "insight.txt").write_text(
+        "摘要：本文研究多智能体系统中的分布式任务规划，重点解决动态任务分配、"
+        "角色适配和负载均衡问题，并提出可扩展的协同规划框架。\n"
+        "关键词：多智能体；任务规划；动态角色\n\n"
+        "第一章 绪论\n"
+        "现有任务分配方法在动态任务环境中存在适应性不足的问题[1]。\n\n"
+        "1.4 研究内容与主要贡献\n"
+        "本文的研究内容包括三个方面：提出动态角色发现机制，设计动态任务重分配算法，"
+        "并构建基于均衡性的分布式任务分配模型。该方法引用已有任务规划研究[1]，"
+        "并对分布式系统综述和任务分配方法进行扩展[2-3]。\n\n"
+        "2.1 方法设计\n"
+        "本文设计动作编码器和聚类方法构建角色模型，提出任务驱动的重分配算法，"
+        "以降低通信和计算开销。\n\n"
+        "3.1 实验结果\n"
+        "实验结果表明，该方法在任务完成率、响应时间和负载均衡方面优于基线方法。\n\n"
+        "结论\n"
+        "本文仍存在真实场景验证不足的局限，未来工作将扩展到复杂通信约束。\n\n"
+        "参考文献\n"
+        "[1] 张三. 多智能体任务规划研究. 2024.\n"
+        "[2] 李四. 分布式系统综述. 2023.\n"
+        "[3] Wang. Task Allocation for Multi-Agent Systems. 2022.\n",
+        encoding="utf-8",
+    )
+    report = sync_directory(papers, db_path)
+    if report["failed"]:
+        raise AssertionError(report["errors"])
+    doc_id = str(search_documents(db_path, "动态角色", top_k=1)[0]["doc_id"])
+    return db_path, doc_id
 
 
 if __name__ == "__main__":

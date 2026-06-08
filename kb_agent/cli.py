@@ -7,9 +7,10 @@ from typing import Any
 
 from . import db
 from .answer import answer_query, route_documents
-from .artifacts import get_doc_card, get_parse_quality, list_artifacts
+from .artifacts import get_citation_map, get_doc_card, get_innovations, get_parse_quality, list_artifacts
 from .config import resolve_db_path
 from .ingest import sync_directory
+from .insights import extract_doc_insights
 from .memory import put_memory, search_memory
 from .search import get_evidence, search_nodes
 
@@ -46,6 +47,18 @@ def main(argv: Any = None) -> None:
 
     quality_parser = subparsers.add_parser("quality", help="Show parse quality for a document")
     quality_parser.add_argument("doc_id")
+
+    extract_parser = subparsers.add_parser("extract", help="Extract paper insight artifacts")
+    extract_parser.add_argument("doc_id")
+    extract_parser.add_argument("--force", action="store_true")
+    extract_parser.add_argument("--no-llm", action="store_true", help="Use rule-based extraction only")
+    extract_parser.add_argument("--require-llm", action="store_true", help="Fail if DeepSeek cannot be called")
+
+    innovations_parser = subparsers.add_parser("innovations", help="Show extracted innovation artifact")
+    innovations_parser.add_argument("doc_id")
+
+    citations_parser = subparsers.add_parser("citations", help="Show extracted citation map artifact")
+    citations_parser.add_argument("doc_id")
 
     evidence_parser = subparsers.add_parser("evidence", help="Get evidence packets")
     evidence_parser.add_argument("doc_id")
@@ -90,6 +103,19 @@ def main(argv: Any = None) -> None:
         _print_json(list_artifacts(db_path, args.doc_id, args.version_id))
     elif args.command == "quality":
         _print_json(get_parse_quality(db_path, args.doc_id))
+    elif args.command == "extract":
+        result = extract_doc_insights(
+            db_path,
+            args.doc_id,
+            force=args.force,
+            use_llm=not args.no_llm,
+            require_llm=args.require_llm,
+        )
+        _print_json(_extract_summary(result))
+    elif args.command == "innovations":
+        _print_json(get_innovations(db_path, args.doc_id))
+    elif args.command == "citations":
+        _print_json(get_citation_map(db_path, args.doc_id))
     elif args.command == "evidence":
         _print_json([packet.to_dict() for packet in get_evidence(db_path, args.doc_id, args.node_ids)])
     elif args.command == "ask":
@@ -153,6 +179,34 @@ def _print_tree(db_path: Path, doc_id: str) -> None:
 
 def _print_json(payload: object) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _extract_summary(result: dict) -> dict:
+    innovation = result.get("innovation") or {}
+    citation_map = result.get("citation_map") or {}
+    return {
+        "doc_id": result.get("doc_id"),
+        "version_id": result.get("version_id"),
+        "artifact_dir": result.get("artifact_dir"),
+        "skipped": result.get("skipped", False),
+        "innovation_path": result.get("innovation_path"),
+        "citation_map_path": result.get("citation_map_path"),
+        "innovation": {
+            "schema": innovation.get("schema"),
+            "status": innovation.get("status"),
+            "item_count": len(innovation.get("items") or []),
+            "warning_count": len(innovation.get("warnings") or []),
+        },
+        "citation_map": {
+            "schema": citation_map.get("schema"),
+            "status": citation_map.get("status"),
+            "reference_count": len(citation_map.get("references") or []),
+            "in_text_citation_count": len(citation_map.get("in_text_citations") or []),
+            "relation_count": len(citation_map.get("relations") or []),
+            "warning_count": len(citation_map.get("warnings") or []),
+        },
+        "llm_error": result.get("llm_error", ""),
+    }
 
 
 if __name__ == "__main__":

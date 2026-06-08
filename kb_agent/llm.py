@@ -54,9 +54,9 @@ def generate_grounded_answer(
     if not evidence:
         raise LLMError("No evidence was provided to the LLM.")
 
-    body: Dict[str, object] = {
-        "model": resolved.model,
-        "messages": [
+    body = _chat_body(
+        resolved,
+        [
             {
                 "role": "system",
                 "content": (
@@ -67,16 +67,45 @@ def generate_grounded_answer(
             },
             {"role": "user", "content": build_grounded_prompt(query, evidence)},
         ],
+    )
+    return _chat_completion_content(body, resolved)
+
+
+def generate_json_object(
+    system_prompt: str,
+    user_prompt: str,
+    settings: Optional[LLMSettings] = None,
+) -> Dict[str, object]:
+    resolved = settings or get_llm_settings()
+    if resolved is None:
+        raise LLMError("DEEPSEEK_API_KEY is not configured.")
+    body = _chat_body(
+        resolved,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    content = _chat_completion_content(body, resolved)
+    return _parse_json_object(content)
+
+
+def _chat_body(resolved: LLMSettings, messages: List[Dict[str, str]]) -> Dict[str, object]:
+    body: Dict[str, object] = {
+        "model": resolved.model,
+        "messages": messages,
         "temperature": resolved.temperature,
         "max_tokens": resolved.max_tokens,
         "stream": False,
     }
-
     thinking = os.environ.get("DEEPSEEK_THINKING", "").strip().lower()
     if thinking in {"enabled", "true", "1", "yes"}:
         body["thinking"] = {"type": "enabled"}
         body["reasoning_effort"] = os.environ.get("DEEPSEEK_REASONING_EFFORT", "medium")
+    return body
 
+
+def _chat_completion_content(body: Dict[str, object], resolved: LLMSettings) -> str:
     request = urllib.request.Request(
         url=f"{resolved.base_url}/chat/completions",
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -105,6 +134,29 @@ def generate_grounded_answer(
     return str(content).strip()
 
 
+def _parse_json_object(content: str) -> Dict[str, object]:
+    text = content.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            raise LLMError(f"DeepSeek did not return a JSON object: {content[:200]}")
+        try:
+            payload = json.loads(text[start : end + 1])
+        except json.JSONDecodeError as exc:
+            raise LLMError(f"DeepSeek returned invalid JSON: {content[:200]}") from exc
+    if not isinstance(payload, dict):
+        raise LLMError("DeepSeek JSON response is not an object.")
+    return payload
+
+
 def build_grounded_prompt(query: str, evidence: Iterable[Dict[str, object]]) -> str:
     lines = [
         f"用户问题：{query}",
@@ -125,4 +177,3 @@ def build_grounded_prompt(query: str, evidence: Iterable[Dict[str, object]]) -> 
         lines.append("")
     lines.append("请基于以上证据回答用户问题。")
     return "\n".join(lines)
-
