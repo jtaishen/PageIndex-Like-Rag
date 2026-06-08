@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Dict, List, Optional
 
 from .models import NodeRecord, ParsedBlock, ParsedDocument
 from .utils import chunk_text, first_words, stable_id
 
 
-def build_document_tree(doc_id: str, parsed: ParsedDocument) -> List[NodeRecord]:
+def build_document_tree(doc_id: str, parsed: ParsedDocument, doc_hash: str = "") -> List[NodeRecord]:
     root = NodeRecord(
         node_id=stable_id("node", doc_id, "root"),
         doc_id=doc_id,
@@ -21,6 +22,9 @@ def build_document_tree(doc_id: str, parsed: ParsedDocument) -> List[NodeRecord]
         page_start=None,
         page_end=None,
         order_index=0,
+        keywords=_keywords(parsed.title, parsed.raw_text),
+        source_offsets={},
+        doc_hash=doc_hash,
     )
     nodes: List[NodeRecord] = [root]
     heading_stack: Dict[int, NodeRecord] = {0: root}
@@ -52,6 +56,9 @@ def build_document_tree(doc_id: str, parsed: ParsedDocument) -> List[NodeRecord]
                     page_start=block.page,
                     page_end=block.page,
                     order_index=order,
+                    keywords=_keywords(block.heading),
+                    source_offsets=_source_offsets(block),
+                    doc_hash=doc_hash,
                 )
                 nodes.append(heading_node)
                 heading_stack[block.level] = heading_node
@@ -64,7 +71,7 @@ def build_document_tree(doc_id: str, parsed: ParsedDocument) -> List[NodeRecord]
             first_heading = False
 
             for chunk in chunk_text(block.text):
-                leaf = _leaf_node(doc_id, current_parent, chunk, order, block)
+                leaf = _leaf_node(doc_id, current_parent, chunk, order, block, doc_hash)
                 nodes.append(leaf)
                 order += 1
         _fill_section_summaries(nodes)
@@ -88,12 +95,15 @@ def build_document_tree(doc_id: str, parsed: ParsedDocument) -> List[NodeRecord]
                 page_start=group_key,
                 page_end=group_key,
                 order_index=order,
+                keywords=_keywords(f"Page {group_key}"),
+                source_offsets={},
+                doc_hash=doc_hash,
             )
             nodes.append(parent)
             order += 1
         for block in blocks:
             for chunk in chunk_text(block.text):
-                leaf = _leaf_node(doc_id, parent, chunk, order, block)
+                leaf = _leaf_node(doc_id, parent, chunk, order, block, doc_hash)
                 nodes.append(leaf)
                 order += 1
     _fill_section_summaries(nodes)
@@ -110,6 +120,10 @@ def tree_to_dict(nodes: List[NodeRecord]) -> Dict[str, object]:
             "node_path": node.node_path,
             "page_start": node.page_start,
             "page_end": node.page_end,
+            "page_range": [node.page_start, node.page_end],
+            "keywords": node.keywords,
+            "source_offsets": node.source_offsets,
+            "doc_hash": node.doc_hash,
             "children": [],
         }
         for node in nodes
@@ -139,6 +153,7 @@ def _leaf_node(
     text: str,
     order: int,
     block: ParsedBlock,
+    doc_hash: str = "",
 ) -> NodeRecord:
     heading = first_words(text, 10)
     return NodeRecord(
@@ -156,6 +171,9 @@ def _leaf_node(
         order_index=order,
         char_start=block.char_start,
         char_end=block.char_end,
+        keywords=_keywords(parent.heading, text),
+        source_offsets=_source_offsets(block),
+        doc_hash=doc_hash,
     )
 
 
@@ -177,3 +195,34 @@ def _fill_section_summaries(nodes: List[NodeRecord]) -> None:
         child_text = " ".join(child.summary or child.text for child in children.get(node.node_id, []))
         if child_text:
             node.summary = first_words(child_text, 50)
+            if not node.keywords:
+                node.keywords = _keywords(node.heading, child_text)
+
+
+def _source_offsets(block: ParsedBlock) -> Dict[str, Optional[int]]:
+    return {
+        "char_start": block.char_start,
+        "char_end": block.char_end,
+        "page_start": block.page,
+        "page_end": block.page,
+    }
+
+
+def _keywords(*values: str, limit: int = 10) -> List[str]:
+    text = " ".join(value for value in values if value)
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,}", text)
+    seen = set()
+    result = []
+    stopwords = {
+        "the", "and", "for", "with", "from", "this", "that", "are", "was",
+        "into", "about", "研究", "系统", "方法", "问题", "分析",
+    }
+    for token in tokens:
+        normalized = token.lower() if token.isascii() else token
+        if normalized in stopwords or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(token)
+        if len(result) >= limit:
+            break
+    return result

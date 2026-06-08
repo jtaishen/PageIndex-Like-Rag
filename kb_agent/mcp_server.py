@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .answer import answer_query, route_documents
+from .artifacts import get_artifact, get_doc_card
 from .config import resolve_db_path
 from .ingest import sync_directory
 from .memory import put_memory, search_memory
@@ -55,6 +56,21 @@ if FastMCP is not None:
             packet.to_dict()
             for packet in get_evidence(resolve_db_path(db_path), doc_id, node_ids)
         ]
+
+    @mcp.tool()
+    def kb_get_doc_card(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return the structured document card for one indexed document."""
+        return get_doc_card(resolve_db_path(db_path), doc_id)
+
+    @mcp.tool()
+    def kb_get_artifact(
+        doc_id: str,
+        name: str,
+        version_id: Optional[str] = None,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return a whitelisted generated artifact for one indexed document."""
+        return get_artifact(resolve_db_path(db_path), doc_id, name, version_id=version_id)
 
     @mcp.tool()
     def kb_answer(

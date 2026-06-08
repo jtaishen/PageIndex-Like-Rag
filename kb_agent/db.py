@@ -3,12 +3,13 @@ from __future__ import annotations
 import sqlite3
 import time
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional
+import json
 
 from .models import DocumentRecord, EvidencePacket, NodeRecord
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -39,6 +40,14 @@ def init_db(conn: sqlite3.Connection) -> None:
             summary TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'ready',
             error TEXT NOT NULL DEFAULT '',
+            authors TEXT NOT NULL DEFAULT '[]',
+            year INTEGER,
+            venue TEXT NOT NULL DEFAULT '',
+            doi TEXT NOT NULL DEFAULT '',
+            abstract TEXT NOT NULL DEFAULT '',
+            keywords TEXT NOT NULL DEFAULT '[]',
+            parser_name TEXT NOT NULL DEFAULT '',
+            parser_version TEXT NOT NULL DEFAULT '',
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         );
@@ -57,7 +66,10 @@ def init_db(conn: sqlite3.Connection) -> None:
             page_end INTEGER,
             order_index INTEGER NOT NULL,
             char_start INTEGER,
-            char_end INTEGER
+            char_end INTEGER,
+            keywords TEXT NOT NULL DEFAULT '[]',
+            source_offsets TEXT NOT NULL DEFAULT '{}',
+            doc_hash TEXT NOT NULL DEFAULT ''
         );
 
         CREATE VIRTUAL TABLE IF NOT EXISTS doc_nodes_fts USING fts5(
@@ -93,16 +105,70 @@ def init_db(conn: sqlite3.Connection) -> None:
             created_at REAL NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS document_versions (
+            version_id TEXT PRIMARY KEY,
+            doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+            file_hash TEXT NOT NULL,
+            parser_name TEXT NOT NULL,
+            parser_version TEXT NOT NULL,
+            artifact_dir TEXT NOT NULL,
+            parse_status TEXT NOT NULL,
+            error TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS doc_cards (
+            doc_id TEXT PRIMARY KEY REFERENCES documents(doc_id) ON DELETE CASCADE,
+            version_id TEXT NOT NULL,
+            card_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_doc_nodes_doc_id ON doc_nodes(doc_id);
         CREATE INDEX IF NOT EXISTS idx_doc_nodes_parent_id ON doc_nodes(parent_id);
         CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path);
+        CREATE INDEX IF NOT EXISTS idx_document_versions_doc_id ON document_versions(doc_id);
         """
+    )
+    _ensure_columns(
+        conn,
+        "documents",
+        {
+            "authors": "TEXT NOT NULL DEFAULT '[]'",
+            "year": "INTEGER",
+            "venue": "TEXT NOT NULL DEFAULT ''",
+            "doi": "TEXT NOT NULL DEFAULT ''",
+            "abstract": "TEXT NOT NULL DEFAULT ''",
+            "keywords": "TEXT NOT NULL DEFAULT '[]'",
+            "parser_name": "TEXT NOT NULL DEFAULT ''",
+            "parser_version": "TEXT NOT NULL DEFAULT ''",
+        },
+    )
+    _ensure_columns(
+        conn,
+        "doc_nodes",
+        {
+            "keywords": "TEXT NOT NULL DEFAULT '[]'",
+            "source_offsets": "TEXT NOT NULL DEFAULT '{}'",
+            "doc_hash": "TEXT NOT NULL DEFAULT ''",
+        },
     )
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
         (str(SCHEMA_VERSION),),
     )
     conn.commit()
+
+
+def _ensure_columns(conn: sqlite3.Connection, table: str, columns: Dict[str, str]) -> None:
+    existing = {
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    for name, definition in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 def get_document_by_path(conn: sqlite3.Connection, path: str) -> Optional[sqlite3.Row]:
@@ -127,9 +193,10 @@ def upsert_document(conn: sqlite3.Connection, record: DocumentRecord) -> None:
         """
         INSERT INTO documents(
             doc_id, path, hash, title, file_type, size, mtime, summary, status, error,
+            authors, year, venue, doi, abstract, keywords, parser_name, parser_version,
             created_at, updated_at
         )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(doc_id) DO UPDATE SET
             path = excluded.path,
             hash = excluded.hash,
@@ -140,6 +207,14 @@ def upsert_document(conn: sqlite3.Connection, record: DocumentRecord) -> None:
             summary = excluded.summary,
             status = excluded.status,
             error = excluded.error,
+            authors = excluded.authors,
+            year = excluded.year,
+            venue = excluded.venue,
+            doi = excluded.doi,
+            abstract = excluded.abstract,
+            keywords = excluded.keywords,
+            parser_name = excluded.parser_name,
+            parser_version = excluded.parser_version,
             updated_at = excluded.updated_at
         """,
         (
@@ -153,6 +228,14 @@ def upsert_document(conn: sqlite3.Connection, record: DocumentRecord) -> None:
             record.summary,
             record.status,
             record.error,
+            json.dumps(record.authors, ensure_ascii=False),
+            record.year,
+            record.venue,
+            record.doi,
+            record.abstract,
+            json.dumps(record.keywords, ensure_ascii=False),
+            record.parser_name,
+            record.parser_version,
             now,
             now,
         ),
@@ -179,6 +262,9 @@ def insert_nodes(conn: sqlite3.Connection, nodes: Iterable[NodeRecord]) -> None:
                 node.order_index,
                 node.char_start,
                 node.char_end,
+                json.dumps(node.keywords, ensure_ascii=False),
+                json.dumps(node.source_offsets, ensure_ascii=False),
+                node.doc_hash,
             )
         )
         fts_rows.append(
@@ -195,9 +281,10 @@ def insert_nodes(conn: sqlite3.Connection, nodes: Iterable[NodeRecord]) -> None:
         """
         INSERT OR REPLACE INTO doc_nodes(
             node_id, doc_id, parent_id, type, heading, summary, text, level,
-            node_path, page_start, page_end, order_index, char_start, char_end
+            node_path, page_start, page_end, order_index, char_start, char_end,
+            keywords, source_offsets, doc_hash
         )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         node_rows,
     )
@@ -214,6 +301,80 @@ def list_documents(conn: sqlite3.Connection) -> List[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM documents ORDER BY updated_at DESC, title ASC"
     ).fetchall()
+
+
+def insert_document_version(
+    conn: sqlite3.Connection,
+    *,
+    version_id: str,
+    doc_id: str,
+    file_hash: str,
+    parser_name: str,
+    parser_version: str,
+    artifact_dir: str,
+    parse_status: str,
+    error: str = "",
+) -> None:
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO document_versions(
+            version_id, doc_id, file_hash, parser_name, parser_version,
+            artifact_dir, parse_status, error, created_at
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            version_id,
+            doc_id,
+            file_hash,
+            parser_name,
+            parser_version,
+            artifact_dir,
+            parse_status,
+            error,
+            time.time(),
+        ),
+    )
+
+
+def upsert_doc_card(conn: sqlite3.Connection, doc_id: str, version_id: str, card: Dict[str, object]) -> None:
+    now = time.time()
+    conn.execute(
+        """
+        INSERT INTO doc_cards(doc_id, version_id, card_json, created_at, updated_at)
+        VALUES(?, ?, ?, ?, ?)
+        ON CONFLICT(doc_id) DO UPDATE SET
+            version_id = excluded.version_id,
+            card_json = excluded.card_json,
+            updated_at = excluded.updated_at
+        """,
+        (doc_id, version_id, json.dumps(card, ensure_ascii=False), now, now),
+    )
+
+
+def get_doc_card(conn: sqlite3.Connection, doc_id: str) -> Optional[Dict[str, object]]:
+    row = conn.execute("SELECT card_json FROM doc_cards WHERE doc_id = ?", (doc_id,)).fetchone()
+    if not row:
+        return None
+    return json.loads(row["card_json"])
+
+
+def get_document_version(conn: sqlite3.Connection, doc_id: str, version_id: Optional[str] = None) -> Optional[sqlite3.Row]:
+    if version_id:
+        return conn.execute(
+            "SELECT * FROM document_versions WHERE doc_id = ? AND version_id = ?",
+            (doc_id, version_id),
+        ).fetchone()
+    return conn.execute(
+        """
+        SELECT *
+        FROM document_versions
+        WHERE doc_id = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (doc_id,),
+    ).fetchone()
 
 
 def get_doc_tree_rows(conn: sqlite3.Connection, doc_id: str) -> List[sqlite3.Row]:
@@ -256,7 +417,7 @@ def get_evidence_packets(
                 node_path=row["node_path"],
                 page_range=(row["page_start"], row["page_end"]),
                 excerpt=text,
-                evidence_type=row["type"],
+                evidence_type=_classify_evidence_type(row["type"], row["node_path"], row["heading"]),
                 confidence=0.75,
                 title=row["title"],
                 path=row["path"],
@@ -264,3 +425,19 @@ def get_evidence_packets(
         )
     return packets
 
+
+def _classify_evidence_type(kind: str, node_path: str, heading: str) -> str:
+    text = f"{node_path} {heading}".lower()
+    if any(token in text for token in ("abstract", "摘要")):
+        return "abstract"
+    if any(token in text for token in ("method", "方法", "算法", "模型", "框架")):
+        return "method"
+    if any(token in text for token in ("experiment", "evaluation", "result", "实验", "评估", "结果", "消融")):
+        return "result"
+    if any(token in text for token in ("limitation", "discussion", "局限", "不足", "讨论")):
+        return "limitation"
+    if any(token in text for token in ("reference", "citation", "参考文献", "引用")):
+        return "citation"
+    if kind in {"document", "section", "page", "paragraph"}:
+        return kind
+    return "paragraph"

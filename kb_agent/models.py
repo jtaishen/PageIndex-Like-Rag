@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -22,6 +22,12 @@ class ParsedDocument:
     raw_text: str
     blocks: List[ParsedBlock]
     metadata: Dict[str, Any]
+    body_md: str = ""
+    structured: Dict[str, Any] = field(default_factory=dict)
+    references: Dict[str, Any] = field(default_factory=dict)
+    parser_name: str = ""
+    parser_version: str = ""
+    parse_warnings: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -36,6 +42,14 @@ class DocumentRecord:
     summary: str
     status: str = "ready"
     error: str = ""
+    authors: List[str] = field(default_factory=list)
+    year: Optional[int] = None
+    venue: str = ""
+    doi: str = ""
+    abstract: str = ""
+    keywords: List[str] = field(default_factory=list)
+    parser_name: str = ""
+    parser_version: str = ""
 
 
 @dataclass
@@ -54,6 +68,9 @@ class NodeRecord:
     order_index: int
     char_start: Optional[int] = None
     char_end: Optional[int] = None
+    keywords: List[str] = field(default_factory=list)
+    source_offsets: Dict[str, Optional[int]] = field(default_factory=dict)
+    doc_hash: str = ""
 
 
 @dataclass
@@ -84,4 +101,3 @@ class SearchResult:
     score: float
     page_start: Optional[int]
     page_end: Optional[int]
-

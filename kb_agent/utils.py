@@ -67,6 +67,14 @@ def write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def write_jsonl(path: Path, rows: Iterable[Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows)
+    if payload:
+        payload += "\n"
+    path.write_text(payload, encoding="utf-8")
+
+
 def read_text_lossy(path: Path) -> str:
     for encoding in ("utf-8", "utf-8-sig", "gb18030", "latin-1"):
         try:
@@ -84,4 +92,3 @@ def unique_preserve_order(values: Iterable[str]) -> List[str]:
             result.append(value)
             seen.add(value)
     return result
-

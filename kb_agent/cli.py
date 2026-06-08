@@ -7,6 +7,7 @@ from typing import Any
 
 from . import db
 from .answer import answer_query, route_documents
+from .artifacts import get_doc_card, list_artifacts
 from .config import resolve_db_path
 from .ingest import sync_directory
 from .memory import put_memory, search_memory
@@ -35,6 +36,13 @@ def main(argv: Any = None) -> None:
 
     tree_parser = subparsers.add_parser("tree", help="Show a document tree")
     tree_parser.add_argument("doc_id")
+
+    card_parser = subparsers.add_parser("card", help="Show a document card")
+    card_parser.add_argument("doc_id")
+
+    artifacts_parser = subparsers.add_parser("artifacts", help="List generated artifacts for a document")
+    artifacts_parser.add_argument("doc_id")
+    artifacts_parser.add_argument("--version-id", default=None)
 
     evidence_parser = subparsers.add_parser("evidence", help="Get evidence packets")
     evidence_parser.add_argument("doc_id")
@@ -73,6 +81,10 @@ def main(argv: Any = None) -> None:
         _print_json(route_documents(db_path, args.query, args.top_k))
     elif args.command == "tree":
         _print_tree(db_path, args.doc_id)
+    elif args.command == "card":
+        _print_json(get_doc_card(db_path, args.doc_id))
+    elif args.command == "artifacts":
+        _print_json(list_artifacts(db_path, args.doc_id, args.version_id))
     elif args.command == "evidence":
         _print_json([packet.to_dict() for packet in get_evidence(db_path, args.doc_id, args.node_ids)])
     elif args.command == "ask":

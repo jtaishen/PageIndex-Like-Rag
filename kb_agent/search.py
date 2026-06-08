@@ -11,10 +11,22 @@ from .utils import compact_whitespace
 
 
 def fts_query(text: str) -> str:
-    tokens = re.findall(r"[\w\u4e00-\u9fff]+", text, flags=re.UNICODE)
+    raw_tokens = re.findall(r"[\w\u4e00-\u9fff]+", text, flags=re.UNICODE)
+    tokens: List[str] = []
+    for token in raw_tokens:
+        tokens.append(token)
+        if re.fullmatch(r"[\u4e00-\u9fff]{3,}", token):
+            tokens.extend(token[index : index + 2] for index in range(0, len(token) - 1))
     if not tokens:
         return '""'
-    return " OR ".join(token.replace('"', "") for token in tokens[:12])
+    unique_tokens = []
+    seen = set()
+    for token in tokens:
+        cleaned = token.replace('"', "")
+        if cleaned and cleaned not in seen:
+            unique_tokens.append(cleaned)
+            seen.add(cleaned)
+    return " OR ".join(unique_tokens[:16])
 
 
 def search_nodes(
