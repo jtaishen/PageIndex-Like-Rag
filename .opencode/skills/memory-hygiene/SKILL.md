@@ -26,3 +26,9 @@ description: 判断哪些内容应写入长期记忆，哪些只应作为任务�
 4. 是否和已有 memory 重复或冲突。
 5. 是否应当作为 `.kb_state` 任务工件，而不是 memory。
 
+工具要求：
+
+- 写入长期记忆必须调用 `memory_put_gated` 或 CLI `memory-put`，不要绕过写入门控。
+- 保存任务进度优先调用 `memory_remember_task`，让系统从 `.kb_state/<task_id>/` 压缩生成任务记忆。
+- 恢复任务优先调用 `memory_resume_task`，再根据返回的 suggested commands 继续操作。
+- 如果内容包含 `node_id`、`page_range`、`excerpt`、`evidence`、论文正文、章节草稿正文，应拒绝写入 memory，保留在知识库工件或任务工件中。

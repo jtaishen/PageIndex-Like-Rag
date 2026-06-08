@@ -18,6 +18,7 @@ parse -> normalize -> tree -> artifacts -> indexes -> evidence packet -> CLI / M
 - 返回带 `doc_id`、`node_id`、`node_path`、页码和 excerpt 的 evidence packet。
 - 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`extract`、`innovations`、`citations`。
 - 支持跨论文比较和综述规划任务工件，生成比较矩阵、综述大纲、章节证据表和下一步行动。
+- 支持长期 memory 写入门控、任务进度记忆、任务恢复和任务进度压缩。
 - 提供可选 MCP server，供 OpenCode 调用。
 
 ## 快速开始
@@ -158,6 +159,40 @@ uv run python -m kb_agent.cli task-artifact <task_id> citation_check.json
 uv run python -m kb_agent.cli task-artifact <task_id> review_report.json
 ```
 
+## v0.7 记忆写入门控与任务恢复
+
+长期 memory 只保存用户偏好、项目规则和跨 session 任务进度，不保存论文正文、检索命中、evidence packet 或大段综述草稿。
+
+安全写入长期记忆：
+
+```bash
+uv run python -m kb_agent.cli memory-put project preference citation_style "GB/T 7714"
+```
+
+写入带 TTL 或来源的记忆：
+
+```bash
+uv run python -m kb_agent.cli memory-put project task_progress current_review "已生成综述草稿，下一步检查引用。" --ttl-days 30 --refs ".kb_state/<task_id>"
+```
+
+将当前任务压缩为长期任务进度：
+
+```bash
+uv run python -m kb_agent.cli remember-task <task_id>
+```
+
+恢复最近任务并查看建议命令：
+
+```bash
+uv run python -m kb_agent.cli resume-task
+```
+
+压缩重复任务进度：
+
+```bash
+uv run python -m kb_agent.cli memory-compact --scope project
+```
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
@@ -223,7 +258,7 @@ DeepSeek 官方 OpenCode 接入方式：
 推荐工具调用顺序：
 
 ```text
-kb_sync -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> kb_get_task_artifact
+kb_sync -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
 ```
 
 ## 测试
@@ -235,4 +270,4 @@ uv run python -m unittest discover -s tests
 ## 后续阶段
 
 - 接入 GROBID / Docling / Marker 提升 PDF 解析质量。
-- 加入 memory write gate、TTL、去重、压缩和 OpenCode plugin hook。
+- 增加 OpenCode plugin hook 和更完整的评测报告。

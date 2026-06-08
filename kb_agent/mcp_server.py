@@ -8,7 +8,7 @@ from .artifacts import get_artifact, get_citation_map, get_doc_card, get_innovat
 from .config import resolve_db_path
 from .ingest import sync_directory
 from .insights import extract_doc_insights
-from .memory import put_memory, search_memory
+from .memory import compact_memory, put_memory_gated as write_memory_gated, remember_task, resume_task, search_memory
 from .review import assemble_review, check_review_citations, draft_review
 from .search import get_evidence, search_nodes
 from .tasks import compare_papers, generate_review_plan, get_task_artifact
@@ -199,10 +199,13 @@ if FastMCP is not None:
         content: str,
         importance: float = 0.5,
         confidence: float = 1.0,
+        ttl_days: Optional[float] = None,
+        refs: str = "",
+        force: bool = False,
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Store explicit, gated long-term memory."""
-        return put_memory(
+        return write_memory_gated(
             resolve_db_path(db_path),
             scope,
             type,
@@ -210,6 +213,32 @@ if FastMCP is not None:
             content,
             importance=importance,
             confidence=confidence,
+            ttl_days=ttl_days,
+            refs=refs,
+            force=force,
+        )
+
+    @mcp.tool()
+    def memory_put_gated(
+        scope: str,
+        type: str,
+        subject_key: str,
+        content: str,
+        refs: str = "",
+        ttl_days: Optional[float] = None,
+        force: bool = False,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Store long-term memory after applying the write gate."""
+        return write_memory_gated(
+            resolve_db_path(db_path),
+            scope,
+            type,
+            subject_key,
+            content,
+            refs=refs,
+            ttl_days=ttl_days,
+            force=force,
         )
 
     @mcp.tool()
@@ -221,6 +250,21 @@ if FastMCP is not None:
     ) -> List[Dict[str, Any]]:
         """Search relevant long-term memory items."""
         return search_memory(resolve_db_path(db_path), query, scope=scope, top_k=top_k)
+
+    @mcp.tool()
+    def memory_remember_task(task_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Store a compressed memory entry for a task artifact directory."""
+        return remember_task(resolve_db_path(db_path), task_id)
+
+    @mcp.tool()
+    def memory_resume_task(db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return current task status, remembered tasks, and suggested next commands."""
+        return resume_task(resolve_db_path(db_path))
+
+    @mcp.tool()
+    def memory_compact(scope: Optional[str] = None, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Compact task progress memory entries into a short summary."""
+        return compact_memory(resolve_db_path(db_path), scope=scope)
 
 
 def main() -> None:

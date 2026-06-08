@@ -16,6 +16,7 @@ from kb_agent.cli import main as cli_main
 from kb_agent.ingest import sync_directory
 from kb_agent.insights import extract_doc_insights
 from kb_agent.llm import LLMError
+from kb_agent.memory import compact_memory, put_memory_gated, remember_task, resume_task, search_memory
 from kb_agent.review import assemble_review, check_review_citations, draft_review
 from kb_agent.search import get_evidence, search_documents, search_nodes
 from kb_agent.tasks import compare_papers, generate_review_plan, get_task_artifact
@@ -521,6 +522,126 @@ class IngestSearchTest(unittest.TestCase):
 
             assembled = assemble_review(db_path, task["task_id"])
             self.assertIn("review_draft", assembled["artifact_paths"])
+
+    def test_memory_write_gate_allows_preferences_and_rejects_paper_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "kb.sqlite"
+
+            accepted = put_memory_gated(
+                db_path,
+                "project",
+                "preference",
+                "citation_style",
+                "默认引用格式使用 GB/T 7714。",
+                confidence=0.9,
+            )
+            self.assertTrue(accepted["accepted"])
+            self.assertEqual(accepted["action"], "accepted")
+
+            merged = put_memory_gated(
+                db_path,
+                "project",
+                "preference",
+                "citation_style",
+                "综述草稿也使用 GB/T 7714。",
+                confidence=0.9,
+            )
+            self.assertEqual(merged["action"], "merged")
+            memories = search_memory(db_path, "GB/T", scope="project")
+            self.assertEqual(len(memories), 1)
+            self.assertIn("综述草稿", memories[0]["content"])
+
+            rejected = put_memory_gated(
+                db_path,
+                "project",
+                "task_progress",
+                "bad_evidence",
+                "node_id=node_1 page_range=[1,2] excerpt=这是一段论文证据正文。",
+                confidence=0.9,
+            )
+            self.assertFalse(rejected["accepted"])
+            self.assertEqual(rejected["reason"], "paper_asset_boundary")
+
+            low_confidence = put_memory_gated(
+                db_path,
+                "project",
+                "preference",
+                "uncertain",
+                "也许用户喜欢某种格式。",
+                confidence=0.2,
+            )
+            self.assertFalse(low_confidence["accepted"])
+            self.assertEqual(low_confidence["reason"], "low_confidence")
+
+    def test_memory_ttl_filters_expired_items(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "kb.sqlite"
+            put_memory_gated(
+                db_path,
+                "project",
+                "preference",
+                "expired",
+                "短期偏好。",
+                ttl_days=-1,
+                force=True,
+            )
+            put_memory_gated(
+                db_path,
+                "project",
+                "preference",
+                "active",
+                "长期偏好。",
+                ttl_days=1,
+            )
+
+            memories = search_memory(db_path, "偏好", scope="project")
+            keys = {item["subject_key"] for item in memories}
+            self.assertNotIn("expired", keys)
+            self.assertIn("active", keys)
+
+    def test_remember_resume_and_compact_task_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+            task = generate_review_plan(
+                db_path,
+                "任务规划方法研究综述",
+                doc_ids=doc_ids,
+                use_llm=False,
+            )
+            draft_review(db_path, task["task_id"], section_ids=["background_problem"], use_llm=False)
+
+            remembered = remember_task(db_path, task["task_id"])
+            self.assertTrue(remembered["memory"]["accepted"])
+            self.assertIn(task["task_id"], remembered["summary"])
+
+            resumed = resume_task(db_path)
+            self.assertEqual(resumed["current_task"]["task_id"], task["task_id"])
+            self.assertIn("suggested_commands", resumed)
+            self.assertTrue(any("remember-task" in item for item in resumed["suggested_commands"]))
+
+            put_memory_gated(
+                db_path,
+                "project",
+                "task_progress",
+                "task:manual",
+                "task_id: task_manual\nstatus: partial\nnext_actions: 继续检查",
+                confidence=0.8,
+            )
+            compacted = compact_memory(db_path, scope="project")
+            self.assertEqual(compacted["status"], "compacted")
+            self.assertGreaterEqual(compacted["compacted_count"], 2)
+            summary = search_memory(db_path, "recent task progress", scope="project")
+            self.assertTrue(any(item["subject_key"] == "task_progress_summary" for item in summary))
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "resume-task"])
+            self.assertIn(task["task_id"], stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "memory-compact", "--scope", "project"])
+            self.assertIn("memory_compact.v1", stdout.getvalue())
 
     def test_failed_parse_records_report_and_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

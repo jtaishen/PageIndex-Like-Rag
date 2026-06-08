@@ -11,7 +11,7 @@ from .artifacts import get_citation_map, get_doc_card, get_innovations, get_pars
 from .config import resolve_db_path
 from .ingest import sync_directory
 from .insights import extract_doc_insights
-from .memory import put_memory, search_memory
+from .memory import compact_memory, put_memory_gated, remember_task, resume_task, search_memory
 from .review import assemble_review, check_review_citations, draft_review
 from .search import get_evidence, search_nodes
 from .tasks import compare_papers, generate_review_plan, get_task_artifact
@@ -110,11 +110,22 @@ def main(argv: Any = None) -> None:
     mem_put_parser.add_argument("content")
     mem_put_parser.add_argument("--importance", type=float, default=0.5)
     mem_put_parser.add_argument("--confidence", type=float, default=1.0)
+    mem_put_parser.add_argument("--ttl-days", type=float, default=None)
+    mem_put_parser.add_argument("--refs", default="")
+    mem_put_parser.add_argument("--force", action="store_true")
 
     mem_search_parser = subparsers.add_parser("memory-search", help="Search memory items")
     mem_search_parser.add_argument("query")
     mem_search_parser.add_argument("--scope", default=None)
     mem_search_parser.add_argument("--top-k", type=int, default=8)
+
+    remember_task_parser = subparsers.add_parser("remember-task", help="Store compressed progress for a task")
+    remember_task_parser.add_argument("task_id")
+
+    subparsers.add_parser("resume-task", help="Resume the latest task from task state and memory")
+
+    compact_parser = subparsers.add_parser("memory-compact", help="Compact task progress memory")
+    compact_parser.add_argument("--scope", default=None)
 
     args = parser.parse_args(argv)
     db_path = resolve_db_path(args.db)
@@ -203,7 +214,7 @@ def main(argv: Any = None) -> None:
                 print(f"\nDeepSeek 调用失败：{result['llm_error']}")
     elif args.command == "memory-put":
         _print_json(
-            put_memory(
+            put_memory_gated(
                 db_path,
                 args.scope,
                 args.type,
@@ -211,10 +222,19 @@ def main(argv: Any = None) -> None:
                 args.content,
                 importance=args.importance,
                 confidence=args.confidence,
+                ttl_days=args.ttl_days,
+                refs=args.refs,
+                force=args.force,
             )
         )
     elif args.command == "memory-search":
         _print_json(search_memory(db_path, args.query, args.scope, args.top_k))
+    elif args.command == "remember-task":
+        _print_json(remember_task(db_path, args.task_id))
+    elif args.command == "resume-task":
+        _print_json(resume_task(db_path))
+    elif args.command == "memory-compact":
+        _print_json(compact_memory(db_path, scope=args.scope))
 
 
 def _list_documents(db_path: Path) -> None:
