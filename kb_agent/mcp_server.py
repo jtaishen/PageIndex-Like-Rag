@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .answer import answer_query, route_documents
-from .artifacts import get_artifact, get_doc_card
+from .artifacts import get_artifact, get_doc_card, get_parse_quality
 from .config import resolve_db_path
 from .ingest import sync_directory
 from .memory import put_memory, search_memory
@@ -71,6 +71,11 @@ if FastMCP is not None:
     ) -> Dict[str, Any]:
         """Return a whitelisted generated artifact for one indexed document."""
         return get_artifact(resolve_db_path(db_path), doc_id, name, version_id=version_id)
+
+    @mcp.tool()
+    def kb_get_parse_quality(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return parse quality metrics and warnings for one indexed document."""
+        return get_parse_quality(resolve_db_path(db_path), doc_id)
 
     @mcp.tool()
     def kb_answer(

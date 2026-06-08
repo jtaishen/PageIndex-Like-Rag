@@ -428,6 +428,10 @@ def get_evidence_packets(
 
 def _classify_evidence_type(kind: str, node_path: str, heading: str) -> str:
     text = f"{node_path} {heading}".lower()
+    if kind == "abstract":
+        return "abstract"
+    if kind == "reference":
+        return "reference"
     if any(token in text for token in ("abstract", "摘要")):
         return "abstract"
     if any(token in text for token in ("method", "方法", "算法", "模型", "框架")):
@@ -437,7 +441,7 @@ def _classify_evidence_type(kind: str, node_path: str, heading: str) -> str:
     if any(token in text for token in ("limitation", "discussion", "局限", "不足", "讨论")):
         return "limitation"
     if any(token in text for token in ("reference", "citation", "参考文献", "引用")):
-        return "citation"
+        return "reference"
     if kind in {"document", "section", "page", "paragraph"}:
         return kind
     return "paragraph"

@@ -7,7 +7,7 @@ from typing import Any
 
 from . import db
 from .answer import answer_query, route_documents
-from .artifacts import get_doc_card, list_artifacts
+from .artifacts import get_doc_card, get_parse_quality, list_artifacts
 from .config import resolve_db_path
 from .ingest import sync_directory
 from .memory import put_memory, search_memory
@@ -43,6 +43,9 @@ def main(argv: Any = None) -> None:
     artifacts_parser = subparsers.add_parser("artifacts", help="List generated artifacts for a document")
     artifacts_parser.add_argument("doc_id")
     artifacts_parser.add_argument("--version-id", default=None)
+
+    quality_parser = subparsers.add_parser("quality", help="Show parse quality for a document")
+    quality_parser.add_argument("doc_id")
 
     evidence_parser = subparsers.add_parser("evidence", help="Get evidence packets")
     evidence_parser.add_argument("doc_id")
@@ -85,6 +88,8 @@ def main(argv: Any = None) -> None:
         _print_json(get_doc_card(db_path, args.doc_id))
     elif args.command == "artifacts":
         _print_json(list_artifacts(db_path, args.doc_id, args.version_id))
+    elif args.command == "quality":
+        _print_json(get_parse_quality(db_path, args.doc_id))
     elif args.command == "evidence":
         _print_json([packet.to_dict() for packet in get_evidence(db_path, args.doc_id, args.node_ids)])
     elif args.command == "ask":

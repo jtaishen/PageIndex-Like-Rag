@@ -72,6 +72,7 @@ def _sync_file(conn, file_path: Path, force: bool = False) -> tuple[str, str]:  
     try:
         parsed = parse_document(file_path)
         nodes = build_document_tree(doc_id, parsed, doc_hash=file_hash)
+        summary = _doc_description(parsed)
         record = DocumentRecord(
             doc_id=doc_id,
             path=str(file_path),
@@ -80,7 +81,7 @@ def _sync_file(conn, file_path: Path, force: bool = False) -> tuple[str, str]:  
             file_type=parsed.file_type,
             size=stat.st_size,
             mtime=stat.st_mtime,
-            summary=first_words(parsed.raw_text, 80),
+            summary=summary,
             status="ready",
             error="",
             authors=list(parsed.metadata.get("authors") or []),
@@ -216,8 +217,43 @@ def _write_failure_report(
 
 
 def _build_doc_card(doc_id: str, version_id: str, base: Path, source_path: Path, file_hash: str, parsed, nodes) -> Dict[str, object]:  # type: ignore[no-untyped-def]
-    section_count = sum(1 for node in nodes if node.kind == "section")
+    section_nodes = [node for node in nodes if node.kind == "section"]
+    section_count = len(section_nodes)
     page_values = [node.page_start for node in nodes if node.page_start]
+    page_count = max(page_values) if page_values else parsed.metadata.get("pages")
+    paragraph_count = sum(1 for node in nodes if node.kind == "paragraph")
+    reference_count = sum(1 for node in nodes if node.kind == "reference" and node.text)
+    figure_count = sum(1 for node in nodes if node.kind == "figure")
+    table_count = sum(1 for node in nodes if node.kind == "table")
+    page_only_tree = section_count == 0 and any(node.kind == "page" for node in nodes)
+    missing_abstract = not bool(parsed.metadata.get("abstract"))
+    quality_warnings = _quality_warnings(parsed, section_count, reference_count, page_only_tree, missing_abstract)
+    parse_quality = {
+        "schema": "parse_quality.v0",
+        "doc_id": doc_id,
+        "version_id": version_id,
+        "page_count": page_count,
+        "section_count": section_count,
+        "paragraph_count": paragraph_count,
+        "reference_count": reference_count,
+        "figure_count": figure_count,
+        "table_count": table_count,
+        "missing_abstract": missing_abstract,
+        "page_only_tree": page_only_tree,
+        "quality_warnings": quality_warnings,
+    }
+    sections = [
+        {
+            "node_id": node.node_id,
+            "title": node.heading,
+            "node_path": node.node_path,
+            "page_range": [node.page_start, node.page_end],
+            "level": node.level,
+            "type": node.kind,
+        }
+        for node in section_nodes[:80]
+    ]
+    description = _doc_description(parsed)
     return {
         "schema": "doc_card.v0",
         "doc_id": doc_id,
@@ -226,7 +262,8 @@ def _build_doc_card(doc_id: str, version_id: str, base: Path, source_path: Path,
         "path": str(source_path),
         "file_type": parsed.file_type,
         "file_hash": file_hash,
-        "summary": first_words(parsed.raw_text, 80),
+        "summary": description,
+        "description": description,
         "authors": parsed.metadata.get("authors") or [],
         "year": parsed.metadata.get("year"),
         "venue": parsed.metadata.get("venue") or "",
@@ -235,10 +272,13 @@ def _build_doc_card(doc_id: str, version_id: str, base: Path, source_path: Path,
         "keywords": parsed.metadata.get("keywords") or [],
         "parser_name": parsed.parser_name,
         "parser_version": parsed.parser_version,
-        "page_count": max(page_values) if page_values else parsed.metadata.get("pages"),
+        "page_count": page_count,
         "block_count": len(parsed.blocks),
         "node_count": len(nodes),
         "section_count": section_count,
+        "sections": sections,
+        "quality_warnings": quality_warnings,
+        "parse_quality": parse_quality,
         "artifact_dir": str(base),
         "artifacts": [
             "raw_text.txt",
@@ -255,3 +295,40 @@ def _build_doc_card(doc_id: str, version_id: str, base: Path, source_path: Path,
         ],
         "created_at": time.time(),
     }
+
+
+def _doc_description(parsed) -> str:  # type: ignore[no-untyped-def]
+    abstract = str(parsed.metadata.get("abstract") or "").strip()
+    if abstract:
+        return _text_excerpt(abstract, 500)
+    keywords = parsed.metadata.get("keywords") or []
+    if keywords:
+        return _text_excerpt(f"{parsed.title}。关键词：{'、'.join(str(item) for item in keywords)}", 500)
+    return _text_excerpt(parsed.raw_text, 500)
+
+
+def _text_excerpt(text: str, max_chars: int) -> str:
+    compacted = " ".join(str(text).split())
+    if len(compacted) <= max_chars:
+        return compacted
+    return compacted[:max_chars].rstrip() + " ..."
+
+
+def _quality_warnings(
+    parsed,  # type: ignore[no-untyped-def]
+    section_count: int,
+    reference_count: int,
+    page_only_tree: bool,
+    missing_abstract: bool,
+) -> List[str]:
+    warnings = list(parsed.parse_warnings)
+    if missing_abstract:
+        warnings.append("missing_abstract")
+    if page_only_tree:
+        warnings.append("page_only_tree")
+    if parsed.file_type == "pdf" and section_count < 2:
+        warnings.append("low_section_count")
+    references_status = (parsed.references or {}).get("status")
+    if reference_count == 0 and references_status != "extracted":
+        warnings.append("missing_references")
+    return warnings

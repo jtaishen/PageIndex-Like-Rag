@@ -1,9 +1,9 @@
 # PageIndex-Like RAG MVP
 
-这是一个基于 OpenCode 的 PageIndex-like 论文知识库智能体 MVP。第一版目标是先跑通核心闭环：
+这是一个基于 OpenCode 的 PageIndex-like 论文知识库智能体 MVP。当前目标是跑通论文入库、结构化工件、章节树检索和 evidence packet 的核心闭环：
 
 ```text
-目录扫描 -> 文档解析 -> SQLite FTS5 索引 -> 简单文档树 -> evidence packet -> CLI / MCP 工具
+parse -> normalize -> tree -> artifacts -> indexes -> evidence packet -> CLI / MCP 工具
 ```
 
 ## 当前能力
@@ -11,10 +11,12 @@
 - 递归扫描目录，支持增量同步。
 - 支持 Markdown、TXT、DOCX、HTML 基础解析。
 - PDF 解析通过可选依赖 `pypdf` 支持。
+- 解析后生成 `raw_text.txt`、`body.md`、`structured.json`、`metadata.json`、`references.json`、`parse_report.json`、`tree.json`、`node_index.jsonl`、`doc_card.json` 等工件。
+- 对中文论文常见结构做规则识别，包括摘要、关键词、第 X 章、`1.1`/`1.1.1` 小节、结论、参考文献、图和表。
 - 将文档保存为 `documents` 和 `doc_nodes`。
 - 使用 SQLite FTS5 做全文检索。
 - 返回带 `doc_id`、`node_id`、`node_path`、页码和 excerpt 的 evidence packet。
-- 提供 CLI 命令。
+- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`。
 - 提供可选 MCP server，供 OpenCode 调用。
 
 ## 快速开始
@@ -36,6 +38,30 @@ data/kb.sqlite
 
 ```bash
 python3 -m kb_agent.cli --db /tmp/kb.sqlite sync ./papers
+```
+
+## v0.3 论文结构演示
+
+同步真实 PDF 并强制使用当前解析器版本重建工件：
+
+```bash
+uv run --extra pdf python -m kb_agent.cli sync articles --force
+```
+
+查看文档、章节树、工件和解析质量：
+
+```bash
+uv run python -m kb_agent.cli list
+uv run python -m kb_agent.cli tree <doc_id>
+uv run python -m kb_agent.cli card <doc_id>
+uv run python -m kb_agent.cli artifacts <doc_id>
+uv run python -m kb_agent.cli quality <doc_id>
+```
+
+只看证据、不调用模型：
+
+```bash
+uv run python -m kb_agent.cli ask "这篇论文的主要研究内容是什么？" --no-llm
 ```
 
 ## PDF 和 MCP 可选依赖
@@ -103,18 +129,18 @@ DeepSeek 官方 OpenCode 接入方式：
 推荐工具调用顺序：
 
 ```text
-kb_sync -> kb_search_docs -> kb_search_tree -> kb_get_evidence -> kb_answer
+kb_sync -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_search_tree -> kb_get_evidence -> kb_answer
 ```
 
 ## 测试
 
 ```bash
-python3 -m unittest discover -s tests
+uv run python -m unittest discover -s tests
 ```
 
 ## 后续阶段
 
 - 接入 GROBID / Docling / Marker 提升 PDF 解析质量。
-- 增加 doc_card、innovation.json、citation_map.json。
+- 抽取 innovation.json、citation_map.json 的真实内容。
 - 增加跨论文比较和综述任务工件。
 - 加入 memory write gate、TTL、去重、压缩和 OpenCode plugin hook。

@@ -13,7 +13,7 @@ from .models import ParsedBlock, ParsedDocument
 from .utils import compact_whitespace, read_text_lossy, split_paragraphs
 
 
-PARSER_VERSION = "0.2.0"
+PARSER_VERSION = "0.3.0"
 
 
 class ParseError(RuntimeError):
@@ -45,10 +45,15 @@ class ParserAdapter(ABC):
         references: Optional[Dict[str, Any]] = None,
         warnings: Optional[List[str]] = None,
     ) -> ParsedDocument:
+        normalized_blocks, normalize_warnings = normalize_blocks(blocks)
         enriched = _enrich_metadata(title, raw_text, metadata or {})
+        if not enriched.get("abstract"):
+            enriched["abstract"] = _extract_abstract_from_blocks(normalized_blocks)
+        if not enriched.get("keywords"):
+            enriched["keywords"] = _extract_keywords_from_blocks(normalized_blocks)
         structured = {
             "schema": "structured.v0",
-            "blocks": [_block_to_dict(block, index) for index, block in enumerate(blocks)],
+            "blocks": [_block_to_dict(block, index) for index, block in enumerate(normalized_blocks)],
             "tables": [],
             "figures": [],
             "formulas": [],
@@ -57,14 +62,14 @@ class ParserAdapter(ABC):
             title=enriched.get("title") or title or path.stem,
             file_type=self.file_type,
             raw_text=raw_text,
-            blocks=blocks,
+            blocks=normalized_blocks,
             metadata=enriched,
-            body_md=body_md or blocks_to_markdown(blocks, title),
+            body_md=body_md or blocks_to_markdown(normalized_blocks, title),
             structured=structured,
             references=references or extract_references(raw_text),
             parser_name=self.name,
             parser_version=self.version,
-            parse_warnings=warnings or [],
+            parse_warnings=[*(warnings or []), *normalize_warnings],
         )
 
 
@@ -259,6 +264,213 @@ class PdfParser(ParserAdapter):
         return self.finish(path, title=title or path.stem, raw_text=raw_text, blocks=blocks, metadata=metadata)
 
 
+SEMANTIC_BLOCK_KINDS = {"abstract", "keywords", "figure", "table", "reference"}
+_CHAPTER_RE = re.compile(r"^第[一二三四五六七八九十百千万0-9]+章\s*[\w\u4e00-\u9fff（）()《》:：、，,\- ]{0,80}$")
+_NUMBERED_HEADING_RE = re.compile(r"^(\d+(?:\.\d+){0,3})[\s、.．]+(.{1,80})$")
+_CHINESE_ORDER_HEADING_RE = re.compile(r"^[一二三四五六七八九十]+[、.．]\s*.{1,80}$")
+_REFERENCE_LINE_RE = re.compile(r"^(\[\d+\]|\d+[.)、]\s+).+")
+
+
+def normalize_blocks(blocks: List[ParsedBlock]) -> tuple[List[ParsedBlock], List[str]]:
+    """Split parser output into lightweight paper-structure blocks."""
+    normalized: List[ParsedBlock] = []
+    warnings: List[str] = []
+    in_references = False
+    context_kind = ""
+    split_count = 0
+
+    for block in blocks:
+        if block.kind == "heading":
+            heading = compact_whitespace(block.heading or block.text)
+            if not heading:
+                continue
+            level = block.level or _infer_heading_level(heading)
+            normalized.append(_copy_block(block, kind="heading", text="", heading=heading, level=level))
+            in_references = _is_reference_heading(heading)
+            context_kind = _context_for_heading(heading)
+            continue
+
+        if block.kind in SEMANTIC_BLOCK_KINDS:
+            normalized.append(block)
+            in_references = block.kind == "reference" or in_references
+            context_kind = block.kind if block.kind in {"abstract", "keywords", "reference"} else context_kind
+            continue
+
+        emitted, in_references, context_kind = _normalize_paragraph_block(block, in_references, context_kind)
+        if len(emitted) > 1:
+            split_count += len(emitted) - 1
+        normalized.extend(emitted)
+
+    if split_count:
+        warnings.append(f"normalize_split_blocks:{split_count}")
+    return normalized, warnings
+
+
+def _normalize_paragraph_block(
+    block: ParsedBlock,
+    in_references: bool,
+    context_kind: str,
+) -> tuple[List[ParsedBlock], bool, str]:
+    emitted: List[ParsedBlock] = []
+    buffer: List[str] = []
+
+    def flush_buffer() -> None:
+        nonlocal buffer
+        text = compact_whitespace(" ".join(buffer))
+        if text:
+            kind = _contextual_paragraph_kind(in_references, context_kind)
+            emitted.append(_copy_block(block, kind=kind, text=text, heading="", level=0))
+        buffer = []
+
+    lines = [compact_whitespace(line) for line in block.text.replace("\r\n", "\n").replace("\r", "\n").splitlines()]
+    lines = [line for line in lines if line]
+    if not lines and block.text.strip():
+        lines = [compact_whitespace(block.text)]
+
+    for line in lines:
+        special = _split_special_line(line)
+        if special:
+            flush_buffer()
+            heading, level, body_kind, body = special
+            emitted.append(_copy_block(block, kind="heading", text="", heading=heading, level=level))
+            in_references = _is_reference_heading(heading)
+            context_kind = _context_for_heading(heading)
+            if body:
+                emitted.append(_copy_block(block, kind=body_kind, text=body, heading="", level=0))
+            continue
+
+        heading = _classify_heading_line(line)
+        if heading:
+            flush_buffer()
+            emitted.append(_copy_block(block, kind="heading", text="", heading=heading[0], level=heading[1]))
+            in_references = _is_reference_heading(heading[0])
+            context_kind = _context_for_heading(heading[0])
+            continue
+
+        semantic_kind = _classify_semantic_line(line, in_references)
+        if semantic_kind:
+            flush_buffer()
+            emitted.append(_copy_block(block, kind=semantic_kind, text=line, heading="", level=0))
+            continue
+
+        buffer.append(line)
+
+    flush_buffer()
+    return emitted, in_references, context_kind
+
+
+def _split_special_line(line: str) -> Optional[tuple[str, int, str, str]]:
+    abstract = re.match(r"^(摘\s*要|Abstract)\s*[:：]?\s*(.*)$", line, re.IGNORECASE)
+    if abstract and (abstract.group(2) or compact_whitespace(abstract.group(1)) in {"摘要", "摘 要", "Abstract"}):
+        return "摘要", 1, "abstract", compact_whitespace(abstract.group(2))
+
+    keywords = re.match(r"^(关键词|关键字|Keywords?)\s*[:：]?\s*(.*)$", line, re.IGNORECASE)
+    if keywords:
+        return "关键词", 1, "keywords", compact_whitespace(keywords.group(2))
+
+    references = re.match(r"^(参考文献|References|Bibliography)\s*[:：]?\s*$", line, re.IGNORECASE)
+    if references:
+        return "参考文献", 1, "reference", ""
+    return None
+
+
+def _classify_heading_line(line: str) -> Optional[tuple[str, int]]:
+    text = compact_whitespace(line)
+    if not text or len(text) > 96:
+        return None
+    if _CHAPTER_RE.match(text):
+        return text, 1
+    if _is_reference_heading(text):
+        return "参考文献", 1
+    if _is_conclusion_heading(text):
+        return text, 1
+    numbered = _NUMBERED_HEADING_RE.match(text)
+    if numbered:
+        number = numbered.group(1)
+        if _looks_like_heading_text(numbered.group(2)):
+            return text, min(number.count(".") + 1, 4)
+    if _CHINESE_ORDER_HEADING_RE.match(text) and _looks_like_heading_text(text):
+        return text, 2
+    return None
+
+
+def _classify_semantic_line(line: str, in_references: bool) -> str:
+    if _is_figure_line(line):
+        return "figure"
+    if _is_table_line(line):
+        return "table"
+    if in_references or _REFERENCE_LINE_RE.match(line):
+        return "reference"
+    return ""
+
+
+def _context_for_heading(heading: str) -> str:
+    normalized = re.sub(r"\s+", "", heading).lower()
+    if normalized in {"摘要", "abstract"}:
+        return "abstract"
+    if normalized in {"关键词", "关键字", "keywords", "keyword"}:
+        return "keywords"
+    if normalized in {"参考文献", "references", "bibliography"}:
+        return "reference"
+    return ""
+
+
+def _contextual_paragraph_kind(in_references: bool, context_kind: str) -> str:
+    if in_references:
+        return "reference"
+    if context_kind in {"abstract", "keywords"}:
+        return context_kind
+    return "paragraph"
+
+
+def _copy_block(
+    block: ParsedBlock,
+    *,
+    kind: str,
+    text: str,
+    heading: str,
+    level: int,
+) -> ParsedBlock:
+    return ParsedBlock(
+        kind=kind,
+        text=text,
+        heading=heading,
+        level=level,
+        page=block.page,
+        char_start=block.char_start,
+        char_end=block.char_end,
+    )
+
+
+def _infer_heading_level(heading: str) -> int:
+    classified = _classify_heading_line(heading)
+    return classified[1] if classified else 1
+
+
+def _is_reference_heading(text: str) -> bool:
+    return bool(re.match(r"^(参考文献|References|Bibliography)\s*[:：]?$", compact_whitespace(text), re.IGNORECASE))
+
+
+def _is_conclusion_heading(text: str) -> bool:
+    normalized = compact_whitespace(text)
+    return bool(re.match(r"^(结论|总结|讨论|致谢|Conclusion|Discussion)\s*[:：]?$", normalized, re.IGNORECASE))
+
+
+def _looks_like_heading_text(text: str) -> bool:
+    stripped = compact_whitespace(text)
+    if not stripped or len(stripped) > 72:
+        return False
+    return not re.search(r"[。！？!?；;]$", stripped)
+
+
+def _is_figure_line(text: str) -> bool:
+    return bool(re.match(r"^(图\s*\d+|Figure\s+\d+)", compact_whitespace(text), re.IGNORECASE))
+
+
+def _is_table_line(text: str) -> bool:
+    return bool(re.match(r"^(表\s*\d+|Table\s+\d+)", compact_whitespace(text), re.IGNORECASE))
+
+
 PARSERS: List[ParserAdapter] = [
     MarkdownParser(),
     PlainTextParser(),
@@ -360,7 +572,7 @@ def _extract_abstract(text: str) -> str:
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
         if match:
-            return compact_whitespace(match.group(1))[:1200]
+            return _clean_abstract_text(match.group(1))[:1200]
     return ""
 
 
@@ -373,6 +585,26 @@ def _extract_keywords(text: str) -> List[str]:
     return [part for part in (compact_whitespace(part) for part in parts) if part][:20]
 
 
+def _extract_abstract_from_blocks(blocks: List[ParsedBlock]) -> str:
+    parts = [block.text for block in blocks if block.kind == "abstract" and block.text.strip()]
+    return _clean_abstract_text(" ".join(parts))[:1200]
+
+
+def _extract_keywords_from_blocks(blocks: List[ParsedBlock]) -> List[str]:
+    raw = " ".join(block.text for block in blocks if block.kind == "keywords")
+    if not raw:
+        return []
+    parts = re.split(r"[;,，；、\s]+", raw)
+    return [part for part in (compact_whitespace(part) for part in parts) if part][:20]
+
+
 def _split_authors(raw: str) -> List[str]:
     parts = re.split(r"[,;，；、/]+", raw)
     return [part for part in (compact_whitespace(part) for part in parts) if part]
+
+
+def _clean_abstract_text(text: str) -> str:
+    cleaned = compact_whitespace(text)
+    cleaned = re.sub(r"^(?:[IVXLC]+|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ])\s+", "", cleaned)
+    cleaned = re.sub(r"扬州大学博士学位论文\s*(?:[IVXLC]+|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ])?", "", cleaned)
+    return compact_whitespace(cleaned)

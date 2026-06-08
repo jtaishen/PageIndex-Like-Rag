@@ -34,6 +34,27 @@ def get_doc_card(db_path: Path, doc_id: str) -> Dict[str, Any]:
         conn.close()
 
 
+def get_parse_quality(db_path: Path, doc_id: str) -> Dict[str, Any]:
+    card = get_doc_card(db_path, doc_id)
+    quality = card.get("parse_quality")
+    if isinstance(quality, dict):
+        return quality
+    return {
+        "schema": "parse_quality.v0",
+        "doc_id": doc_id,
+        "version_id": card.get("version_id"),
+        "page_count": card.get("page_count"),
+        "section_count": card.get("section_count", 0),
+        "paragraph_count": None,
+        "reference_count": None,
+        "figure_count": None,
+        "table_count": None,
+        "missing_abstract": not bool(card.get("abstract")),
+        "page_only_tree": bool(card.get("section_count", 0) == 0),
+        "quality_warnings": card.get("quality_warnings", []),
+    }
+
+
 def list_artifacts(db_path: Path, doc_id: str, version_id: Optional[str] = None) -> Dict[str, Any]:
     conn = db.connect(db_path)
     db.init_db(conn)

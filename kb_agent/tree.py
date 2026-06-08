@@ -8,6 +8,9 @@ from .models import NodeRecord, ParsedBlock, ParsedDocument
 from .utils import chunk_text, first_words, stable_id
 
 
+SEMANTIC_LEAF_KINDS = {"abstract", "keywords", "figure", "table", "reference"}
+
+
 def build_document_tree(doc_id: str, parsed: ParsedDocument, doc_hash: str = "") -> List[NodeRecord]:
     root = NodeRecord(
         node_id=stable_id("node", doc_id, "root"),
@@ -47,7 +50,7 @@ def build_document_tree(doc_id: str, parsed: ParsedDocument, doc_hash: str = "")
                     node_id=stable_id("node", doc_id, order, block.heading),
                     doc_id=doc_id,
                     parent_id=parent.node_id,
-                    kind="section",
+                    kind=_heading_kind(block.heading),
                     heading=block.heading,
                     summary=block.heading,
                     text="",
@@ -156,11 +159,12 @@ def _leaf_node(
     doc_hash: str = "",
 ) -> NodeRecord:
     heading = first_words(text, 10)
+    kind = block.kind if block.kind in SEMANTIC_LEAF_KINDS else "paragraph"
     return NodeRecord(
         node_id=stable_id("node", doc_id, order, heading, block.page or ""),
         doc_id=doc_id,
         parent_id=parent.node_id,
-        kind="paragraph",
+        kind=kind,
         heading=heading,
         summary=first_words(text, 32),
         text=text,
@@ -182,6 +186,17 @@ def _group_blocks_by_page(blocks: List[ParsedBlock]) -> Dict[Optional[int], List
     for block in blocks:
         groups.setdefault(block.page, []).append(block)
     return groups
+
+
+def _heading_kind(heading: str) -> str:
+    normalized = re.sub(r"\s+", "", heading).lower()
+    if normalized in {"摘要", "abstract"}:
+        return "abstract"
+    if normalized in {"关键词", "关键字", "keywords", "keyword"}:
+        return "keywords"
+    if normalized in {"参考文献", "references", "bibliography"}:
+        return "reference"
+    return "section"
 
 
 def _fill_section_summaries(nodes: List[NodeRecord]) -> None:
