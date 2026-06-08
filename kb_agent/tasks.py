@@ -85,6 +85,9 @@ TASK_ARTIFACT_WHITELIST = {
     "selected_papers.json",
     "comparison_matrix.json",
     "review_outline.json",
+    "review_draft.md",
+    "citation_check.json",
+    "review_report.json",
     "open_questions.json",
     "next_actions.json",
 }
@@ -1004,6 +1007,9 @@ def _valid_task_artifact_name(name: str) -> bool:
     if name.startswith("section_evidence/") and name.endswith(".json"):
         parts = Path(name).parts
         return len(parts) == 2 and parts[0] == "section_evidence" and ".." not in parts
+    if name.startswith("section_drafts/") and (name.endswith(".json") or name.endswith(".md")):
+        parts = Path(name).parts
+        return len(parts) == 2 and parts[0] == "section_drafts" and ".." not in parts
     return False
 
 

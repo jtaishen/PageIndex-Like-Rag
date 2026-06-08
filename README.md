@@ -121,6 +121,43 @@ uv run python -m kb_agent.cli task-artifact <task_id> section_evidence/backgroun
 
 如果已配置 DeepSeek，可以去掉 `--no-llm`，让模型基于 evidence packet 生成结构化比较和综述大纲；如果必须调用模型成功，则添加 `--require-llm`。
 
+## v0.6 综述正文草稿与引用检查
+
+v0.6 会基于 v0.5 的 `review_outline.json` 和 `section_evidence/*.json` 逐节生成综述草稿，并写入同一个 `.kb_state/<task_id>/` 任务目录。
+
+生成章节草稿、总稿和质量报告：
+
+```bash
+uv run python -m kb_agent.cli draft-review <task_id> --no-llm
+```
+
+只生成某个章节：
+
+```bash
+uv run python -m kb_agent.cli draft-review <task_id> --section-id background_problem
+```
+
+重新组装已有章节草稿：
+
+```bash
+uv run python -m kb_agent.cli assemble-review <task_id>
+```
+
+检查正文中的 `[E1]`、`[E2]` 等证据编号是否能映射到章节证据：
+
+```bash
+uv run python -m kb_agent.cli check-review <task_id>
+```
+
+查看 v0.6 工件：
+
+```bash
+uv run python -m kb_agent.cli task-artifact <task_id> section_drafts/background_problem.json
+uv run python -m kb_agent.cli task-artifact <task_id> review_draft.md
+uv run python -m kb_agent.cli task-artifact <task_id> citation_check.json
+uv run python -m kb_agent.cli task-artifact <task_id> review_report.json
+```
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
@@ -186,7 +223,7 @@ DeepSeek 官方 OpenCode 接入方式：
 推荐工具调用顺序：
 
 ```text
-kb_sync -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_get_task_artifact
+kb_sync -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> kb_get_task_artifact
 ```
 
 ## 测试

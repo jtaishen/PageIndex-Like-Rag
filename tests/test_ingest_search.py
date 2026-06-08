@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -15,6 +16,7 @@ from kb_agent.cli import main as cli_main
 from kb_agent.ingest import sync_directory
 from kb_agent.insights import extract_doc_insights
 from kb_agent.llm import LLMError
+from kb_agent.review import assemble_review, check_review_citations, draft_review
 from kb_agent.search import get_evidence, search_documents, search_nodes
 from kb_agent.tasks import compare_papers, generate_review_plan, get_task_artifact
 
@@ -405,6 +407,120 @@ class IngestSearchTest(unittest.TestCase):
                         require_llm=True,
                     )
             self.assertFalse(state_root.exists())
+
+    def test_draft_review_writes_section_drafts_and_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+            task = generate_review_plan(
+                db_path,
+                "任务规划方法研究综述",
+                doc_ids=doc_ids,
+                use_llm=False,
+            )
+
+            result = draft_review(db_path, task["task_id"], use_llm=False)
+
+            self.assertEqual(result["schema"], "review_draft_result.v1")
+            self.assertEqual(result["drafted_section_count"], 5)
+            self.assertIn("review_draft", result["artifact_paths"])
+            draft = get_task_artifact(db_path, task["task_id"], "section_drafts/background_problem.json")
+            self.assertEqual(draft["content"]["schema"], "section_draft.v1")
+            self.assertEqual(draft["content"]["status"], "partial")
+            self.assertGreaterEqual(len(draft["content"]["evidence"]), 1)
+
+            review_draft = get_task_artifact(db_path, task["task_id"], "review_draft.md")
+            self.assertIn("任务规划方法研究综述", review_draft["content"])
+            citation_check = get_task_artifact(db_path, task["task_id"], "citation_check.json")
+            self.assertEqual(citation_check["content"]["schema"], "citation_check.v1")
+            report = get_task_artifact(db_path, task["task_id"], "review_report.json")
+            self.assertEqual(report["content"]["schema"], "review_report.v1")
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "assemble-review", task["task_id"]])
+            self.assertIn("review_draft", stdout.getvalue())
+
+    def test_llm_review_draft_normalizes_evidence_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+            task = generate_review_plan(
+                db_path,
+                "任务规划方法研究综述",
+                doc_ids=doc_ids,
+                use_llm=False,
+            )
+            payload = {
+                "claim_plan": [{"claim": "两类论文都关注任务规划问题。", "evidence": ["E1"]}],
+                "body_markdown": "本节可先界定任务规划问题，并说明服务机器人和多智能体场景都需要处理动态约束。[E1]",
+                "unsupported_claims": [],
+                "warnings": [],
+            }
+
+            with mock.patch("kb_agent.review.generate_json_object", return_value=payload):
+                result = draft_review(
+                    db_path,
+                    task["task_id"],
+                    section_ids=["background_problem"],
+                    use_llm=True,
+                )
+
+            draft = result["section_drafts"][0]
+            self.assertEqual(draft["source"], "llm")
+            self.assertEqual(draft["status"], "drafted")
+            self.assertEqual(draft["used_evidence"][0]["ref_id"], "E1")
+            self.assertFalse(result["citation_check"]["missing_refs"])
+            self.assertEqual(result["citation_check"]["sections"][0]["coverage_score"], 1.0)
+
+    def test_draft_review_requires_llm_does_not_write_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+            task = generate_review_plan(
+                db_path,
+                "任务规划方法研究综述",
+                doc_ids=doc_ids,
+                use_llm=False,
+            )
+            draft_dir = db_path.parent / ".kb_state" / task["task_id"] / "section_drafts"
+
+            with mock.patch("kb_agent.review.generate_json_object", side_effect=LLMError("boom")):
+                with self.assertRaises(LLMError):
+                    draft_review(
+                        db_path,
+                        task["task_id"],
+                        section_ids=["background_problem"],
+                        use_llm=True,
+                        require_llm=True,
+                    )
+
+            self.assertFalse(draft_dir.exists())
+
+    def test_check_review_detects_bad_refs_and_unsupported_paragraphs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+            task = generate_review_plan(
+                db_path,
+                "任务规划方法研究综述",
+                doc_ids=doc_ids,
+                use_llm=False,
+            )
+            draft_review(db_path, task["task_id"], section_ids=["background_problem"], use_llm=False)
+            artifact = get_task_artifact(db_path, task["task_id"], "section_drafts/background_problem.json")
+            payload = artifact["content"]
+            payload["body_markdown"] = (
+                "这一段是没有任何证据标记的长段落，需要被引用一致性检查识别出来。\n\n"
+                "这一段引用了不存在的证据编号，因此也应该被记录为缺失引用。[E99]"
+            )
+            Path(artifact["path"]).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            result = check_review_citations(db_path, task["task_id"])
+
+            self.assertEqual(result["citation_check"]["status"], "partial")
+            missing_refs = result["citation_check"]["missing_refs"]
+            self.assertTrue(any(item["ref_id"] == "E99" for item in missing_refs))
+            self.assertGreaterEqual(len(result["citation_check"]["unsupported_paragraphs"]), 1)
+
+            assembled = assemble_review(db_path, task["task_id"])
+            self.assertIn("review_draft", assembled["artifact_paths"])
 
     def test_failed_parse_records_report_and_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -9,6 +9,7 @@ from .config import resolve_db_path
 from .ingest import sync_directory
 from .insights import extract_doc_insights
 from .memory import put_memory, search_memory
+from .review import assemble_review, check_review_citations, draft_review
 from .search import get_evidence, search_nodes
 from .tasks import compare_papers, generate_review_plan, get_task_artifact
 
@@ -152,6 +153,33 @@ if FastMCP is not None:
     ) -> Dict[str, Any]:
         """Read a whitelisted compare/review task artifact."""
         return get_task_artifact(resolve_db_path(db_path), task_id, name)
+
+    @mcp.tool()
+    def kb_draft_review(
+        task_id: str,
+        section_ids: Optional[List[str]] = None,
+        use_llm: bool = True,
+        require_llm: bool = False,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Draft review sections from a generated review task and section evidence."""
+        return draft_review(
+            resolve_db_path(db_path),
+            task_id,
+            section_ids=section_ids,
+            use_llm=use_llm,
+            require_llm=require_llm,
+        )
+
+    @mcp.tool()
+    def kb_assemble_review(task_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Assemble review section drafts into a Markdown review draft."""
+        return assemble_review(resolve_db_path(db_path), task_id)
+
+    @mcp.tool()
+    def kb_check_review_citations(task_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Check that review draft citations map to section evidence."""
+        return check_review_citations(resolve_db_path(db_path), task_id)
 
     @mcp.tool()
     def kb_answer(

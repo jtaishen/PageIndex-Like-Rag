@@ -12,6 +12,7 @@ from .config import resolve_db_path
 from .ingest import sync_directory
 from .insights import extract_doc_insights
 from .memory import put_memory, search_memory
+from .review import assemble_review, check_review_citations, draft_review
 from .search import get_evidence, search_nodes
 from .tasks import compare_papers, generate_review_plan, get_task_artifact
 
@@ -75,9 +76,21 @@ def main(argv: Any = None) -> None:
     review_parser.add_argument("--no-llm", action="store_true", help="Use rule-based planning only")
     review_parser.add_argument("--require-llm", action="store_true", help="Fail if DeepSeek cannot be called")
 
-    task_artifact_parser = subparsers.add_parser("task-artifact", help="Read a v0.5 task artifact")
+    task_artifact_parser = subparsers.add_parser("task-artifact", help="Read a task artifact")
     task_artifact_parser.add_argument("task_id")
     task_artifact_parser.add_argument("name")
+
+    draft_review_parser = subparsers.add_parser("draft-review", help="Draft review sections from review task evidence")
+    draft_review_parser.add_argument("task_id")
+    draft_review_parser.add_argument("--section-id", action="append", default=[], help="Draft only one section id; repeatable")
+    draft_review_parser.add_argument("--no-llm", action="store_true", help="Use evidence bullet drafts only")
+    draft_review_parser.add_argument("--require-llm", action="store_true", help="Fail if DeepSeek cannot be called")
+
+    assemble_review_parser = subparsers.add_parser("assemble-review", help="Assemble section drafts into review_draft.md")
+    assemble_review_parser.add_argument("task_id")
+
+    check_review_parser = subparsers.add_parser("check-review", help="Check review draft citation consistency")
+    check_review_parser.add_argument("task_id")
 
     evidence_parser = subparsers.add_parser("evidence", help="Get evidence packets")
     evidence_parser.add_argument("doc_id")
@@ -157,6 +170,21 @@ def main(argv: Any = None) -> None:
         _print_json(_task_summary(result))
     elif args.command == "task-artifact":
         _print_json(get_task_artifact(db_path, args.task_id, args.name))
+    elif args.command == "draft-review":
+        result = draft_review(
+            db_path,
+            args.task_id,
+            section_ids=args.section_id,
+            use_llm=not args.no_llm,
+            require_llm=args.require_llm,
+        )
+        _print_json(_review_summary(result))
+    elif args.command == "assemble-review":
+        result = assemble_review(db_path, args.task_id)
+        _print_json(_review_summary(result))
+    elif args.command == "check-review":
+        result = check_review_citations(db_path, args.task_id)
+        _print_json(_review_summary(result))
     elif args.command == "evidence":
         _print_json([packet.to_dict() for packet in get_evidence(db_path, args.doc_id, args.node_ids)])
     elif args.command == "ask":
@@ -276,6 +304,22 @@ def _task_warnings(result: dict) -> list:
     if result.get("review_outline"):
         return result["review_outline"].get("warnings", [])
     return []
+
+
+def _review_summary(result: dict) -> dict:
+    report = result.get("review_report") or {}
+    citation_check = result.get("citation_check") or {}
+    return {
+        "task_id": result.get("task_id"),
+        "status": result.get("status") or report.get("status"),
+        "drafted_section_count": result.get("drafted_section_count") or report.get("drafted_section_count"),
+        "citation_coverage_score": report.get("citation_coverage_score") or citation_check.get("coverage_score"),
+        "missing_ref_count": len(citation_check.get("missing_refs") or []),
+        "unsupported_paragraph_count": len(citation_check.get("unsupported_paragraphs") or []),
+        "artifact_paths": result.get("artifact_paths", {}),
+        "warnings": report.get("warnings", []),
+        "llm_error": result.get("llm_error", ""),
+    }
 
 
 if __name__ == "__main__":
