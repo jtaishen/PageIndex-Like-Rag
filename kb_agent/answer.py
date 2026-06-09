@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 
 from .llm import LLMError, generate_grounded_answer
 from .search import get_evidence, search_documents, search_nodes
+from .tree_search import tree_search_for_query
 from .utils import compact_whitespace, first_words
 
 
@@ -16,11 +17,16 @@ def answer_query(
     require_llm: bool = False,
     search_mode: str = "hybrid",
 ) -> Dict[str, object]:
-    results = search_nodes(db_path, query, top_k=top_k, search_mode=search_mode)
-    evidence = []
-    for result in results:
-        packets = get_evidence(db_path, result.doc_id, [result.node_id])
-        evidence.extend(packet.to_dict() for packet in packets)
+    tree_trace = None
+    if search_mode == "tree":
+        tree_trace = tree_search_for_query(db_path, query, top_k=top_k, use_llm=False, search_mode="hybrid")
+        evidence = list(tree_trace.get("evidence") or [])
+    else:
+        results = search_nodes(db_path, query, top_k=top_k, search_mode=search_mode)
+        evidence = []
+        for result in results:
+            packets = get_evidence(db_path, result.doc_id, [result.node_id])
+            evidence.extend(packet.to_dict() for packet in packets)
 
     lines: List[str] = []
     llm_error: Optional[str] = None
@@ -42,6 +48,7 @@ def answer_query(
         "search_mode": search_mode,
         "answer": "\n".join(lines),
         "evidence": evidence,
+        "tree_search_trace": tree_trace,
         "llm_error": llm_error,
     }
 

@@ -268,6 +268,32 @@ uv sync --extra embeddings
 KB_EMBEDDING_PROVIDER=sentence-transformers uv run python -m kb_agent.cli embed --force
 ```
 
+## v0.10 LLM Tree Search 与可解释树检索
+
+v0.10 在 hybrid/FTS 候选基础上增加论文内部树检索：先识别查询意图，再用 value function 为章节、段落、图表、参考文献节点打分，最后返回可解释的 `tree_search_trace`。默认 `ask/search/compare/generate-review` 仍保持 hybrid；需要树搜索时显式指定 `--search-mode tree`。
+
+查看查询意图：
+
+```bash
+uv run python -m kb_agent.cli classify-query "这篇论文的方法设计是什么？" --no-llm
+```
+
+在单篇论文内运行树搜索：
+
+```bash
+uv run python -m kb_agent.cli tree-search <doc_id> "这篇论文的方法设计是什么？" --no-llm
+```
+
+让问答、比较和综述规划使用树搜索证据：
+
+```bash
+uv run python -m kb_agent.cli ask "这两篇论文的任务规划方法有什么区别？" --no-llm --search-mode tree
+uv run python -m kb_agent.cli compare "服务机器人与多智能体任务规划方法对比" --no-llm --search-mode tree
+uv run python -m kb_agent.cli generate-review "任务规划方法研究综述" --no-llm --search-mode tree
+```
+
+`tree_search_trace` 会记录 query profile、评分分解、展开路径、最终 evidence、LLM fallback 原因和读取到的长期偏好摘要。树搜索只读取允许的 memory 偏好，不会写入论文正文、检索命中或 evidence packet。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
@@ -345,7 +371,7 @@ DeepSeek 官方 OpenCode 接入方式：
 推荐工具调用顺序：
 
 ```text
-kb_sync -> kb_build_semantic_index -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
+kb_sync -> kb_build_semantic_index -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_classify_query -> kb_tree_search -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
 ```
 
 ## 测试

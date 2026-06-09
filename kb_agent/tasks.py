@@ -11,6 +11,7 @@ from .config import DEFAULT_DB_PATH, PROJECT_ROOT
 from .insights import extract_doc_insights
 from .llm import LLMError, generate_json_object
 from .search import get_evidence, search_documents, search_nodes
+from .tree_search import tree_search
 from .utils import compact_whitespace, stable_id, write_json
 
 
@@ -281,7 +282,8 @@ def _select_papers(
 ) -> List[Dict[str, Any]]:
     if doc_ids:
         return [{"doc_id": doc_id, "score": None, "node_matches": None} for doc_id in _unique_strings(doc_ids)]
-    return search_documents(db_path, query, top_k=max(1, top_k_docs), search_mode=search_mode)
+    route_mode = "hybrid" if search_mode == "tree" else search_mode
+    return search_documents(db_path, query, top_k=max(1, top_k_docs), search_mode=route_mode)
 
 
 def _prepare_paper_contexts(db_path: Path, selected: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], List[str]]:
@@ -373,6 +375,9 @@ def _collect_section_evidence(
 
 
 def _search_doc_evidence(db_path: Path, doc_id: str, query: str, top_k: int, search_mode: str = "hybrid") -> List[Dict[str, Any]]:
+    if search_mode == "tree":
+        trace = tree_search(db_path, doc_id, query, budget=top_k, use_llm=False, search_mode="hybrid")
+        return _dedupe_evidence(list(trace.get("evidence") or []))
     results = search_nodes(db_path, query, doc_id=doc_id, top_k=top_k, search_mode=search_mode)
     packets = []
     for result in results:

@@ -10,9 +10,11 @@ from .embeddings import build_semantic_index
 from .ingest import sync_directory
 from .insights import extract_doc_insights
 from .memory import compact_memory, put_memory_gated as write_memory_gated, remember_task, resume_task, search_memory
+from .query import classify_query
 from .review import assemble_review, check_review_citations, draft_review
 from .search import get_evidence, search_nodes
 from .tasks import compare_papers, generate_review_plan, get_task_artifact
+from .tree_search import tree_search
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -69,6 +71,36 @@ if FastMCP is not None:
             result.__dict__
             for result in search_nodes(resolve_db_path(db_path), query, doc_id=doc_id, top_k=top_k, search_mode=search_mode)
         ]
+
+    @mcp.tool()
+    def kb_classify_query(
+        query: str,
+        use_llm: bool = True,
+        require_llm: bool = False,
+    ) -> Dict[str, Any]:
+        """Classify query intent and preferred tree-search targets."""
+        return classify_query(query, use_llm=use_llm, require_llm=require_llm)
+
+    @mcp.tool()
+    def kb_tree_search(
+        doc_id: str,
+        query: str,
+        budget: int = 8,
+        use_llm: bool = True,
+        require_llm: bool = False,
+        search_mode: str = "hybrid",
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Run explainable value-function or LLM-guided tree search inside one document."""
+        return tree_search(
+            resolve_db_path(db_path),
+            doc_id,
+            query,
+            budget=budget,
+            use_llm=use_llm,
+            require_llm=require_llm,
+            search_mode=search_mode,
+        )
 
     @mcp.tool()
     def kb_get_evidence(
@@ -142,6 +174,7 @@ if FastMCP is not None:
         top_k_docs: int = 5,
         use_llm: bool = True,
         require_llm: bool = False,
+        search_mode: str = "hybrid",
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Compare candidate papers and write grounded comparison task artifacts."""

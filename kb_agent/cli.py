@@ -14,9 +14,11 @@ from .eval import eval_search
 from .ingest import sync_directory
 from .insights import extract_doc_insights
 from .memory import compact_memory, put_memory_gated, remember_task, resume_task, search_memory
+from .query import classify_query
 from .review import assemble_review, check_review_citations, draft_review
 from .search import build_search_report, get_evidence, search_nodes
 from .tasks import compare_papers, generate_review_plan, get_task_artifact
+from .tree_search import tree_search
 
 
 def main(argv: Any = None) -> None:
@@ -36,12 +38,12 @@ def main(argv: Any = None) -> None:
     search_parser.add_argument("query")
     search_parser.add_argument("--doc-id", default=None)
     search_parser.add_argument("--top-k", type=int, default=8)
-    search_parser.add_argument("--search-mode", choices=["hybrid", "fts"], default="hybrid")
+    search_parser.add_argument("--search-mode", choices=["hybrid", "fts", "tree"], default="hybrid")
 
     docs_parser = subparsers.add_parser("docs", help="Search candidate documents")
     docs_parser.add_argument("query")
     docs_parser.add_argument("--top-k", type=int, default=8)
-    docs_parser.add_argument("--search-mode", choices=["hybrid", "fts"], default="hybrid")
+    docs_parser.add_argument("--search-mode", choices=["hybrid", "fts", "tree"], default="hybrid")
 
     embed_parser = subparsers.add_parser("embed", help="Build semantic embeddings for ready documents")
     embed_parser.add_argument("--doc-id", action="append", default=[], help="Build only one document id; repeatable")
@@ -52,12 +54,25 @@ def main(argv: Any = None) -> None:
     report_parser.add_argument("query")
     report_parser.add_argument("--doc-id", default=None)
     report_parser.add_argument("--top-k", type=int, default=8)
-    report_parser.add_argument("--search-mode", choices=["hybrid", "fts"], default="hybrid")
+    report_parser.add_argument("--search-mode", choices=["hybrid", "fts", "tree"], default="hybrid")
 
     eval_parser = subparsers.add_parser("eval-search", help="Run a JSON search evaluation set")
     eval_parser.add_argument("queries_json")
     eval_parser.add_argument("--top-k", type=int, default=5)
-    eval_parser.add_argument("--search-mode", choices=["hybrid", "fts"], default="hybrid")
+    eval_parser.add_argument("--search-mode", choices=["hybrid", "fts", "tree"], default="hybrid")
+
+    classify_parser = subparsers.add_parser("classify-query", help="Classify a query intent for tree search")
+    classify_parser.add_argument("query")
+    classify_parser.add_argument("--no-llm", action="store_true", help="Use rule-based classification only")
+    classify_parser.add_argument("--require-llm", action="store_true", help="Fail if DeepSeek cannot be called")
+
+    tree_search_parser = subparsers.add_parser("tree-search", help="Run explainable tree search inside one document")
+    tree_search_parser.add_argument("doc_id")
+    tree_search_parser.add_argument("query")
+    tree_search_parser.add_argument("--budget", type=int, default=8)
+    tree_search_parser.add_argument("--no-llm", action="store_true", help="Use value-function tree search only")
+    tree_search_parser.add_argument("--require-llm", action="store_true", help="Fail if DeepSeek cannot be called")
+    tree_search_parser.add_argument("--search-mode", choices=["hybrid", "fts"], default="hybrid")
 
     tree_parser = subparsers.add_parser("tree", help="Show a document tree")
     tree_parser.add_argument("doc_id")
@@ -94,7 +109,7 @@ def main(argv: Any = None) -> None:
     compare_parser.add_argument("--top-k-docs", type=int, default=5)
     compare_parser.add_argument("--no-llm", action="store_true", help="Use rule-based comparison only")
     compare_parser.add_argument("--require-llm", action="store_true", help="Fail if DeepSeek cannot be called")
-    compare_parser.add_argument("--search-mode", choices=["hybrid", "fts"], default="hybrid")
+    compare_parser.add_argument("--search-mode", choices=["hybrid", "fts", "tree"], default="hybrid")
 
     review_parser = subparsers.add_parser("generate-review", help="Generate review planning task artifacts")
     review_parser.add_argument("topic")
@@ -102,7 +117,7 @@ def main(argv: Any = None) -> None:
     review_parser.add_argument("--top-k-docs", type=int, default=8)
     review_parser.add_argument("--no-llm", action="store_true", help="Use rule-based planning only")
     review_parser.add_argument("--require-llm", action="store_true", help="Fail if DeepSeek cannot be called")
-    review_parser.add_argument("--search-mode", choices=["hybrid", "fts"], default="hybrid")
+    review_parser.add_argument("--search-mode", choices=["hybrid", "fts", "tree"], default="hybrid")
 
     task_artifact_parser = subparsers.add_parser("task-artifact", help="Read a task artifact")
     task_artifact_parser.add_argument("task_id")
@@ -130,7 +145,7 @@ def main(argv: Any = None) -> None:
     ask_parser.add_argument("--no-llm", action="store_true", help="Only print evidence; do not call DeepSeek")
     ask_parser.add_argument("--require-llm", action="store_true", help="Fail if DeepSeek cannot be called")
     ask_parser.add_argument("--json", action="store_true", help="Print full JSON result")
-    ask_parser.add_argument("--search-mode", choices=["hybrid", "fts"], default="hybrid")
+    ask_parser.add_argument("--search-mode", choices=["hybrid", "fts", "tree"], default="hybrid")
 
     mem_put_parser = subparsers.add_parser("memory-put", help="Store explicit long-term memory")
     mem_put_parser.add_argument("scope")
@@ -179,6 +194,20 @@ def main(argv: Any = None) -> None:
         _print_json(build_search_report(db_path, args.query, doc_id=args.doc_id, top_k=args.top_k, search_mode=args.search_mode))
     elif args.command == "eval-search":
         _print_json(_eval_summary(eval_search(db_path, Path(args.queries_json), search_mode=args.search_mode, top_k=args.top_k)))
+    elif args.command == "classify-query":
+        _print_json(classify_query(args.query, use_llm=not args.no_llm, require_llm=args.require_llm))
+    elif args.command == "tree-search":
+        _print_json(
+            tree_search(
+                db_path,
+                args.doc_id,
+                args.query,
+                budget=args.budget,
+                use_llm=not args.no_llm,
+                require_llm=args.require_llm,
+                search_mode=args.search_mode,
+            )
+        )
     elif args.command == "tree":
         _print_tree(db_path, args.doc_id)
     elif args.command == "card":

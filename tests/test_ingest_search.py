@@ -20,9 +20,11 @@ from kb_agent.insights import extract_doc_insights
 from kb_agent.llm import LLMError
 from kb_agent.memory import compact_memory, put_memory_gated, remember_task, resume_task, search_memory
 from kb_agent.models import ParsedBlock, ParsedDocument
+from kb_agent.query import classify_query
 from kb_agent.review import assemble_review, check_review_citations, draft_review
 from kb_agent.search import build_search_report, get_evidence, search_documents, search_nodes
 from kb_agent.tasks import compare_papers, generate_review_plan, get_task_artifact
+from kb_agent.tree_search import tree_search
 
 
 class IngestSearchTest(unittest.TestCase):
@@ -752,6 +754,121 @@ class IngestSearchTest(unittest.TestCase):
             with contextlib.redirect_stdout(stdout):
                 cli_main(["--db", str(db_path), "eval-search", str(queries_path), "--search-mode", "hybrid"])
             self.assertIn("search_eval.v1", stdout.getvalue())
+
+    def test_query_classifier_recognizes_paper_intents(self) -> None:
+        samples = {
+            "method": "这篇论文的方法设计是什么？",
+            "experiment": "实验结果和评价指标如何？",
+            "limitation": "这项工作的局限和不足是什么？",
+            "citation": "参考文献和引用关系有哪些？",
+            "compare": "对比两篇论文的方法差异",
+            "review": "生成任务规划方法研究综述",
+        }
+        for expected, query in samples.items():
+            profile = classify_query(query, use_llm=False)
+            self.assertEqual(profile["schema"], "query_profile.v1")
+            self.assertEqual(profile["intent"], expected)
+            self.assertTrue(profile["focus_terms"])
+            self.assertTrue(profile["preferred_node_types"])
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            cli_main(["classify-query", "这篇论文的方法设计是什么？", "--no-llm"])
+        self.assertIn('"intent": "method"', stdout.getvalue())
+
+    def test_tree_search_value_function_selects_structured_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_id = _sync_insight_sample(Path(tmp))
+            trace = tree_search(db_path, doc_id, "这篇论文的方法设计是什么？", budget=3, use_llm=False)
+
+            self.assertEqual(trace["schema"], "tree_search_trace.v1")
+            self.assertEqual(trace["query_profile"]["intent"], "method")
+            self.assertGreaterEqual(len(trace["evidence"]), 1)
+            self.assertTrue(any("方法设计" in item["node_path"] for item in trace["evidence"]))
+            self.assertIn("score_components", trace["evidence"][0])
+            self.assertTrue(trace["expanded_nodes"])
+            self.assertTrue(trace["selected_paths"])
+
+            results = search_nodes(db_path, "这篇论文的方法设计是什么？", doc_id=doc_id, top_k=3, search_mode="tree")
+            self.assertGreaterEqual(len(results), 1)
+            self.assertIn("tree:value", results[0].rank_reason)
+
+            report = build_search_report(db_path, "这篇论文的方法设计是什么？", doc_id=doc_id, top_k=3, search_mode="tree")
+            self.assertEqual(report["effective_search_mode"], "tree")
+            self.assertIn("tree_search_trace", report)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "tree-search", doc_id, "这篇论文的方法设计是什么？", "--no-llm"])
+            self.assertIn("tree_search_trace.v1", stdout.getvalue())
+
+    def test_tree_search_llm_selection_and_require_llm_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_id = _sync_insight_sample(Path(tmp))
+            node_index = get_artifact(db_path, doc_id, "node_index.jsonl")["content"]
+            target_id = next(
+                node["node_id"]
+                for node in node_index
+                if "实验结果表明" in node.get("text", "")
+            )
+            payload = {
+                "selected_node_ids": [target_id],
+                "rationale": ["实验查询应优先选择实验结果节点。"],
+                "warnings": [],
+            }
+            with mock.patch("kb_agent.tree_search.generate_json_object", return_value=payload):
+                trace = tree_search(db_path, doc_id, "实验结果如何？", budget=3, use_llm=True)
+
+            self.assertEqual(trace["evidence"][0]["node_id"], target_id)
+            self.assertEqual(trace["llm_decisions"]["selected_node_ids"], [target_id])
+            self.assertFalse(trace["llm_error"])
+
+            with mock.patch("kb_agent.tree_search.generate_json_object", side_effect=LLMError("boom")):
+                fallback = tree_search(db_path, doc_id, "实验结果如何？", budget=2, use_llm=True)
+            self.assertIn("llm_unavailable:boom", fallback["warnings"])
+            self.assertTrue(fallback["evidence"])
+
+            with mock.patch("kb_agent.tree_search.generate_json_object", side_effect=LLMError("boom")):
+                with self.assertRaises(LLMError):
+                    tree_search(db_path, doc_id, "实验结果如何？", budget=2, use_llm=True, require_llm=True)
+
+    def test_ask_compare_and_review_can_use_tree_search_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+
+            answer = answer_query(
+                db_path,
+                "这两篇论文的任务规划方法有什么区别？",
+                top_k=4,
+                use_llm=False,
+                search_mode="tree",
+            )
+            self.assertEqual(answer["search_mode"], "tree")
+            self.assertTrue(answer["tree_search_trace"])
+            self.assertGreaterEqual(len(answer["evidence"]), 1)
+            self.assertIn("score_components", answer["evidence"][0])
+
+            comparison = compare_papers(
+                db_path,
+                "服务机器人与多智能体任务规划方法对比",
+                doc_ids=doc_ids,
+                use_llm=False,
+                search_mode="tree",
+            )
+            first_cell = comparison["comparison_matrix"]["dimensions"][0]["cells"][0]
+            self.assertTrue(first_cell["evidence"])
+            self.assertIn("tree:value", first_cell["evidence"][0]["rank_reason"])
+
+            review = generate_review_plan(
+                db_path,
+                "任务规划方法研究综述",
+                doc_ids=doc_ids,
+                use_llm=False,
+                search_mode="tree",
+            )
+            background = review["section_evidence"]["background_problem"]
+            self.assertGreaterEqual(background["evidence_count"], 1)
+            self.assertIn("score_components", background["evidence"][0])
 
     def test_pdf_parser_choice_pypdf_records_quality_chain(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

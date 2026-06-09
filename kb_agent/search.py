@@ -18,7 +18,7 @@ from .models import EvidencePacket, SearchResult
 from .utils import compact_whitespace
 
 
-SEARCH_MODES = {"hybrid", "fts"}
+SEARCH_MODES = {"hybrid", "fts", "tree"}
 
 
 def resolve_search_mode(search_mode: str = "hybrid") -> str:
@@ -55,10 +55,15 @@ def search_nodes(
     top_k: int = 8,
     search_mode: str = "hybrid",
 ) -> List[SearchResult]:
+    mode = resolve_search_mode(search_mode)
+    if mode == "tree":
+        from .tree_search import tree_search_results
+
+        return tree_search_results(db_path, query, doc_id=doc_id, top_k=top_k, search_mode="hybrid")
     conn = db.connect(db_path)
     db.init_db(conn)
     try:
-        return _search_nodes_conn(conn, query, doc_id=doc_id, top_k=top_k, search_mode=search_mode)
+        return _search_nodes_conn(conn, query, doc_id=doc_id, top_k=top_k, search_mode=mode)
     finally:
         conn.close()
 
@@ -73,6 +78,8 @@ def search_documents(
     db.init_db(conn)
     try:
         mode = resolve_search_mode(search_mode)
+        if mode == "tree":
+            mode = "hybrid"
         if mode == "hybrid":
             rows = _search_documents_hybrid_conn(conn, query, top_k)
             if rows:
@@ -90,6 +97,23 @@ def build_search_report(
     search_mode: str = "hybrid",
 ) -> Dict[str, object]:
     mode = resolve_search_mode(search_mode)
+    if mode == "tree":
+        from .tree_search import tree_search_for_query
+
+        trace = tree_search_for_query(db_path, query, doc_id=doc_id, top_k=top_k, use_llm=False, search_mode="hybrid")
+        return {
+            "schema": "search_report.v1",
+            "query": query,
+            "doc_id": doc_id,
+            "requested_search_mode": mode,
+            "effective_search_mode": "tree",
+            "top_k": top_k,
+            "warnings": trace.get("warnings", []),
+            "embedding_status": _safe_embedding_status(db_path),
+            "documents": trace.get("routed_documents", []) or _docs_from_tree_results(trace.get("results", [])),
+            "results": trace.get("results", []),
+            "tree_search_trace": trace,
+        }
     conn = db.connect(db_path)
     db.init_db(conn)
     try:
@@ -578,6 +602,36 @@ def _docs_for_results(conn, results: List[SearchResult]) -> List[Dict[str, objec
     for result in results:
         matches[result.doc_id] += 1
     return [{**dict(row), "node_matches": matches.get(row["doc_id"], 0)} for row in rows]
+
+
+def _docs_from_tree_results(results: object) -> List[Dict[str, object]]:
+    grouped: Dict[str, Dict[str, object]] = {}
+    if not isinstance(results, list):
+        return []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        doc_id = str(item.get("doc_id") or "")
+        if not doc_id:
+            continue
+        doc = grouped.setdefault(
+            doc_id,
+            {
+                "doc_id": doc_id,
+                "title": item.get("title") or doc_id,
+                "path": item.get("path") or "",
+                "node_matches": 0,
+                "score": item.get("score"),
+                "rank_reason": item.get("rank_reason") or "tree:value",
+                "best_node_id": item.get("node_id"),
+            },
+        )
+        doc["node_matches"] = int(doc["node_matches"]) + 1
+        if float(item.get("score") or 0.0) > float(doc.get("score") or 0.0):
+            doc["score"] = item.get("score")
+            doc["best_node_id"] = item.get("node_id")
+            doc["rank_reason"] = item.get("rank_reason") or doc["rank_reason"]
+    return list(grouped.values())
 
 
 def _search_report_warnings(results: List[SearchResult], mode: str, db_path: Path) -> List[str]:
