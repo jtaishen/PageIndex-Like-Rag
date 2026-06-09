@@ -66,6 +66,8 @@ def extract_facts(
     nodes = _artifact_content(db_path, doc_id, "node_index.jsonl", [])
     layout = _artifact_content(db_path, doc_id, "layout_blocks.json", {})
     tables = _artifact_content(db_path, doc_id, "tables.json", {})
+    table_content = _artifact_content(db_path, doc_id, "table_content.json", {})
+    table_summaries = _artifact_content(db_path, doc_id, "table_summaries.json", {})
     figures = _artifact_content(db_path, doc_id, "figures.json", {})
     innovation, citation_map, insight_warnings = _read_or_extract_insight_artifacts(db_path, doc_id)
     node_by_id = _node_map(nodes)
@@ -75,7 +77,17 @@ def extract_facts(
 
     if use_llm:
         try:
-            payload = _extract_facts_with_llm(card, quality, innovation, citation_map, selected_nodes, layout, tables, figures)
+            payload = _extract_facts_with_llm(
+                card,
+                quality,
+                innovation,
+                citation_map,
+                selected_nodes,
+                layout,
+                tables,
+                table_summaries,
+                figures,
+            )
             facts = _normalize_fact_payload(
                 payload,
                 doc_id=doc_id,
@@ -98,6 +110,7 @@ def extract_facts(
         warnings.append("llm_disabled")
         facts = _rule_based_facts(doc_id, version_id, card, quality, innovation, citation_map, selected_nodes, node_by_id, warnings)
 
+    facts = _merge_table_facts(doc_id, version_id, facts, table_content, table_summaries, node_by_id)
     artifacts = _build_fact_artifacts(doc_id, version_id, card, quality, facts, llm_error)
     _write_fact_artifacts(artifact_dir, artifacts)
     _replace_fact_rows(db_path, doc_id, version_id, facts)
@@ -143,22 +156,27 @@ def fact_search(
     *,
     doc_ids: Optional[List[str]] = None,
     fact_type: Optional[str] = None,
+    source: str = "all",
+    min_confidence: float = 0.0,
     top_k: int = 20,
 ) -> Dict[str, Any]:
     fact_kind = (fact_type or "").strip().lower()
     if fact_kind and fact_kind not in {"claim", "entity", "relation"}:
         raise ValueError("fact type must be one of: claim, entity, relation")
+    source_filter = (source or "all").strip().lower()
+    if source_filter not in {"all", "text", "table"}:
+        raise ValueError("source must be one of: all, text, table")
     terms = _query_terms(query)
     conn = db.connect(db_path)
     db.init_db(conn)
     try:
         items: List[Dict[str, Any]] = []
         if fact_kind in {"", "claim"}:
-            items.extend(_search_claim_rows(conn, terms, doc_ids))
+            items.extend(_search_claim_rows(conn, terms, doc_ids, source_filter, min_confidence))
         if fact_kind in {"", "entity"}:
-            items.extend(_search_entity_rows(conn, terms, doc_ids))
+            items.extend(_search_entity_rows(conn, terms, doc_ids, source_filter, min_confidence))
         if fact_kind in {"", "relation"}:
-            items.extend(_search_relation_rows(conn, terms, doc_ids))
+            items.extend(_search_relation_rows(conn, terms, doc_ids, source_filter, min_confidence))
     finally:
         conn.close()
     ranked = sorted(items, key=lambda item: (-float(item.get("score") or 0.0), str(item.get("fact_id") or "")))[: max(1, top_k)]
@@ -166,6 +184,8 @@ def fact_search(
         "schema": "fact_search.v1",
         "query": query,
         "type": fact_kind or "all",
+        "source": source_filter,
+        "min_confidence": min_confidence,
         "doc_ids": doc_ids or [],
         "top_k": top_k,
         "count": len(ranked),
@@ -178,6 +198,7 @@ def fact_coverage_summary(db_path: Path, *, doc_id: Optional[str] = None) -> Dic
     db.init_db(conn)
     try:
         counts = db.paper_fact_counts(conn, doc_id=doc_id)
+        source_counts = _fact_source_counts(conn, doc_id=doc_id)
     finally:
         conn.close()
     total = counts["claim_count"] + counts["entity_count"] + counts["relation_count"]
@@ -186,6 +207,8 @@ def fact_coverage_summary(db_path: Path, *, doc_id: Optional[str] = None) -> Dic
         "doc_id": doc_id or "",
         "total_fact_count": total,
         **counts,
+        **source_counts,
+        "table_backed_fact_rate": round(source_counts["table_backed_fact_count"] / max(1, total), 4),
     }
 
 
@@ -196,6 +219,21 @@ def fact_summary_for_doc(db_path: Path, doc_id: str) -> Dict[str, Any]:
         relations = get_relations(db_path, doc_id)
     except (FileNotFoundError, KeyError, ValueError):
         return {"schema": "fact_summary.v1", "doc_id": doc_id, "available": False}
+    table_claims = [
+        item
+        for item in (claims.get("claims") or [])
+        if isinstance(item, dict) and _is_table_source(str(item.get("source") or ""))
+    ]
+    table_entities = [
+        item
+        for item in (entities.get("entities") or [])
+        if isinstance(item, dict) and _is_table_source(str(item.get("source") or ""))
+    ]
+    table_relations = [
+        item
+        for item in (relations.get("relations") or [])
+        if isinstance(item, dict) and _is_table_source(str(item.get("source") or ""))
+    ]
     return {
         "schema": "fact_summary.v1",
         "doc_id": doc_id,
@@ -203,6 +241,10 @@ def fact_summary_for_doc(db_path: Path, doc_id: str) -> Dict[str, Any]:
         "claim_count": int(claims.get("count") or 0),
         "entity_count": int(entities.get("count") or 0),
         "relation_count": int(relations.get("count") or 0),
+        "table_backed_fact_count": len(table_claims) + len(table_entities) + len(table_relations),
+        "table_claim_count": len(table_claims),
+        "table_entity_count": len(table_entities),
+        "table_relation_count": len(table_relations),
         "top_claims": [
             {
                 "claim_id": item.get("claim_id"),
@@ -220,6 +262,24 @@ def fact_summary_for_doc(db_path: Path, doc_id: str) -> Dict[str, Any]:
             }
             for item in (entities.get("entities") or [])[:8]
             if isinstance(item, dict)
+        ],
+        "top_table_entities": [
+            {
+                "entity_id": item.get("entity_id"),
+                "type": item.get("type"),
+                "name": item.get("name"),
+                "confidence": item.get("confidence"),
+            }
+            for item in table_entities[:8]
+        ],
+        "top_table_relations": [
+            {
+                "relation_id": item.get("relation_id"),
+                "type": item.get("type"),
+                "text": _excerpt(str(item.get("text") or ""), 180),
+                "confidence": item.get("confidence"),
+            }
+            for item in table_relations[:8]
         ],
     }
 
@@ -323,6 +383,7 @@ def _extract_facts_with_llm(
     selected_nodes: List[Dict[str, Any]],
     layout: Any,
     tables: Any,
+    table_summaries: Any,
     figures: Any,
 ) -> Dict[str, object]:
     system_prompt = (
@@ -344,6 +405,7 @@ def _extract_facts_with_llm(
             f"citation_relation_count: {len(citation_map.get('relations') or [])}",
             f"layout_block_count: {(layout or {}).get('count') if isinstance(layout, dict) else 0}",
             f"table_count: {(tables or {}).get('count') if isinstance(tables, dict) else 0}",
+            f"table_summaries: {(table_summaries or {}).get('table_summaries') if isinstance(table_summaries, dict) else []}",
             f"figure_count: {(figures or {}).get('count') if isinstance(figures, dict) else 0}",
             "",
             "候选证据节点：",
@@ -554,6 +616,206 @@ def _rule_based_facts(
     return normalized
 
 
+def _merge_table_facts(
+    doc_id: str,
+    version_id: str,
+    facts: Dict[str, Any],
+    table_content: Any,
+    table_summaries: Any,
+    node_by_id: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    del table_summaries
+    table_facts = _facts_from_tables(doc_id, version_id, table_content, node_by_id)
+    if not table_facts["claims"] and not table_facts["entities"] and not table_facts["relations"]:
+        return facts
+    merged = {
+        "claims": [*(facts.get("claims") or []), *table_facts["claims"]],
+        "entities": [*(facts.get("entities") or []), *table_facts["entities"]],
+        "relations": [*(facts.get("relations") or []), *table_facts["relations"]],
+    }
+    normalized = _dedupe_facts(merged)
+    normalized["status"] = facts.get("status") or "partial"
+    normalized["source"] = facts.get("source") or "rule"
+    normalized["warnings"] = _unique_strings([*(facts.get("warnings") or []), *table_facts["warnings"]])
+    return normalized
+
+
+def _facts_from_tables(
+    doc_id: str,
+    version_id: str,
+    table_content: Any,
+    node_by_id: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    tables = table_content.get("table_content") if isinstance(table_content, dict) else table_content
+    if not isinstance(tables, list):
+        return {"claims": [], "entities": [], "relations": [], "warnings": []}
+    claims: List[Dict[str, Any]] = []
+    entities: List[Dict[str, Any]] = []
+    relations: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    for table_index, table in enumerate(tables):
+        if not isinstance(table, dict):
+            continue
+        node = _node_for_table(table, node_by_id)
+        if not node:
+            warnings.append("table_fact_without_node_skipped")
+            continue
+        source = str(table.get("source") or "table_rule")
+        confidence = _confidence(table.get("confidence"), 0.62)
+        evidence = _table_evidence(table)
+        caption = str(table.get("caption") or "")
+        headers = [str(item) for item in table.get("headers") or [] if str(item).strip()]
+        rows = [row for row in table.get("rows") or [] if isinstance(row, dict)]
+        metric_headers = [header for header in headers if _looks_like_metric(header)]
+        if caption and rows:
+            claim = _claim_record(
+                doc_id,
+                version_id,
+                "result",
+                f"{caption} 汇总了 {len(rows)} 行实验或对比结果。",
+                node,
+                source,
+                max(0.5, confidence - 0.02),
+                table_index,
+                extra_evidence=evidence,
+            )
+            if claim:
+                claims.append(claim)
+        for metric in metric_headers:
+            entity = _entity_record(doc_id, version_id, "metric", metric, node, source, confidence, extra_evidence=evidence)
+            if entity:
+                entities.append(entity)
+        baseline_names: List[str] = []
+        method_names: List[str] = []
+        for row_index, row in enumerate(rows):
+            cells = [
+                str(cell.get("text") or "")
+                for cell in row.get("cells") or []
+                if isinstance(cell, dict) and str(cell.get("text") or "").strip()
+            ]
+            if not cells:
+                continue
+            method_name = _table_method_name(cells, headers)
+            if method_name:
+                method_type = "baseline" if _looks_like_baseline(method_name) else "method"
+                method_entity = _entity_record(
+                    doc_id,
+                    version_id,
+                    method_type,
+                    method_name,
+                    node,
+                    source,
+                    confidence,
+                    extra_evidence=evidence,
+                )
+                if method_entity:
+                    entities.append(method_entity)
+                method_names.append(method_name)
+                if method_type == "baseline":
+                    baseline_names.append(method_name)
+            for cell_index, value in enumerate(cells):
+                header = headers[cell_index] if cell_index < len(headers) else ""
+                if _looks_like_metric(header):
+                    metric_entity = _entity_record(
+                        doc_id,
+                        version_id,
+                        "metric",
+                        header,
+                        node,
+                        source,
+                        confidence,
+                        extra_evidence=evidence,
+                    )
+                    if metric_entity:
+                        entities.append(metric_entity)
+                    result_name = f"{header}: {value}" if value else header
+                    if _looks_like_result(value):
+                        result_entity = _entity_record(
+                            doc_id,
+                            version_id,
+                            "result",
+                            result_name,
+                            node,
+                            source,
+                            max(0.5, confidence - 0.04),
+                            extra_evidence=evidence,
+                        )
+                        if result_entity:
+                            entities.append(result_entity)
+                    if method_name and header and value:
+                        relation = _relation_record(
+                            doc_id,
+                            version_id,
+                            "reports_metric",
+                            method_name,
+                            result_name,
+                            node,
+                            source,
+                            max(0.5, confidence - 0.03),
+                            text=f"{method_name} reports {result_name}",
+                            index=table_index * 100 + row_index * 10 + cell_index,
+                            extra_evidence=evidence,
+                        )
+                        if relation:
+                            relations.append(relation)
+                if _looks_like_dataset(header) or _looks_like_dataset(value):
+                    dataset_name = value if not _looks_like_dataset(header) else value or header
+                    dataset = _entity_record(
+                        doc_id,
+                        version_id,
+                        "dataset",
+                        dataset_name,
+                        node,
+                        source,
+                        confidence,
+                        extra_evidence=evidence,
+                    )
+                    if dataset:
+                        entities.append(dataset)
+                    if method_name and dataset_name:
+                        relation = _relation_record(
+                            doc_id,
+                            version_id,
+                            "evaluates_on",
+                            method_name,
+                            dataset_name,
+                            node,
+                            source,
+                            max(0.5, confidence - 0.03),
+                            index=table_index * 100 + row_index * 10 + cell_index,
+                            extra_evidence=evidence,
+                        )
+                        if relation:
+                            relations.append(relation)
+        if baseline_names:
+            for method_name in _unique_strings(method_names):
+                if _looks_like_baseline(method_name):
+                    continue
+                for baseline in baseline_names[:3]:
+                    relation_type = "improves" if _looks_like_ours(method_name) else "compares_with"
+                    relation = _relation_record(
+                        doc_id,
+                        version_id,
+                        relation_type,
+                        method_name,
+                        baseline,
+                        node,
+                        source,
+                        max(0.48, confidence - 0.08),
+                        text=f"{method_name} {relation_type} {baseline} in {caption}",
+                        index=table_index,
+                        extra_evidence=evidence,
+                    )
+                    if relation:
+                        relations.append(relation)
+    return {
+        "claims": claims,
+        "entities": entities,
+        "relations": relations,
+        "warnings": _unique_strings([*warnings, "table_fact_extraction"]),
+    }
+
+
 def _build_fact_artifacts(
     doc_id: str,
     version_id: str,
@@ -569,6 +831,7 @@ def _build_fact_artifacts(
     warnings = _unique_strings(facts.get("warnings") or [])
     low_confidence = sum(1 for item in [*claims, *entities, *relations] if float(item.get("confidence") or 0.0) < 0.5)
     no_evidence = sum(1 for item in [*claims, *entities, *relations] if not item.get("node_id"))
+    table_backed = sum(1 for item in [*claims, *entities, *relations] if _is_table_source(str(item.get("source") or "")))
     claims_artifact = {
         "schema": "claims.v1",
         "status": facts.get("status") or "partial",
@@ -625,6 +888,8 @@ def _build_fact_artifacts(
         "relation_count": len(relations),
         "low_confidence_count": low_confidence,
         "no_evidence_count": no_evidence,
+        "table_backed_fact_count": table_backed,
+        "table_backed_fact_rate": round(table_backed / max(1, len(claims) + len(entities) + len(relations)), 4),
         "quality_level": quality.get("quality_level"),
         "quality_warnings": quality.get("quality_warnings") or [],
         "warnings": warnings,
@@ -670,6 +935,7 @@ def _claim_record(
     source: str,
     confidence: float,
     index: int,
+    extra_evidence: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     clean = _excerpt(text, 420)
     if not clean or not node:
@@ -691,7 +957,7 @@ def _claim_record(
         "page_range": page_range,
         "confidence": confidence,
         "source": source,
-        "evidence": _evidence_ref(node),
+        "evidence": _merge_evidence(_evidence_ref(node), extra_evidence),
         "created_at": time.time(),
     }
 
@@ -705,6 +971,7 @@ def _entity_record(
     source: str,
     confidence: float,
     aliases: Optional[List[str]] = None,
+    extra_evidence: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     clean = _excerpt(name, 120)
     if not clean or not node:
@@ -727,7 +994,7 @@ def _entity_record(
         "page_range": _page_range_from_node(node),
         "confidence": confidence,
         "source": source,
-        "evidence": _evidence_ref(node),
+        "evidence": _merge_evidence(_evidence_ref(node), extra_evidence),
         "created_at": time.time(),
     }
 
@@ -746,6 +1013,7 @@ def _relation_record(
     object_id: str = "",
     text: str = "",
     index: int = 0,
+    extra_evidence: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     if not node:
         return None
@@ -773,9 +1041,99 @@ def _relation_record(
         "page_range": _page_range_from_node(node),
         "confidence": confidence,
         "source": source,
-        "evidence": _evidence_ref(node),
+        "evidence": _merge_evidence(_evidence_ref(node), extra_evidence),
         "created_at": time.time(),
     }
+
+
+def _merge_evidence(base: Dict[str, Any], extra: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    merged = dict(base or {})
+    if extra:
+        for key, value in extra.items():
+            if value not in (None, "", [], {}):
+                merged[key] = value
+    return merged
+
+
+def _table_evidence(table: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "table_id": table.get("table_id") or "",
+        "caption_id": table.get("table_id") or "",
+        "layout_block_id": table.get("layout_block_id") or "",
+        "content_layout_block_ids": table.get("content_layout_block_ids") or [],
+        "page_range": table.get("page_range") or [table.get("page"), table.get("page")],
+        "source": table.get("source") or "",
+        "source_parser": table.get("source_parser") or "",
+    }
+
+
+def _node_for_table(table: Dict[str, Any], node_by_id: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    layout_ids = [
+        *(str(item) for item in table.get("content_layout_block_ids") or [] if str(item)),
+        str(table.get("layout_block_id") or ""),
+    ]
+    caption_ids = {str(table.get("table_id") or ""), str(table.get("caption_id") or "")}
+    for wanted in layout_ids:
+        if not wanted:
+            continue
+        for node in node_by_id.values():
+            offsets = _source_offsets_dict(node)
+            if str(offsets.get("layout_block_id") or "") == wanted:
+                return node
+    for node in node_by_id.values():
+        offsets = _source_offsets_dict(node)
+        if str(offsets.get("caption_id") or "") in caption_ids:
+            return node
+    return None
+
+
+def _source_offsets_dict(node: Dict[str, Any]) -> Dict[str, Any]:
+    offsets = node.get("source_offsets") or {}
+    if isinstance(offsets, str):
+        try:
+            parsed = json.loads(offsets)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return offsets if isinstance(offsets, dict) else {}
+
+
+def _table_method_name(cells: List[str], headers: List[str]) -> str:
+    for index, cell in enumerate(cells):
+        header = headers[index] if index < len(headers) else ""
+        if _looks_like_result(cell):
+            continue
+        if _looks_like_method_header(header) or _looks_like_method(cell) or index == 0:
+            return _excerpt(cell, 120)
+    return ""
+
+
+def _looks_like_metric(value: str) -> bool:
+    return bool(re.search(r"(率|时间|开销|准确|精度|召回|F1|AUC|BLEU|ROUGE|指标|性能|鲁棒|延迟|吞吐)", value, re.IGNORECASE))
+
+
+def _looks_like_method_header(value: str) -> bool:
+    return bool(re.search(r"(方法|算法|模型|框架|method|model|baseline)", value, re.IGNORECASE))
+
+
+def _looks_like_method(value: str) -> bool:
+    return bool(re.search(r"(方法|算法|模型|框架|基线|baseline|ours|本文)", value, re.IGNORECASE))
+
+
+def _looks_like_baseline(value: str) -> bool:
+    return bool(re.search(r"(基线|baseline|对比|传统|规则)", value, re.IGNORECASE))
+
+
+def _looks_like_ours(value: str) -> bool:
+    return bool(re.search(r"(本文|ours|提出|本方法|所提)", value, re.IGNORECASE))
+
+
+def _looks_like_result(value: str) -> bool:
+    return bool(re.search(r"[-+]?\d+(?:\.\d+)?\s*(?:%|ms|s|秒|分|x|倍)?", value, re.IGNORECASE))
+
+
+def _looks_like_dataset(value: str) -> bool:
+    return bool(re.search(r"(数据集|dataset|benchmark|场景|语料|任务集)", value, re.IGNORECASE))
 
 
 def _entities_from_text(doc_id: str, version_id: str, node: Dict[str, Any], text: str) -> List[Dict[str, Any]]:
@@ -1014,15 +1372,23 @@ def _query_terms(query: str) -> List[str]:
     return _unique_strings(terms)[:12] or [query]
 
 
-def _search_claim_rows(conn, terms: List[str], doc_ids: Optional[List[str]]) -> List[Dict[str, Any]]:  # type: ignore[no-untyped-def]
+def _search_claim_rows(
+    conn,
+    terms: List[str],
+    doc_ids: Optional[List[str]],
+    source: str,
+    min_confidence: float,
+) -> List[Dict[str, Any]]:  # type: ignore[no-untyped-def]
     conditions, params = _like_conditions("text", terms)
     doc_filter = _doc_filter(doc_ids, params)
+    source_filter = _source_filter(source, params)
+    confidence_filter = _confidence_filter(min_confidence, params)
     rows = conn.execute(
         f"""
         SELECT claim_id AS fact_id, 'claim' AS fact_type, doc_id, version_id, node_id,
                claim_type AS type, text, page_range, confidence, source, evidence_json
         FROM paper_claims
-        WHERE ({conditions}) {doc_filter}
+        WHERE ({conditions}) {doc_filter} {source_filter} {confidence_filter}
         LIMIT 200
         """,
         params,
@@ -1030,15 +1396,23 @@ def _search_claim_rows(conn, terms: List[str], doc_ids: Optional[List[str]]) -> 
     return [_fact_row(dict(row), terms) for row in rows]
 
 
-def _search_entity_rows(conn, terms: List[str], doc_ids: Optional[List[str]]) -> List[Dict[str, Any]]:  # type: ignore[no-untyped-def]
+def _search_entity_rows(
+    conn,
+    terms: List[str],
+    doc_ids: Optional[List[str]],
+    source: str,
+    min_confidence: float,
+) -> List[Dict[str, Any]]:  # type: ignore[no-untyped-def]
     conditions, params = _like_conditions("name", terms)
     doc_filter = _doc_filter(doc_ids, params)
+    source_filter = _source_filter(source, params)
+    confidence_filter = _confidence_filter(min_confidence, params)
     rows = conn.execute(
         f"""
         SELECT entity_id AS fact_id, 'entity' AS fact_type, doc_id, version_id, node_id,
                entity_type AS type, name AS text, page_range, confidence, source, evidence_json
         FROM paper_entities
-        WHERE ({conditions}) {doc_filter}
+        WHERE ({conditions}) {doc_filter} {source_filter} {confidence_filter}
         LIMIT 200
         """,
         params,
@@ -1046,16 +1420,24 @@ def _search_entity_rows(conn, terms: List[str], doc_ids: Optional[List[str]]) ->
     return [_fact_row(dict(row), terms) for row in rows]
 
 
-def _search_relation_rows(conn, terms: List[str], doc_ids: Optional[List[str]]) -> List[Dict[str, Any]]:  # type: ignore[no-untyped-def]
+def _search_relation_rows(
+    conn,
+    terms: List[str],
+    doc_ids: Optional[List[str]],
+    source: str,
+    min_confidence: float,
+) -> List[Dict[str, Any]]:  # type: ignore[no-untyped-def]
     conditions, params = _like_conditions("text || ' ' || subject_name || ' ' || object_name", terms)
     doc_filter = _doc_filter(doc_ids, params)
+    source_filter = _source_filter(source, params)
+    confidence_filter = _confidence_filter(min_confidence, params)
     rows = conn.execute(
         f"""
         SELECT relation_id AS fact_id, 'relation' AS fact_type, doc_id, version_id, node_id,
                relation_type AS type, text, subject_name, object_name, page_range,
                confidence, source, evidence_json
         FROM paper_relations
-        WHERE ({conditions}) {doc_filter}
+        WHERE ({conditions}) {doc_filter} {source_filter} {confidence_filter}
         LIMIT 200
         """,
         params,
@@ -1081,6 +1463,27 @@ def _doc_filter(doc_ids: Optional[List[str]], params: List[Any]) -> str:
     return f"AND doc_id IN ({placeholders})"
 
 
+def _source_filter(source: str, params: List[Any]) -> str:
+    if source == "table":
+        params.append("%table%")
+        return "AND source LIKE ?"
+    if source == "text":
+        params.append("%table%")
+        return "AND source NOT LIKE ?"
+    return ""
+
+
+def _confidence_filter(min_confidence: float, params: List[Any]) -> str:
+    try:
+        threshold = float(min_confidence)
+    except (TypeError, ValueError):
+        threshold = 0.0
+    if threshold <= 0:
+        return ""
+    params.append(threshold)
+    return "AND confidence >= ?"
+
+
 def _fact_row(row: Dict[str, Any], terms: List[str]) -> Dict[str, Any]:
     text = compact_whitespace(str(row.get("text") or ""))
     haystack = text + " " + str(row.get("subject_name") or "") + " " + str(row.get("object_name") or "")
@@ -1098,9 +1501,40 @@ def _fact_row(row: Dict[str, Any], terms: List[str]) -> Dict[str, Any]:
         "page_range": _json_value(row.get("page_range"), []),
         "confidence": float(row.get("confidence") or 0.0),
         "source": row.get("source") or "",
+        "source_kind": "table" if _is_table_source(str(row.get("source") or "")) else "text",
         "evidence": _json_value(row.get("evidence_json"), {}),
         "score": score,
     }
+
+
+def _fact_source_counts(conn, *, doc_id: Optional[str] = None) -> Dict[str, int]:  # type: ignore[no-untyped-def]
+    params: List[Any] = []
+    where = ""
+    if doc_id:
+        where = "WHERE doc_id = ?"
+        params.append(doc_id)
+    table_count = 0
+    text_count = 0
+    for table in ("paper_claims", "paper_entities", "paper_relations"):
+        prefix = f"{where} AND" if where else "WHERE"
+        table_row = conn.execute(
+            f"SELECT COUNT(*) AS count FROM {table} {prefix} source LIKE ?",
+            [*params, "%table%"],
+        ).fetchone()
+        text_row = conn.execute(
+            f"SELECT COUNT(*) AS count FROM {table} {prefix} source NOT LIKE ?",
+            [*params, "%table%"],
+        ).fetchone()
+        table_count += int(table_row["count"] or 0)
+        text_count += int(text_row["count"] or 0)
+    return {
+        "table_backed_fact_count": table_count,
+        "text_backed_fact_count": text_count,
+    }
+
+
+def _is_table_source(source: str) -> bool:
+    return "table" in source.lower()
 
 
 def _json_value(value: Any, default: Any) -> Any:

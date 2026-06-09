@@ -9,6 +9,9 @@ const OBSERVED_TOOLS = new Set([
   "kb_eval_search",
   "kb_eval_review",
   "kb_eval_memory",
+  "kb_eval_facts",
+  "kb_get_table_content",
+  "kb_get_table_summaries",
   "kb_put_feedback",
   "kb_build_eval_set_from_feedback",
   "kb_eval_dashboard",
@@ -25,6 +28,10 @@ const SENSITIVE_KEYS = new Set([
   "evidence",
   "review_draft",
   "section_drafts",
+  "rows",
+  "cells",
+  "table_content",
+  "table_summaries",
   "text",
   "tree_search_trace",
 ]);
@@ -156,6 +163,20 @@ function summarizeMetrics(tool, safe, coverage) {
       citation_coverage_score: numberValue(safe.citation_coverage_score || safe?.review_report?.citation_coverage_score),
       missing_ref_count: numberValue(safe.missing_ref_count),
       unsupported_paragraph_count: numberValue(safe.unsupported_paragraph_count),
+    };
+  }
+  if (tool === "kb_eval_facts") {
+    return {
+      total_fact_count: numberValue(safe.total_fact_count),
+      table_backed_fact_count: numberValue(safe.table_backed_fact_count),
+      low_confidence_count: numberValue(safe.low_confidence_count),
+      duplicate_group_count: numberValue(safe.duplicate_group_count),
+    };
+  }
+  if (tool === "kb_get_table_content" || tool === "kb_get_table_summaries") {
+    return {
+      table_count: numberValue(safe.count),
+      table_warning_count: numberValue(safe.table_warning_count),
     };
   }
   return {

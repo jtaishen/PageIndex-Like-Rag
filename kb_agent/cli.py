@@ -16,12 +16,14 @@ from .artifacts import (
     get_layout_blocks,
     get_parse_quality,
     get_parse_report,
+    get_table_content,
+    get_table_summaries,
     get_tables,
     list_artifacts,
 )
 from .config import resolve_db_path
 from .embeddings import build_semantic_index, semantic_index_status
-from .eval import eval_memory, eval_review, eval_search
+from .eval import eval_facts, eval_memory, eval_review, eval_search
 from .facts import extract_facts, fact_search, get_claims, get_entities, get_fact_graph, get_relations
 from .feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from .ingest import sync_directory
@@ -89,6 +91,9 @@ def main(argv: Any = None) -> None:
 
     subparsers.add_parser("eval-memory", help="Evaluate long-term memory hygiene and resume readiness")
 
+    eval_facts_parser = subparsers.add_parser("eval-facts", help="Evaluate grounded paper facts and table-backed coverage")
+    eval_facts_parser.add_argument("--doc-id", action="append", default=[], help="Limit to one document id; repeatable")
+
     classify_parser = subparsers.add_parser("classify-query", help="Classify a query intent for tree search")
     classify_parser.add_argument("query")
     classify_parser.add_argument("--no-llm", action="store_true", help="Use rule-based classification only")
@@ -131,6 +136,14 @@ def main(argv: Any = None) -> None:
     tables_parser.add_argument("doc_id")
     tables_parser.add_argument("--version-id", default=None)
 
+    table_content_parser = subparsers.add_parser("table-content", help="Show parsed table row and cell artifacts")
+    table_content_parser.add_argument("doc_id")
+    table_content_parser.add_argument("--version-id", default=None)
+
+    table_summaries_parser = subparsers.add_parser("table-summaries", help="Show parsed table summary artifacts")
+    table_summaries_parser.add_argument("doc_id")
+    table_summaries_parser.add_argument("--version-id", default=None)
+
     extract_parser = subparsers.add_parser("extract", help="Extract paper insight artifacts")
     extract_parser.add_argument("doc_id")
     extract_parser.add_argument("--force", action="store_true")
@@ -165,6 +178,8 @@ def main(argv: Any = None) -> None:
     fact_search_parser.add_argument("query")
     fact_search_parser.add_argument("--doc-id", action="append", default=[], help="Limit to one document id; repeatable")
     fact_search_parser.add_argument("--type", choices=["claim", "entity", "relation"], default=None)
+    fact_search_parser.add_argument("--source", choices=["text", "table", "all"], default="all")
+    fact_search_parser.add_argument("--min-confidence", type=float, default=0.0)
     fact_search_parser.add_argument("--top-k", type=int, default=20)
 
     compare_parser = subparsers.add_parser("compare", help="Compare papers with grounded task artifacts")
@@ -341,6 +356,8 @@ def main(argv: Any = None) -> None:
         _print_json(_review_eval_summary(eval_review(db_path, args.task_id)))
     elif args.command == "eval-memory":
         _print_json(_memory_eval_summary(eval_memory(db_path)))
+    elif args.command == "eval-facts":
+        _print_json(_fact_eval_summary(eval_facts(db_path, doc_ids=args.doc_id or None)))
     elif args.command == "classify-query":
         _print_json(classify_query(args.query, use_llm=not args.no_llm, require_llm=args.require_llm))
     elif args.command == "tree-search":
@@ -371,6 +388,10 @@ def main(argv: Any = None) -> None:
         _print_json(get_figures(db_path, args.doc_id, args.version_id))
     elif args.command == "tables":
         _print_json(get_tables(db_path, args.doc_id, args.version_id))
+    elif args.command == "table-content":
+        _print_json(get_table_content(db_path, args.doc_id, args.version_id))
+    elif args.command == "table-summaries":
+        _print_json(get_table_summaries(db_path, args.doc_id, args.version_id))
     elif args.command == "extract":
         result = extract_doc_insights(
             db_path,
@@ -402,7 +423,17 @@ def main(argv: Any = None) -> None:
     elif args.command == "fact-graph":
         _print_json(get_fact_graph(db_path, args.doc_id))
     elif args.command == "fact-search":
-        _print_json(fact_search(db_path, args.query, doc_ids=args.doc_id or None, fact_type=args.type, top_k=args.top_k))
+        _print_json(
+            fact_search(
+                db_path,
+                args.query,
+                doc_ids=args.doc_id or None,
+                fact_type=args.type,
+                source=args.source,
+                min_confidence=args.min_confidence,
+                top_k=args.top_k,
+            )
+        )
     elif args.command == "compare":
         result = compare_papers(
             db_path,
@@ -802,6 +833,25 @@ def _memory_eval_summary(result: dict) -> dict:
     }
 
 
+def _fact_eval_summary(result: dict) -> dict:
+    return {
+        "schema": result.get("schema"),
+        "path": result.get("path"),
+        "status": result.get("status"),
+        "doc_ids": result.get("doc_ids") or [],
+        "total_fact_count": result.get("total_fact_count", 0),
+        "claim_count": result.get("claim_count", 0),
+        "entity_count": result.get("entity_count", 0),
+        "relation_count": result.get("relation_count", 0),
+        "evidence_coverage_rate": result.get("evidence_coverage_rate", 0.0),
+        "low_confidence_rate": result.get("low_confidence_rate", 0.0),
+        "duplicate_rate": result.get("duplicate_rate", 0.0),
+        "table_backed_fact_count": result.get("table_backed_fact_count", 0),
+        "table_backed_fact_rate": result.get("table_backed_fact_rate", 0.0),
+        "warnings": result.get("warnings") or [],
+    }
+
+
 def _comma_list(value: str) -> List[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
@@ -824,6 +874,9 @@ def _parse_report_summary(report: dict) -> dict:
         "block_count": report.get("block_count"),
         "layout_block_count": report.get("layout_block_count"),
         "table_count": report.get("table_count"),
+        "table_content_count": report.get("table_content_count"),
+        "table_parse_score": report.get("table_parse_score"),
+        "table_warning_count": report.get("table_warning_count"),
         "figure_count": report.get("figure_count"),
         "reference_section_count": report.get("reference_section_count"),
         "noise_removed_count": report.get("noise_removed_count"),

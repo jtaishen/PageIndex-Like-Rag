@@ -160,6 +160,92 @@ def eval_memory(db_path: Path) -> Dict[str, Any]:
     return {**report, "path": str(path)}
 
 
+def eval_facts(db_path: Path, doc_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+    clean_doc_ids = _unique_strings(doc_ids or [])
+    conn = db.connect(db_path)
+    db.init_db(conn)
+    try:
+        rows = _fact_rows(conn, clean_doc_ids or None)
+        if not clean_doc_ids:
+            clean_doc_ids = _unique_strings(str(row.get("doc_id") or "") for row in rows if row.get("doc_id"))
+            if not clean_doc_ids:
+                clean_doc_ids = [
+                    str(row["doc_id"])
+                    for row in conn.execute("SELECT doc_id FROM documents WHERE status = 'ready'").fetchall()
+                ]
+    finally:
+        conn.close()
+
+    total = len(rows)
+    claim_count = sum(1 for row in rows if row.get("fact_type") == "claim")
+    entity_count = sum(1 for row in rows if row.get("fact_type") == "entity")
+    relation_count = sum(1 for row in rows if row.get("fact_type") == "relation")
+    no_node = sum(1 for row in rows if not row.get("node_id"))
+    with_node = total - no_node
+    low_confidence = sum(1 for row in rows if float(row.get("confidence") or 0.0) < 0.5)
+    table_backed = sum(1 for row in rows if "table" in str(row.get("source") or "").lower())
+    duplicates = _duplicate_fact_groups(rows)
+    weak_docs = []
+    for doc_id in clean_doc_ids:
+        try:
+            quality = get_parse_quality(db_path, doc_id)
+        except (FileNotFoundError, KeyError, ValueError):
+            continue
+        quality_warnings = quality.get("quality_warnings") or []
+        if quality.get("quality_level") == "weak" or any(
+            warning in quality_warnings
+            for warning in ("page_only_tree", "weak_layout_blocks", "weak_table_parse", "missing_table_content")
+        ):
+            weak_docs.append(
+                {
+                    "doc_id": doc_id,
+                    "quality_level": quality.get("quality_level"),
+                    "quality_warnings": quality_warnings,
+                    "table_parse_score": quality.get("table_parse_score"),
+                }
+            )
+
+    warnings: List[str] = []
+    if total == 0:
+        warnings.append("no_facts")
+    if no_node:
+        warnings.append("facts_without_node_id")
+    if low_confidence:
+        warnings.append("low_confidence_facts")
+    if duplicates:
+        warnings.append("duplicate_facts")
+    if weak_docs:
+        warnings.append("weak_parse_quality_for_facts")
+    if table_backed == 0 and total:
+        warnings.append("no_table_backed_facts")
+
+    report = {
+        "schema": "fact_eval.v1",
+        "status": "needs_review" if warnings else "passed",
+        "doc_ids": clean_doc_ids,
+        "doc_count": len(clean_doc_ids),
+        "total_fact_count": total,
+        "claim_count": claim_count,
+        "entity_count": entity_count,
+        "relation_count": relation_count,
+        "evidence_coverage_rate": round(with_node / max(1, total), 4),
+        "low_confidence_count": low_confidence,
+        "low_confidence_rate": round(low_confidence / max(1, total), 4),
+        "duplicate_group_count": len(duplicates),
+        "duplicate_rate": round(sum(group["count"] - 1 for group in duplicates) / max(1, total), 4),
+        "no_node_id_count": no_node,
+        "table_backed_fact_count": table_backed,
+        "table_backed_fact_rate": round(table_backed / max(1, total), 4),
+        "weak_parse_doc_count": len(weak_docs),
+        "weak_parse_docs": weak_docs,
+        "duplicate_groups": duplicates[:20],
+        "warnings": warnings,
+        "created_at": time.time(),
+    }
+    path = _write_eval_report("fact_eval", report)
+    return {**report, "path": str(path)}
+
+
 def _eval_search_mode(
     db_path: Path,
     queries: List[Any],
@@ -265,6 +351,71 @@ def _task_artifact_content(db_path: Path, task_id: str, name: str, warnings: Lis
         warnings.append(f"missing_task_artifact:{name}:{exc}")
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _fact_rows(conn, doc_ids: Optional[List[str]]) -> List[Dict[str, Any]]:  # type: ignore[no-untyped-def]
+    params: List[Any] = []
+    filter_sql = ""
+    if doc_ids:
+        placeholders = ",".join("?" for _ in doc_ids)
+        filter_sql = f"WHERE doc_id IN ({placeholders})"
+        params.extend(doc_ids)
+    queries = [
+        (
+            "claim",
+            f"""
+            SELECT 'claim' AS fact_type, claim_id AS fact_id, doc_id, version_id, node_id,
+                   claim_type AS type, normalized_text AS key_text, confidence, source, evidence_json
+            FROM paper_claims {filter_sql}
+            """,
+        ),
+        (
+            "entity",
+            f"""
+            SELECT 'entity' AS fact_type, entity_id AS fact_id, doc_id, version_id, node_id,
+                   entity_type AS type, normalized_name AS key_text, confidence, source, evidence_json
+            FROM paper_entities {filter_sql}
+            """,
+        ),
+        (
+            "relation",
+            f"""
+            SELECT 'relation' AS fact_type, relation_id AS fact_id, doc_id, version_id, node_id,
+                   relation_type AS type, subject_name || '->' || object_name AS key_text,
+                   confidence, source, evidence_json
+            FROM paper_relations {filter_sql}
+            """,
+        ),
+    ]
+    rows: List[Dict[str, Any]] = []
+    for _, query in queries:
+        rows.extend(dict(row) for row in conn.execute(query, params).fetchall())
+    return rows
+
+
+def _duplicate_fact_groups(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        key = "|".join(
+            [
+                str(row.get("doc_id") or ""),
+                str(row.get("fact_type") or ""),
+                str(row.get("type") or ""),
+                compact_whitespace(str(row.get("key_text") or "")).lower(),
+            ]
+        )
+        groups.setdefault(key, []).append(row)
+    result = []
+    for key, items in groups.items():
+        if len(items) > 1:
+            result.append(
+                {
+                    "key": key,
+                    "count": len(items),
+                    "fact_ids": [str(item.get("fact_id") or "") for item in items[:8]],
+                }
+            )
+    return sorted(result, key=lambda item: (-int(item["count"]), item["key"]))
 
 
 def _duplicate_memory_groups(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

@@ -8,7 +8,18 @@ from typing import Any, Dict, Iterable, List, Optional
 from . import db
 from .config import DATA_DIR, SUPPORTED_EXTENSIONS, ensure_data_dirs
 from .models import DocumentRecord
-from .parsers import build_layout_blocks, build_reference_sections, build_visual_items, parser_identity_for_path, parse_document
+from .parsers import (
+    build_layout_blocks,
+    build_reference_sections,
+    build_table_content,
+    build_table_summaries,
+    build_visual_items,
+    enhance_table_items,
+    parser_identity_for_path,
+    parse_document,
+    table_parse_score,
+    table_warning_count,
+)
 from .tree import build_document_tree, tree_to_dict
 from .utils import first_words, sha256_file, stable_id, write_json, write_jsonl
 
@@ -147,6 +158,9 @@ def _write_artifacts(doc_id: str, version_id: str, base: Path, source_path: Path
     (base / "body.md").write_text(parsed.body_md, encoding="utf-8")
     layout_blocks = _layout_blocks_from(parsed)
     tables = _tables_from(parsed)
+    table_content = _table_content_from(parsed, tables, layout_blocks)
+    tables = enhance_table_items(tables, table_content)
+    table_summaries = _table_summaries_from(parsed, table_content)
     figures = _figures_from(parsed)
     reference_sections = _reference_sections_from(parsed)
     structured_payload = dict(parsed.structured or {})
@@ -155,8 +169,13 @@ def _write_artifacts(doc_id: str, version_id: str, base: Path, source_path: Path
     structured_payload["layout_blocks"] = layout_blocks
     structured_payload["layout_blocks_count"] = len(layout_blocks)
     structured_payload["tables"] = tables
+    structured_payload["table_content"] = table_content
+    structured_payload["table_summaries"] = table_summaries
     structured_payload["figures"] = figures
     structured_payload["table_count"] = len(tables)
+    structured_payload["table_content_count"] = len(table_content)
+    structured_payload["table_parse_score"] = table_parse_score(table_content, tables)
+    structured_payload["table_warning_count"] = table_warning_count(table_content)
     structured_payload["figure_count"] = len(figures)
     structured_payload["reference_sections"] = reference_sections
     structured_payload["reference_section_count"] = len(reference_sections)
@@ -165,6 +184,8 @@ def _write_artifacts(doc_id: str, version_id: str, base: Path, source_path: Path
     write_json(base / "references.json", parsed.references)
     write_json(base / "layout_blocks.json", _layout_artifact(doc_id, version_id, layout_blocks))
     write_json(base / "tables.json", _visual_artifact("tables", doc_id, version_id, tables))
+    write_json(base / "table_content.json", _table_content_artifact(doc_id, version_id, table_content))
+    write_json(base / "table_summaries.json", _table_summaries_artifact(doc_id, version_id, table_summaries))
     write_json(base / "figures.json", _visual_artifact("figures", doc_id, version_id, figures))
     write_json(base / "reference_sections.json", _reference_sections_artifact(doc_id, version_id, reference_sections))
     write_json(
@@ -191,6 +212,9 @@ def _write_artifacts(doc_id: str, version_id: str, base: Path, source_path: Path
             "block_count": len(parsed.blocks),
             "layout_block_count": len(layout_blocks),
             "table_count": len(tables),
+            "table_content_count": len(table_content),
+            "table_parse_score": table_parse_score(table_content, tables),
+            "table_warning_count": table_warning_count(table_content),
             "figure_count": len(figures),
             "reference_section_count": len(reference_sections),
             "noise_removed_count": int(parsed.metadata.get("noise_removed_count") or 0),
@@ -246,6 +270,9 @@ def _write_failure_report(
             "block_count": 0,
             "layout_block_count": 0,
             "table_count": 0,
+            "table_content_count": 0,
+            "table_parse_score": 0.0,
+            "table_warning_count": 0,
             "figure_count": 0,
             "reference_section_count": 0,
             "noise_removed_count": 0,
@@ -259,6 +286,8 @@ def _write_failure_report(
 def _build_doc_card(doc_id: str, version_id: str, base: Path, source_path: Path, file_hash: str, parsed, nodes) -> Dict[str, object]:  # type: ignore[no-untyped-def]
     layout_blocks = _layout_blocks_from(parsed)
     tables = _tables_from(parsed)
+    table_content = _table_content_from(parsed, tables, layout_blocks)
+    tables = enhance_table_items(tables, table_content)
     figures = _figures_from(parsed)
     section_nodes = [node for node in nodes if node.kind == "section"]
     section_count = len(section_nodes)
@@ -278,10 +307,16 @@ def _build_doc_card(doc_id: str, version_id: str, base: Path, source_path: Path,
     layout_score = _layout_score(layout_blocks, parsed)
     caption_score = _caption_score(figures, tables)
     caption_link_rate = _caption_link_rate(figures, tables)
+    current_table_parse_score = table_parse_score(table_content, tables)
+    current_table_warning_count = table_warning_count(table_content)
     if parsed.file_type == "pdf" and layout_score < 0.45:
         quality_warnings.append("weak_layout_blocks")
     if (figures or tables) and caption_link_rate < 0.5:
         quality_warnings.append("low_caption_link_rate")
+    if tables and not table_content:
+        quality_warnings.append("missing_table_content")
+    if current_table_parse_score < 0.5 and tables:
+        quality_warnings.append("weak_table_parse")
     quality_level = _quality_level(metadata_score, structure_score, reference_score, quality_warnings)
     parse_quality = {
         "schema": "parse_quality.v0",
@@ -294,6 +329,9 @@ def _build_doc_card(doc_id: str, version_id: str, base: Path, source_path: Path,
         "reference_count": reference_count,
         "figure_count": figure_count,
         "table_count": table_count,
+        "table_content_count": len(table_content),
+        "table_parse_score": current_table_parse_score,
+        "table_warning_count": current_table_warning_count,
         "parser_chain": diagnostics.get("parser_chain", [parsed.parser_name]),
         "fallback_used": diagnostics.get("fallback_used", False),
         "metadata_score": metadata_score,
@@ -355,6 +393,8 @@ def _build_doc_card(doc_id: str, version_id: str, base: Path, source_path: Path,
             "references.json",
             "layout_blocks.json",
             "tables.json",
+            "table_content.json",
+            "table_summaries.json",
             "figures.json",
             "reference_sections.json",
             "parse_report.json",
@@ -384,6 +424,26 @@ def _tables_from(parsed) -> List[Dict[str, Any]]:  # type: ignore[no-untyped-def
         if cleaned and all(item.get("schema") == "table.v1" for item in cleaned):
             return cleaned
     return build_visual_items(_layout_blocks_from(parsed), "table")
+
+
+def _table_content_from(parsed, tables: List[Dict[str, Any]], layout_blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:  # type: ignore[no-untyped-def]
+    content = parsed.structured.get("table_content") if isinstance(parsed.structured, dict) else []
+    if isinstance(content, list):
+        cleaned = [item for item in content if isinstance(item, dict) and item.get("schema") == "table_content.v1"]
+        if cleaned:
+            return cleaned
+    raw_tables = parsed.structured.get("tables") if isinstance(parsed.structured, dict) else []
+    raw_tables = raw_tables if isinstance(raw_tables, list) else []
+    return build_table_content(parsed.blocks, layout_blocks, raw_tables=raw_tables)
+
+
+def _table_summaries_from(parsed, table_content: List[Dict[str, Any]]) -> List[Dict[str, Any]]:  # type: ignore[no-untyped-def]
+    summaries = parsed.structured.get("table_summaries") if isinstance(parsed.structured, dict) else []
+    if isinstance(summaries, list):
+        cleaned = [item for item in summaries if isinstance(item, dict) and item.get("schema") == "table_summary.v1"]
+        if cleaned:
+            return cleaned
+    return build_table_summaries(table_content)
 
 
 def _figures_from(parsed) -> List[Dict[str, Any]]:  # type: ignore[no-untyped-def]
@@ -432,6 +492,26 @@ def _visual_artifact(kind: str, doc_id: str, version_id: str, items: List[Dict[s
         "version_id": version_id,
         "count": len(items),
         kind: items,
+    }
+
+
+def _table_content_artifact(doc_id: str, version_id: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "schema": "table_content.v1",
+        "doc_id": doc_id,
+        "version_id": version_id,
+        "count": len(items),
+        "table_content": items,
+    }
+
+
+def _table_summaries_artifact(doc_id: str, version_id: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "schema": "table_summaries.v1",
+        "doc_id": doc_id,
+        "version_id": version_id,
+        "count": len(items),
+        "table_summaries": items,
     }
 
 

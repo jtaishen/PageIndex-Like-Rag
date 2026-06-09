@@ -691,6 +691,8 @@ def _fact_matches(db_path: Path, query: str, doc_id: Optional[str], top_k: int) 
         "available": True,
         "count": result.get("count", 0),
         "items": result.get("items", [])[:top_k],
+        "table_backed_count": sum(1 for item in result.get("items", [])[:top_k] if item.get("source_kind") == "table"),
+        "text_backed_count": sum(1 for item in result.get("items", [])[:top_k] if item.get("source_kind") != "table"),
         "warnings": [],
     }
 

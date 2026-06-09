@@ -738,8 +738,13 @@ def _format_fact_summary(facts: Dict[str, Any], limit: int = 5) -> Dict[str, Any
         "claim_count": facts.get("claim_count", 0),
         "entity_count": facts.get("entity_count", 0),
         "relation_count": facts.get("relation_count", 0),
+        "table_backed_fact_count": facts.get("table_backed_fact_count", 0),
+        "table_entity_count": facts.get("table_entity_count", 0),
+        "table_relation_count": facts.get("table_relation_count", 0),
         "top_claims": facts.get("top_claims", [])[:limit],
         "top_entities": facts.get("top_entities", [])[:limit],
+        "top_table_entities": facts.get("top_table_entities", [])[:limit],
+        "top_table_relations": facts.get("top_table_relations", [])[:limit],
     }
 
 
@@ -760,12 +765,20 @@ def _dimension_claim(context: Dict[str, Any], dimension_id: str, evidence: List[
         limitations = context.get("innovation", {}).get("limitations") or []
         if limitations:
             return "；".join(_excerpt(str(item), 160) for item in limitations[:2])
+    if dimension_id == "evaluation_protocol":
+        table_relations = [str(item.get("text") or "") for item in facts.get("top_table_relations", []) if isinstance(item, dict)]
+        table_entities = [str(item.get("name") or "") for item in facts.get("top_table_entities", []) if isinstance(item, dict)]
+        if table_relations:
+            return "；".join(_excerpt(item, 180) for item in table_relations[:2])
+        if table_entities:
+            return f"表格事实包含：{'、'.join(_excerpt(item, 60) for item in table_entities[:4])}。"
     if dimension_id == "evidence_strength":
         quality = context.get("quality") or {}
         citation_count = len((context.get("citation_map") or {}).get("references") or [])
+        table_fact_count = int(facts.get("table_backed_fact_count") or 0)
         return (
             f"章节数 {quality.get('section_count', 0)}，参考文献 {citation_count}，"
-            f"质量告警 {len(quality.get('quality_warnings') or [])} 个。"
+            f"表格事实 {table_fact_count} 条，质量告警 {len(quality.get('quality_warnings') or [])} 个。"
         )
     if evidence:
         return _excerpt(str(evidence[0].get("excerpt") or ""), 260)
@@ -909,6 +922,7 @@ def _selected_papers_artifact(
                 "claim_count": facts.get("claim_count", 0),
                 "entity_count": facts.get("entity_count", 0),
                 "relation_count": facts.get("relation_count", 0),
+                "table_backed_fact_count": facts.get("table_backed_fact_count", 0),
                 "route_score": context.get("route_score"),
                 "node_matches": context.get("node_matches"),
             }

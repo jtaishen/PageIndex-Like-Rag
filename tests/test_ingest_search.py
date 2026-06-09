@@ -24,12 +24,14 @@ from kb_agent.artifacts import (
     get_layout_blocks,
     get_parse_quality,
     get_parse_report,
+    get_table_content,
+    get_table_summaries,
     get_tables,
     list_artifacts,
 )
 from kb_agent.cli import main as cli_main
 from kb_agent.embeddings import HashEmbeddingProvider, build_semantic_index, semantic_index_status
-from kb_agent.eval import eval_memory, eval_review, eval_search
+from kb_agent.eval import eval_facts, eval_memory, eval_review, eval_search
 from kb_agent.facts import extract_facts, fact_search, get_claims, get_entities, get_fact_graph, get_relations
 from kb_agent.feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from kb_agent.ingest import sync_directory
@@ -379,6 +381,100 @@ class IngestSearchTest(unittest.TestCase):
             with contextlib.redirect_stdout(stdout):
                 cli_main(["--db", str(db_path), "fact-search", "动态角色", "--doc-id", doc_id, "--type", "claim"])
             self.assertIn("fact_search.v1", stdout.getvalue())
+
+    def test_table_content_artifacts_quality_and_fact_eval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_id = _sync_table_sample(Path(tmp))
+
+            tables = get_tables(db_path, doc_id)
+            self.assertEqual(tables["count"], 1)
+            self.assertEqual(tables["tables"][0]["row_count"], 2)
+            self.assertEqual(tables["tables"][0]["column_count"], 4)
+            self.assertEqual(tables["tables"][0]["cell_count"], 12)
+            self.assertEqual(tables["tables"][0]["source_parser"], "plain_text")
+
+            table_content = get_table_content(db_path, doc_id)
+            self.assertEqual(table_content["schema"], "table_content.v1")
+            self.assertEqual(table_content["count"], 1)
+            item = table_content["table_content"][0]
+            self.assertEqual(item["headers"], ["方法", "任务完成率", "响应时间", "数据集"])
+            self.assertEqual(item["rows"][0]["cells"][0]["text"], "基线方法")
+            self.assertEqual(item["rows"][1]["cells"][1]["text"], "92%")
+            self.assertEqual(item["source"], "table_rule")
+
+            summaries = get_table_summaries(db_path, doc_id)
+            summary = summaries["table_summaries"][0]
+            self.assertIn("任务完成率", summary["metrics"])
+            self.assertIn("本文方法", summary["methods"])
+            self.assertIn("92%", summary["results"])
+
+            quality = get_parse_quality(db_path, doc_id)
+            self.assertEqual(quality["table_content_count"], 1)
+            self.assertEqual(quality["table_parse_score"], 1.0)
+            self.assertEqual(quality["table_warning_count"], 0)
+            parse_report = get_parse_report(db_path, doc_id)
+            self.assertEqual(parse_report["table_content_count"], 1)
+
+            result = extract_facts(db_path, doc_id, force=True, use_llm=False)
+            self.assertGreater(result["fact_report"]["table_backed_fact_count"], 0)
+            entities = get_entities(db_path, doc_id)
+            relations = get_relations(db_path, doc_id)
+            table_entities = [item for item in entities["entities"] if item["source"] == "table_rule"]
+            table_relations = [item for item in relations["relations"] if item["source"] == "table_rule"]
+            self.assertTrue(any(item["type"] == "result" and "任务完成率" in item["name"] for item in table_entities))
+            self.assertIn("reports_metric", {item["type"] for item in table_relations})
+            self.assertIn("improves", {item["type"] for item in table_relations})
+            for item in [*table_entities, *table_relations]:
+                self.assertEqual(item["evidence"]["table_id"], "table_001")
+                self.assertTrue(item["node_id"])
+
+            table_search = fact_search(db_path, "任务完成率", doc_ids=[doc_id], source="table", min_confidence=0.5)
+            self.assertGreaterEqual(table_search["count"], 1)
+            self.assertTrue(all(item["source_kind"] == "table" for item in table_search["items"]))
+
+            report = eval_facts(db_path, doc_ids=[doc_id])
+            self.assertEqual(report["schema"], "fact_eval.v1")
+            self.assertGreater(report["table_backed_fact_count"], 0)
+            self.assertEqual(report["no_node_id_count"], 0)
+            self.assertEqual(report["evidence_coverage_rate"], 1.0)
+
+            search_report = build_search_report(db_path, "任务完成率", doc_id=doc_id, top_k=3)
+            self.assertIn("table_backed_count", search_report["fact_matches"])
+
+            dashboard = eval_dashboard(db_path)
+            self.assertGreater(dashboard["fact_coverage"]["table_backed_fact_count"], 0)
+            self.assertEqual(dashboard["latest_fact_eval"]["schema"], "fact_eval.v1")
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "table-content", doc_id])
+            self.assertIn("table_content.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "table-summaries", doc_id])
+            self.assertIn("table_summaries.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main([
+                    "--db",
+                    str(db_path),
+                    "fact-search",
+                    "任务完成率",
+                    "--doc-id",
+                    doc_id,
+                    "--source",
+                    "table",
+                    "--min-confidence",
+                    "0.5",
+                ])
+            self.assertIn("source_kind", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "eval-facts", "--doc-id", doc_id])
+            self.assertIn("fact_eval.v1", stdout.getvalue())
 
     def test_llm_fact_extraction_and_require_llm_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1646,7 +1742,13 @@ class IngestSearchTest(unittest.TestCase):
                 structured={
                     "schema": "structured.v0",
                     "blocks": [],
-                    "tables": [{"caption": "表 1 解析质量对比"}],
+                    "tables": [
+                        {
+                            "caption": "表 1 解析质量对比",
+                            "rows": [["解析器", "章节数", "表格数"], ["Docling", "5", "2"]],
+                            "bbox": [1, 2, 3, 4],
+                        }
+                    ],
                     "figures": [{"caption": "图 1 解析流程"}],
                 },
             )
@@ -1677,6 +1779,11 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(parse_report["parser_chain"], ["docling"])
             self.assertFalse(parse_report["fallback_used"])
             self.assertTrue(parse_report["adapter_statuses"]["marker"]["placeholder"])
+            table_content = get_table_content(db_path, doc_id)
+            self.assertEqual(table_content["count"], 1)
+            self.assertEqual(table_content["table_content"][0]["source"], "docling_table")
+            self.assertEqual(table_content["table_content"][0]["column_count"], 3)
+            self.assertEqual(table_content["table_content"][0]["bbox"], [1.0, 2.0, 3.0, 4.0])
 
     def test_grobid_enrichment_updates_metadata_and_references(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1920,6 +2027,29 @@ def _fake_pdf_document(label: str, structured=None) -> ParsedDocument:  # type: 
         parser_name=f"pdf_{label}",
         parser_version="test",
     )
+
+
+def _sync_table_sample(root: Path) -> tuple[Path, str]:
+    papers = root / "papers"
+    papers.mkdir()
+    db_path = root / "kb.sqlite"
+    (papers / "table.txt").write_text(
+        "摘要：本文研究任务规划方法的实验评测。\n"
+        "关键词：任务规划；表格事实\n\n"
+        "1 实验结果\n"
+        "表 1 任务规划方法性能对比\n"
+        "方法 任务完成率 响应时间 数据集\n"
+        "基线方法 80% 12s 仿真任务集\n"
+        "本文方法 92% 8s 仿真任务集\n\n"
+        "结论\n"
+        "本文方法优于基线方法。\n",
+        encoding="utf-8",
+    )
+    report = sync_directory(papers, db_path, force=True)
+    if report["failed"]:
+        raise AssertionError(report["errors"])
+    doc_id = str(search_documents(db_path, "任务规划 表格事实", top_k=1)[0]["doc_id"])
+    return db_path, doc_id
 
 
 def _sync_insight_sample(root: Path) -> tuple[Path, str]:

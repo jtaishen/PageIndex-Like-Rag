@@ -13,11 +13,13 @@ from .artifacts import (
     get_layout_blocks,
     get_parse_quality,
     get_parse_report,
+    get_table_content,
+    get_table_summaries,
     get_tables,
 )
 from .config import resolve_db_path
 from .embeddings import build_semantic_index, semantic_index_status
-from .eval import eval_memory, eval_review, eval_search
+from .eval import eval_facts, eval_memory, eval_review, eval_search
 from .facts import extract_facts, fact_search, get_claims, get_entities, get_fact_graph, get_relations
 from .feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from .ingest import sync_directory
@@ -111,6 +113,11 @@ if FastMCP is not None:
     def kb_eval_memory(db_path: Optional[str] = None) -> Dict[str, Any]:
         """Evaluate long-term memory hygiene and task resume readiness."""
         return eval_memory(resolve_db_path(db_path))
+
+    @mcp.tool()
+    def kb_eval_facts(doc_ids: Optional[List[str]] = None, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Evaluate grounded fact coverage, confidence, duplicates, and table-backed facts."""
+        return eval_facts(resolve_db_path(db_path), doc_ids=doc_ids)
 
     @mcp.tool()
     def kb_get_query_log(
@@ -336,6 +343,16 @@ if FastMCP is not None:
         return get_tables(resolve_db_path(db_path), doc_id)
 
     @mcp.tool()
+    def kb_get_table_content(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return parsed table rows, cells, and conservative quality warnings."""
+        return get_table_content(resolve_db_path(db_path), doc_id)
+
+    @mcp.tool()
+    def kb_get_table_summaries(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return compact table summaries for metrics, methods, and results."""
+        return get_table_summaries(resolve_db_path(db_path), doc_id)
+
+    @mcp.tool()
     def kb_extract_doc_insights(
         doc_id: str,
         force: bool = False,
@@ -405,11 +422,21 @@ if FastMCP is not None:
         query: str,
         doc_ids: Optional[List[str]] = None,
         type: Optional[str] = None,
+        source: str = "all",
+        min_confidence: float = 0.0,
         top_k: int = 20,
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Search grounded claims, entities, and relations without returning long excerpts."""
-        return fact_search(resolve_db_path(db_path), query, doc_ids=doc_ids, fact_type=type, top_k=top_k)
+        return fact_search(
+            resolve_db_path(db_path),
+            query,
+            doc_ids=doc_ids,
+            fact_type=type,
+            source=source,
+            min_confidence=min_confidence,
+            top_k=top_k,
+        )
 
     @mcp.tool()
     def kb_compare(

@@ -244,6 +244,7 @@ def eval_dashboard(db_path: Path, *, since_days: Optional[float] = None, output_
     stats = query_stats(db_path, since_days=since_days)
     feedback = feedback_summary(db_path, since_days=since_days)
     fact_coverage = fact_coverage_summary(db_path)
+    latest_fact_eval = _latest_fact_eval_report()
     latest_reports = _latest_eval_reports(limit=8)
     tuning_reports = latest_search_tuning_reports(limit=5)
     profiles = list_search_profiles()
@@ -255,6 +256,7 @@ def eval_dashboard(db_path: Path, *, since_days: Optional[float] = None, output_
         "query_stats": stats,
         "feedback_summary": feedback,
         "fact_coverage": fact_coverage,
+        "latest_fact_eval": latest_fact_eval,
         "latest_eval_reports": latest_reports,
         "latest_search_tuning": tuning_reports,
         "search_profiles": profiles,
@@ -378,6 +380,31 @@ def _latest_eval_reports(limit: int = 8) -> List[Dict[str, Any]]:
     return reports
 
 
+def _latest_fact_eval_report() -> Dict[str, Any]:
+    out_dir = DATA_DIR / "eval"
+    if not out_dir.exists():
+        return {}
+    for path in sorted(out_dir.glob("fact_eval_*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if payload.get("schema") != "fact_eval.v1":
+            continue
+        return {
+            "path": str(path),
+            "schema": payload.get("schema") or "",
+            "status": payload.get("status") or "",
+            "total_fact_count": payload.get("total_fact_count", 0),
+            "table_backed_fact_count": payload.get("table_backed_fact_count", 0),
+            "low_confidence_count": payload.get("low_confidence_count", 0),
+            "duplicate_group_count": payload.get("duplicate_group_count", 0),
+            "warnings": payload.get("warnings") or [],
+            "created_at": payload.get("created_at"),
+        }
+    return {}
+
+
 def _dashboard_recommendations(stats: Dict[str, Any], feedback: Dict[str, Any], fact_coverage: Optional[Dict[str, Any]] = None) -> List[str]:
     recommendations = []
     if stats.get("no_evidence_rate", 0) > 0:
@@ -392,6 +419,8 @@ def _dashboard_recommendations(stats: Dict[str, Any], feedback: Dict[str, Any], 
         recommendations.append("尚未抽取事实层；建议对核心论文运行 extract-facts 后再复盘 compare/review。")
     if fact_coverage is not None and fact_coverage.get("low_confidence_count", 0) > 0:
         recommendations.append("复核低置信事实，必要时用 DeepSeek 重新抽取或回到证据节点人工确认。")
+    if fact_coverage is not None and fact_coverage.get("total_fact_count", 0) > 0 and fact_coverage.get("table_backed_fact_count", 0) == 0:
+        recommendations.append("事实层尚无表格来源；如论文包含实验表格，建议重新同步并运行 extract-facts 与 eval-facts。")
     return recommendations
 
 
@@ -399,6 +428,7 @@ def _dashboard_markdown(dashboard: Dict[str, Any]) -> str:
     stats = dashboard.get("query_stats") or {}
     feedback = dashboard.get("feedback_summary") or {}
     facts = dashboard.get("fact_coverage") or {}
+    fact_eval = dashboard.get("latest_fact_eval") or {}
     reports = dashboard.get("latest_eval_reports") or []
     lines = [
         "# KB Eval Dashboard",
@@ -408,12 +438,15 @@ def _dashboard_markdown(dashboard: Dict[str, Any]) -> str:
         f"- query_count: `{stats.get('query_count', 0)}`",
         f"- feedback_count: `{feedback.get('feedback_count', 0)}`",
         f"- fact_count: `{facts.get('total_fact_count', 0)}`",
+        f"- table_backed_fact_count: `{facts.get('table_backed_fact_count', 0)}`",
         f"- claim_count: `{facts.get('claim_count', 0)}`",
         f"- entity_count: `{facts.get('entity_count', 0)}`",
         f"- relation_count: `{facts.get('relation_count', 0)}`",
         f"- avg_feedback_rating: `{feedback.get('avg_rating', 0.0)}`",
         f"- fallback_rate: `{stats.get('fallback_rate', 0.0)}`",
         f"- no_evidence_rate: `{stats.get('no_evidence_rate', 0.0)}`",
+        f"- latest_fact_eval_status: `{fact_eval.get('status', '')}`",
+        f"- latest_fact_eval_low_confidence: `{fact_eval.get('low_confidence_count', 0)}`",
         "",
         "## Feedback Labels",
     ]
@@ -438,6 +471,7 @@ def _dashboard_html(dashboard: Dict[str, Any]) -> str:
     stats = dashboard.get("query_stats") or {}
     feedback = dashboard.get("feedback_summary") or {}
     facts = dashboard.get("fact_coverage") or {}
+    fact_eval = dashboard.get("latest_fact_eval") or {}
     profiles = dashboard.get("search_profiles") or {}
     active = profiles.get("active") or {}
     cards = [
@@ -448,10 +482,12 @@ def _dashboard_html(dashboard: Dict[str, Any]) -> str:
         ("Avg Rating", feedback.get("avg_rating", 0.0)),
         ("Low Ratings", feedback.get("low_rating_count", 0)),
         ("Facts", facts.get("total_fact_count", 0)),
+        ("Table Facts", facts.get("table_backed_fact_count", 0)),
         ("Claims", facts.get("claim_count", 0)),
         ("Entities", facts.get("entity_count", 0)),
         ("Relations", facts.get("relation_count", 0)),
         ("Low Conf Facts", facts.get("low_confidence_count", 0)),
+        ("Fact Eval Low Conf", fact_eval.get("low_confidence_count", 0)),
     ]
     card_html = "\n".join(
         f"<section class='card'><div class='label'>{escape(str(label))}</div><div class='value'>{escape(str(value))}</div></section>"
