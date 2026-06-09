@@ -7,10 +7,12 @@ from .answer import answer_query, route_documents
 from .artifacts import get_artifact, get_citation_map, get_doc_card, get_innovations, get_parse_quality, get_parse_report
 from .config import resolve_db_path
 from .embeddings import build_semantic_index
+from .eval import eval_memory, eval_review, eval_search
 from .ingest import sync_directory
 from .insights import extract_doc_insights
 from .memory import compact_memory, put_memory_gated as write_memory_gated, remember_task, resume_task, search_memory
 from .query import classify_query
+from .query_log import list_query_logs, query_stats
 from .review import assemble_review, check_review_citations, draft_review
 from .search import get_evidence, search_nodes
 from .tasks import compare_papers, generate_review_plan, get_task_artifact
@@ -57,6 +59,55 @@ if FastMCP is not None:
     ) -> Dict[str, Any]:
         """Build or refresh semantic embeddings for ready documents."""
         return build_semantic_index(resolve_db_path(db_path), doc_ids=doc_ids, force=force, provider=provider)
+
+    @mcp.tool()
+    def kb_eval_search(
+        queries_json: str,
+        search_mode: str = "hybrid",
+        top_k: int = 5,
+        compare_modes: Optional[List[str]] = None,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Run retrieval evaluation and optionally compare search modes."""
+        return eval_search(
+            resolve_db_path(db_path),
+            Path(queries_json),
+            search_mode=search_mode,
+            top_k=top_k,
+            compare_modes=compare_modes,
+        )
+
+    @mcp.tool()
+    def kb_eval_review(task_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Evaluate review task citation coverage and unsupported paragraphs."""
+        return eval_review(resolve_db_path(db_path), task_id)
+
+    @mcp.tool()
+    def kb_eval_memory(db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Evaluate long-term memory hygiene and task resume readiness."""
+        return eval_memory(resolve_db_path(db_path))
+
+    @mcp.tool()
+    def kb_get_query_log(
+        limit: int = 20,
+        operation: Optional[str] = None,
+        intent: Optional[str] = None,
+        status: Optional[str] = None,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return recent sanitized query logs without evidence excerpts."""
+        return list_query_logs(
+            resolve_db_path(db_path),
+            limit=limit,
+            operation=operation,
+            intent=intent,
+            status=status,
+        )
+
+    @mcp.tool()
+    def kb_get_query_stats(since_days: Optional[float] = None, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return aggregate query log metrics and warning rates."""
+        return query_stats(resolve_db_path(db_path), since_days=since_days)
 
     @mcp.tool()
     def kb_search_tree(

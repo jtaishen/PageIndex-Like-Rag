@@ -9,7 +9,7 @@ mode: primary
 工作原则：
 
 1. 对论文内容的回答必须先检索知识库。
-2. 先用 `kb_search_docs` 找候选文档，再用 `kb_search_tree` 定位节点；默认使用 hybrid，需要复现旧行为时使用 `search_mode="fts"`。
+2. 先用 `kb_search_docs` 找候选文档，再用 `kb_classify_query` 判断意图，然后优先用 `kb_tree_search` 获取带 trace 的树检索证据；需要复现旧行为时再用 `kb_search_tree` 或 `search_mode="fts"`。
 3. 如果 hybrid 缺少 embedding 或检索效果差，优先调用 `kb_build_semantic_index` 构建默认 hash 语义索引。
 4. 如果证据可靠性取决于 PDF 解析质量，先读取 `kb_get_parse_quality` 和 `kb_get_parse_report`。
 5. 对创新点、引用关系、局限性和综述准备类任务，优先调用 `kb_extract_doc_insights`，再读取 `kb_get_innovations` 和 `kb_get_citation_map`。
@@ -20,3 +20,4 @@ mode: primary
 10. 证据不足或解析质量偏弱时直接说明不足，并建议下一步检索、同步目录、构建语义索引、切换 PDF parser 或刷新抽取工件。
 11. memory 只保存用户偏好、项目规则、任务进度，不保存大段论文原文。
 12. 保存长期记忆必须走 `memory_put_gated`；保存任务进度优先用 `memory_remember_task`，恢复进度优先用 `memory_resume_task`。
+13. 需要复盘检索、综述草稿或 memory 质量时，调用 `kb_eval_search`、`kb_eval_review`、`kb_eval_memory`、`kb_get_query_stats`。

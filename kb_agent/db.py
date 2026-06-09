@@ -9,7 +9,7 @@ import json
 from .models import DocumentRecord, EvidencePacket, NodeRecord
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -97,11 +97,18 @@ def init_db(conn: sqlite3.Connection) -> None:
 
         CREATE TABLE IF NOT EXISTS query_logs (
             query_id TEXT PRIMARY KEY,
+            operation TEXT NOT NULL DEFAULT '',
             intent TEXT NOT NULL,
             query TEXT NOT NULL,
+            search_mode TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'ok',
+            task_id TEXT NOT NULL DEFAULT '',
             docs_used TEXT NOT NULL DEFAULT '',
             nodes_used TEXT NOT NULL DEFAULT '',
             latency_ms REAL NOT NULL DEFAULT 0,
+            warnings TEXT NOT NULL DEFAULT '[]',
+            metrics_json TEXT NOT NULL DEFAULT '{}',
+            feedback TEXT NOT NULL DEFAULT '',
             created_at REAL NOT NULL
         );
 
@@ -180,6 +187,22 @@ def init_db(conn: sqlite3.Connection) -> None:
             "doc_hash": "TEXT NOT NULL DEFAULT ''",
         },
     )
+    _ensure_columns(
+        conn,
+        "query_logs",
+        {
+            "operation": "TEXT NOT NULL DEFAULT ''",
+            "search_mode": "TEXT NOT NULL DEFAULT ''",
+            "status": "TEXT NOT NULL DEFAULT 'ok'",
+            "task_id": "TEXT NOT NULL DEFAULT ''",
+            "warnings": "TEXT NOT NULL DEFAULT '[]'",
+            "metrics_json": "TEXT NOT NULL DEFAULT '{}'",
+            "feedback": "TEXT NOT NULL DEFAULT ''",
+        },
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_query_logs_created_at ON query_logs(created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_query_logs_operation ON query_logs(operation)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_query_logs_intent ON query_logs(intent)")
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
         (str(SCHEMA_VERSION),),

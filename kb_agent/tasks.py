@@ -10,6 +10,7 @@ from .artifacts import get_citation_map, get_doc_card, get_innovations, get_pars
 from .config import DEFAULT_DB_PATH, PROJECT_ROOT
 from .insights import extract_doc_insights
 from .llm import LLMError, generate_json_object
+from .query_log import write_query_log
 from .search import get_evidence, search_documents, search_nodes
 from .tree_search import tree_search
 from .utils import compact_whitespace, stable_id, write_json
@@ -105,6 +106,7 @@ def compare_papers(
     require_llm: bool = False,
     search_mode: str = "hybrid",
 ) -> Dict[str, Any]:
+    started = time.time()
     selected = _select_papers(db_path, query, doc_ids, top_k_docs, search_mode)
     contexts, prepare_warnings = _prepare_paper_contexts(db_path, selected)
     evidence_by_dimension = _collect_dimension_evidence(db_path, query, contexts, COMPARE_DIMENSIONS, search_mode)
@@ -154,6 +156,20 @@ def compare_papers(
         open_questions=open_questions,
         next_actions=next_actions,
     )
+    _log_task_query(
+        db_path,
+        operation="compare",
+        query=query,
+        search_mode=search_mode,
+        task_id=task_id,
+        contexts=contexts,
+        status=matrix["status"],
+        warnings=matrix["warnings"],
+        coverage=coverage,
+        evidence=_flatten_dimension_evidence(evidence_by_dimension),
+        started=started,
+        llm_error=llm_error,
+    )
     return {
         "schema": "task_result.v1",
         "task_id": task_id,
@@ -179,6 +195,7 @@ def generate_review_plan(
     require_llm: bool = False,
     search_mode: str = "hybrid",
 ) -> Dict[str, Any]:
+    started = time.time()
     selected = _select_papers(db_path, topic, doc_ids, top_k_docs, search_mode)
     contexts, prepare_warnings = _prepare_paper_contexts(db_path, selected)
     section_evidence = _collect_section_evidence(db_path, topic, contexts, search_mode)
@@ -232,6 +249,20 @@ def generate_review_plan(
         section_evidence=section_artifacts,
         open_questions=open_questions,
         next_actions=next_actions,
+    )
+    _log_task_query(
+        db_path,
+        operation="generate-review",
+        query=topic,
+        search_mode=search_mode,
+        task_id=task_id,
+        contexts=contexts,
+        status=outline["status"],
+        warnings=outline["warnings"],
+        coverage=coverage,
+        evidence=[item for items in section_evidence.values() for item in items],
+        started=started,
+        llm_error=llm_error,
     )
     return {
         "schema": "task_result.v1",
@@ -996,6 +1027,64 @@ def _write_task_artifacts(
     )
     paths["current_task"] = str(root / "current_task.json")
     return paths
+
+
+def _log_task_query(
+    db_path: Path,
+    *,
+    operation: str,
+    query: str,
+    search_mode: str,
+    task_id: str,
+    contexts: List[Dict[str, Any]],
+    status: str,
+    warnings: List[str],
+    coverage: Dict[str, Any],
+    evidence: List[Dict[str, Any]],
+    started: float,
+    llm_error: str = "",
+) -> None:
+    doc_ids = _unique_strings(
+        [
+            *(str(context.get("doc_id") or "") for context in contexts),
+            *(str(item.get("doc_id") or "") for item in evidence if isinstance(item, dict)),
+        ]
+    )
+    node_ids = _unique_strings(
+        str(item.get("node_id") or "")
+        for item in evidence
+        if isinstance(item, dict) and item.get("node_id")
+    )
+    log_warnings = list(warnings)
+    if llm_error:
+        log_warnings.append(f"llm_unavailable:{llm_error}")
+    write_query_log(
+        db_path,
+        operation=operation,
+        query=query,
+        intent="compare" if operation == "compare" else "review",
+        search_mode=search_mode,
+        status=status or "ok",
+        task_id=task_id,
+        docs_used=doc_ids,
+        nodes_used=node_ids,
+        latency_ms=round((time.time() - started) * 1000, 3),
+        warnings=log_warnings,
+        metrics={
+            "context_count": len(contexts),
+            "evidence_count": len(evidence),
+            "coverage": coverage,
+            "llm_error": bool(llm_error),
+        },
+    )
+
+
+def _flatten_dimension_evidence(evidence_by_dimension: Dict[str, Dict[str, List[Dict[str, Any]]]]) -> List[Dict[str, Any]]:
+    evidence: List[Dict[str, Any]] = []
+    for by_doc in evidence_by_dimension.values():
+        for items in by_doc.values():
+            evidence.extend(items)
+    return _dedupe_evidence(evidence)
 
 
 def _task_state_root(db_path: Path) -> Path:

@@ -3,7 +3,9 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -14,13 +16,14 @@ from kb_agent.answer import answer_query
 from kb_agent.artifacts import get_artifact, get_citation_map, get_doc_card, get_innovations, get_parse_quality, get_parse_report, list_artifacts
 from kb_agent.cli import main as cli_main
 from kb_agent.embeddings import HashEmbeddingProvider, build_semantic_index
-from kb_agent.eval import eval_search
+from kb_agent.eval import eval_memory, eval_review, eval_search
 from kb_agent.ingest import sync_directory
 from kb_agent.insights import extract_doc_insights
 from kb_agent.llm import LLMError
 from kb_agent.memory import compact_memory, put_memory_gated, remember_task, resume_task, search_memory
 from kb_agent.models import ParsedBlock, ParsedDocument
 from kb_agent.query import classify_query
+from kb_agent.query_log import list_query_logs, query_stats
 from kb_agent.review import assemble_review, check_review_citations, draft_review
 from kb_agent.search import build_search_report, get_evidence, search_documents, search_nodes
 from kb_agent.tasks import compare_papers, generate_review_plan, get_task_artifact
@@ -745,7 +748,7 @@ class IngestSearchTest(unittest.TestCase):
             )
 
             report = eval_search(db_path, queries_path, search_mode="hybrid", top_k=3)
-            self.assertEqual(report["schema"], "search_eval.v1")
+            self.assertEqual(report["schema"], "search_eval.v2")
             self.assertEqual(report["query_count"], 1)
             self.assertGreaterEqual(report["doc_recall_at_k"], 1.0)
             self.assertTrue(Path(report["path"]).exists())
@@ -753,7 +756,7 @@ class IngestSearchTest(unittest.TestCase):
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
                 cli_main(["--db", str(db_path), "eval-search", str(queries_path), "--search-mode", "hybrid"])
-            self.assertIn("search_eval.v1", stdout.getvalue())
+            self.assertIn("search_eval.v2", stdout.getvalue())
 
     def test_query_classifier_recognizes_paper_intents(self) -> None:
         samples = {
@@ -869,6 +872,202 @@ class IngestSearchTest(unittest.TestCase):
             background = review["section_evidence"]["background_problem"]
             self.assertGreaterEqual(background["evidence_count"], 1)
             self.assertIn("score_components", background["evidence"][0])
+
+    def test_query_log_schema_migrates_old_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "old.sqlite"
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            conn.execute(
+                """
+                CREATE TABLE query_logs(
+                    query_id TEXT PRIMARY KEY,
+                    intent TEXT NOT NULL,
+                    query TEXT NOT NULL,
+                    docs_used TEXT NOT NULL DEFAULT '',
+                    nodes_used TEXT NOT NULL DEFAULT '',
+                    latency_ms REAL NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO query_logs(query_id, intent, query, docs_used, nodes_used, latency_ms, created_at)
+                VALUES('query_old', 'method', '旧查询', '[]', '[]', 12.0, 1.0)
+                """
+            )
+            db.init_db(conn)
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(query_logs)").fetchall()}
+            conn.close()
+
+            self.assertIn("operation", columns)
+            self.assertIn("metrics_json", columns)
+            logs = list_query_logs(db_path, limit=5)
+            self.assertEqual(logs["count"], 1)
+            self.assertEqual(logs["items"][0]["query"], "旧查询")
+            self.assertEqual(logs["items"][0]["metrics"], {})
+
+    def test_query_logs_capture_operations_without_evidence_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+            doc_id = doc_ids[0]
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "search", "任务规划方法", "--top-k", "2"])
+            answer_query(db_path, "服务机器人任务规划方法是什么？", top_k=2, use_llm=False)
+            tree_search(db_path, doc_id, "方法设计", budget=2, use_llm=False)
+            compare_papers(
+                db_path,
+                "服务机器人与多智能体任务规划方法对比",
+                doc_ids=doc_ids,
+                use_llm=False,
+                search_mode="tree",
+            )
+            generate_review_plan(
+                db_path,
+                "任务规划方法研究综述",
+                doc_ids=doc_ids,
+                use_llm=False,
+                search_mode="tree",
+            )
+
+            logs = list_query_logs(db_path, limit=200)
+            operations = {item["operation"] for item in logs["items"]}
+            self.assertIn("search", operations)
+            self.assertIn("ask", operations)
+            self.assertIn("tree-search", operations)
+            self.assertIn("compare", operations)
+            self.assertIn("generate-review", operations)
+            dumped = json.dumps(logs, ensure_ascii=False)
+            self.assertNotIn("excerpt", dumped)
+            self.assertNotIn("系统通过大语言模型解析用户意图", dumped)
+
+            stats = query_stats(db_path)
+            self.assertGreaterEqual(stats["query_count"], 5)
+            self.assertIn("tree-search", stats["operation_counts"])
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "query-stats"])
+            self.assertIn("query_stats.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "query-log", "--limit", "3"])
+            self.assertIn("query_log_list.v1", stdout.getvalue())
+
+    def test_eval_search_v2_compare_modes_and_expected_node_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path, doc_id = _sync_insight_sample(root)
+            build_semantic_index(db_path, force=True, provider="hash")
+            node_index = get_artifact(db_path, doc_id, "node_index.jsonl")["content"]
+            target_node = next(node for node in node_index if "动态角色发现机制" in node.get("text", ""))
+            queries_path = root / "queries.json"
+            queries_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "query": "动态角色任务规划",
+                            "expected_doc_ids": [doc_id],
+                            "expected_node_ids": [target_node["node_id"]],
+                            "expected_node_keywords": ["动态角色"],
+                            "intent": "method",
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            report = eval_search(db_path, queries_path, search_mode="hybrid", top_k=3, compare_modes=["hybrid", "tree", "fts"])
+            self.assertEqual(report["schema"], "search_eval.v2")
+            self.assertEqual(set(report["mode_results"].keys()), {"hybrid", "tree", "fts"})
+            self.assertIn("node_recall_at_k", report)
+            self.assertTrue(Path(report["path"]).exists())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main([
+                    "--db",
+                    str(db_path),
+                    "eval-search",
+                    str(queries_path),
+                    "--compare-modes",
+                    "hybrid,tree,fts",
+                ])
+            self.assertIn("search_eval.v2", stdout.getvalue())
+
+    def test_eval_review_and_memory_reports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+            task = generate_review_plan(
+                db_path,
+                "任务规划方法研究综述",
+                doc_ids=doc_ids,
+                use_llm=False,
+            )
+            draft_review(db_path, task["task_id"], use_llm=False)
+            check_review_citations(db_path, task["task_id"])
+
+            review_eval = eval_review(db_path, task["task_id"])
+            self.assertEqual(review_eval["schema"], "review_eval.v1")
+            self.assertEqual(review_eval["task_id"], task["task_id"])
+            self.assertIn("citation_coverage_score", review_eval)
+
+            put_memory_gated(
+                db_path,
+                "project",
+                "preference",
+                "expired_pref",
+                "偏好：优先检查引用覆盖。",
+                ttl_days=-1,
+            )
+            conn = db.connect(db_path)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO memory_items(
+                        memory_id, scope, type, subject_key, content, refs, ttl,
+                        importance, confidence, created_at, updated_at
+                    )
+                    VALUES('mem_polluted', 'project', 'task_progress', 'polluted',
+                           'node_id=node_x excerpt=论文正文 page_range=[1,2]', '', NULL,
+                           0.9, 0.9, 1.0, 1.0)
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            memory_eval = eval_memory(db_path)
+            self.assertEqual(memory_eval["schema"], "memory_eval.v1")
+            self.assertGreaterEqual(memory_eval["expired_count"], 1)
+            self.assertGreaterEqual(memory_eval["suspected_pollution_count"], 1)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "eval-review", task["task_id"]])
+            self.assertIn("review_eval.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "eval-memory"])
+            self.assertIn("memory_eval.v1", stdout.getvalue())
+
+    def test_opencode_observer_plugin_is_static_valid_and_sanitizes_sensitive_keys(self) -> None:
+        plugin_path = Path(".opencode/plugins/kb-observer/index.mjs")
+        self.assertTrue(plugin_path.exists())
+        content = plugin_path.read_text(encoding="utf-8")
+        self.assertIn("tool.execute.after", content)
+        self.assertIn("experimental.session.compacting", content)
+        self.assertIn("SENSITIVE_KEYS", content)
+        node = shutil.which("node")
+        if node:
+            result = subprocess.run([node, "--check", str(plugin_path)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_pdf_parser_choice_pypdf_records_quality_chain(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1039,7 +1238,7 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(parse_report["status"], "failed")
             self.assertIn("Cannot read DOCX", parse_report["error"])
 
-    def test_v1_database_migrates_to_v3(self) -> None:
+    def test_v1_database_migrates_to_v4(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "v1.sqlite"
             conn = sqlite3.connect(db_path)
@@ -1089,6 +1288,7 @@ class IngestSearchTest(unittest.TestCase):
                 db.init_db(conn)
                 doc_columns = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
                 node_columns = {row["name"] for row in conn.execute("PRAGMA table_info(doc_nodes)")}
+                query_log_columns = {row["name"] for row in conn.execute("PRAGMA table_info(query_logs)")}
                 tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
                 self.assertIn("authors", doc_columns)
                 self.assertIn("parser_version", doc_columns)
@@ -1097,7 +1297,9 @@ class IngestSearchTest(unittest.TestCase):
                 self.assertIn("doc_hash", node_columns)
                 self.assertIn("node_embeddings", tables)
                 self.assertIn("document_embeddings", tables)
-                self.assertEqual(conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()["value"], "3")
+                self.assertIn("operation", query_log_columns)
+                self.assertIn("metrics_json", query_log_columns)
+                self.assertEqual(conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()["value"], "4")
             finally:
                 conn.close()
 

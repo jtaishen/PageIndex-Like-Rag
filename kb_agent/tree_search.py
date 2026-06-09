@@ -10,7 +10,8 @@ from . import db
 from .llm import LLMError, generate_json_object
 from .models import EvidencePacket, SearchResult
 from .query import classify_query
-from .utils import compact_whitespace, first_words, stable_id
+from .query_log import insert_query_log
+from .utils import compact_whitespace, first_words
 
 
 FLAT_SEARCH_MODES = {"hybrid", "fts"}
@@ -727,20 +728,25 @@ def _log_query(conn: Any, trace: Dict[str, Any], started: float) -> None:
         str(item.get("node_id") or "")
         for item in trace.get("results", [])
     )
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO query_logs(query_id, intent, query, docs_used, nodes_used, latency_ms, created_at)
-        VALUES(?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            stable_id("query", trace.get("query", ""), time.time(), length=12),
-            str(profile.get("intent") or "unknown"),
-            str(trace.get("query") or ""),
-            json.dumps(docs_used, ensure_ascii=False),
-            json.dumps(nodes_used, ensure_ascii=False),
-            round((time.time() - started) * 1000, 3),
-            time.time(),
-        ),
+    insert_query_log(
+        conn,
+        operation="tree-search",
+        query=str(trace.get("query") or ""),
+        intent=str(profile.get("intent") or "unknown"),
+        search_mode=str(trace.get("requested_search_mode") or trace.get("effective_search_mode") or ""),
+        status="ok" if trace.get("evidence") else "empty",
+        docs_used=docs_used,
+        nodes_used=nodes_used,
+        latency_ms=round((time.time() - started) * 1000, 3),
+        warnings=trace.get("warnings") or [],
+        metrics={
+            "schema": trace.get("schema"),
+            "budget": trace.get("budget") or trace.get("top_k"),
+            "effective_search_mode": trace.get("effective_search_mode"),
+            "result_count": len(trace.get("results") or []),
+            "evidence_count": len(trace.get("evidence") or []),
+            "fallback_used": bool(trace.get("fallback_reason")),
+        },
     )
 
 

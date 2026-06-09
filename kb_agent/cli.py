@@ -2,19 +2,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Iterable, List
 
 from . import db
 from .answer import answer_query, route_documents
 from .artifacts import get_citation_map, get_doc_card, get_innovations, get_parse_quality, get_parse_report, list_artifacts
 from .config import resolve_db_path
 from .embeddings import build_semantic_index
-from .eval import eval_search
+from .eval import eval_memory, eval_review, eval_search
 from .ingest import sync_directory
 from .insights import extract_doc_insights
 from .memory import compact_memory, put_memory_gated, remember_task, resume_task, search_memory
 from .query import classify_query
+from .query_log import list_query_logs, query_stats, write_query_log
 from .review import assemble_review, check_review_citations, draft_review
 from .search import build_search_report, get_evidence, search_nodes
 from .tasks import compare_papers, generate_review_plan, get_task_artifact
@@ -60,6 +62,16 @@ def main(argv: Any = None) -> None:
     eval_parser.add_argument("queries_json")
     eval_parser.add_argument("--top-k", type=int, default=5)
     eval_parser.add_argument("--search-mode", choices=["hybrid", "fts", "tree"], default="hybrid")
+    eval_parser.add_argument(
+        "--compare-modes",
+        default="",
+        help="Comma-separated search modes to compare, for example hybrid,tree,fts",
+    )
+
+    eval_review_parser = subparsers.add_parser("eval-review", help="Evaluate review task evidence and citation coverage")
+    eval_review_parser.add_argument("task_id")
+
+    subparsers.add_parser("eval-memory", help="Evaluate long-term memory hygiene and resume readiness")
 
     classify_parser = subparsers.add_parser("classify-query", help="Classify a query intent for tree search")
     classify_parser.add_argument("query")
@@ -171,6 +183,15 @@ def main(argv: Any = None) -> None:
     compact_parser = subparsers.add_parser("memory-compact", help="Compact task progress memory")
     compact_parser.add_argument("--scope", default=None)
 
+    query_log_parser = subparsers.add_parser("query-log", help="List recent query logs")
+    query_log_parser.add_argument("--limit", type=int, default=20)
+    query_log_parser.add_argument("--operation", default=None)
+    query_log_parser.add_argument("--intent", default=None)
+    query_log_parser.add_argument("--status", default=None)
+
+    query_stats_parser = subparsers.add_parser("query-stats", help="Summarize query log metrics")
+    query_stats_parser.add_argument("--since-days", type=float, default=None)
+
     args = parser.parse_args(argv)
     db_path = resolve_db_path(args.db)
 
@@ -182,18 +203,36 @@ def main(argv: Any = None) -> None:
     elif args.command == "list":
         _list_documents(db_path)
     elif args.command == "search":
-        _print_json([
-            result.__dict__
-            for result in search_nodes(db_path, args.query, args.doc_id, args.top_k, search_mode=args.search_mode)
-        ])
+        started = time.time()
+        results = search_nodes(db_path, args.query, args.doc_id, args.top_k, search_mode=args.search_mode)
+        _log_search_results(db_path, "search", args.query, args.search_mode, started, results)
+        _print_json([result.__dict__ for result in results])
     elif args.command == "docs":
-        _print_json(route_documents(db_path, args.query, args.top_k, search_mode=args.search_mode))
+        started = time.time()
+        docs = route_documents(db_path, args.query, args.top_k, search_mode=args.search_mode)
+        _log_doc_results(db_path, args.query, args.search_mode, started, docs)
+        _print_json(docs)
     elif args.command == "embed":
         _print_json(build_semantic_index(db_path, doc_ids=args.doc_id or None, force=args.force, provider=args.provider))
     elif args.command == "search-report":
         _print_json(build_search_report(db_path, args.query, doc_id=args.doc_id, top_k=args.top_k, search_mode=args.search_mode))
     elif args.command == "eval-search":
-        _print_json(_eval_summary(eval_search(db_path, Path(args.queries_json), search_mode=args.search_mode, top_k=args.top_k)))
+        compare_modes = _comma_list(args.compare_modes)
+        _print_json(
+            _eval_summary(
+                eval_search(
+                    db_path,
+                    Path(args.queries_json),
+                    search_mode=args.search_mode,
+                    top_k=args.top_k,
+                    compare_modes=compare_modes or None,
+                )
+            )
+        )
+    elif args.command == "eval-review":
+        _print_json(_review_eval_summary(eval_review(db_path, args.task_id)))
+    elif args.command == "eval-memory":
+        _print_json(_memory_eval_summary(eval_memory(db_path)))
     elif args.command == "classify-query":
         _print_json(classify_query(args.query, use_llm=not args.no_llm, require_llm=args.require_llm))
     elif args.command == "tree-search":
@@ -310,6 +349,18 @@ def main(argv: Any = None) -> None:
         _print_json(resume_task(db_path))
     elif args.command == "memory-compact":
         _print_json(compact_memory(db_path, scope=args.scope))
+    elif args.command == "query-log":
+        _print_json(
+            list_query_logs(
+                db_path,
+                limit=args.limit,
+                operation=args.operation,
+                intent=args.intent,
+                status=args.status,
+            )
+        )
+    elif args.command == "query-stats":
+        _print_json(query_stats(db_path, since_days=args.since_days))
 
 
 def _list_documents(db_path: Path) -> None:
@@ -343,6 +394,75 @@ def _print_tree(db_path: Path, doc_id: str) -> None:
 
 def _print_json(payload: object) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _log_search_results(
+    db_path: Path,
+    operation: str,
+    query: str,
+    search_mode: str,
+    started: float,
+    results: List[Any],
+) -> None:
+    warnings = []
+    if not results:
+        warnings.append("no_search_results")
+    if any("fts_fallback" in str(getattr(result, "rank_reason", "")) for result in results):
+        warnings.append("fts_fallback")
+    write_query_log(
+        db_path,
+        operation=operation,
+        query=query,
+        intent=str(classify_query(query, use_llm=False).get("intent") or ""),
+        search_mode=search_mode,
+        status="ok" if results else "empty",
+        docs_used=_unique_values(str(getattr(result, "doc_id", "")) for result in results),
+        nodes_used=_unique_values(str(getattr(result, "node_id", "")) for result in results),
+        latency_ms=round((time.time() - started) * 1000, 3),
+        warnings=warnings,
+        metrics={
+            "result_count": len(results),
+            "fallback_used": bool(warnings),
+        },
+    )
+
+
+def _log_doc_results(
+    db_path: Path,
+    query: str,
+    search_mode: str,
+    started: float,
+    docs: List[Dict[str, Any]],
+) -> None:
+    warnings = [] if docs else ["no_search_results"]
+    write_query_log(
+        db_path,
+        operation="search-docs",
+        query=query,
+        intent=str(classify_query(query, use_llm=False).get("intent") or ""),
+        search_mode=search_mode,
+        status="ok" if docs else "empty",
+        docs_used=_unique_values(str(item.get("doc_id") or "") for item in docs),
+        nodes_used=_unique_values(str(item.get("best_node_id") or "") for item in docs if item.get("best_node_id")),
+        latency_ms=round((time.time() - started) * 1000, 3),
+        warnings=warnings,
+        metrics={
+            "result_count": len(docs),
+            "fallback_used": any("fts_fallback" in str(item.get("rank_reason") or "") for item in docs),
+        },
+    )
+
+
+def _unique_values(values: Iterable[str]) -> List[str]:
+    result = []
+    seen = set()
+    for value in values:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
 
 
 def _extract_summary(result: dict) -> dict:
@@ -422,14 +542,51 @@ def _eval_summary(result: dict) -> dict:
         "schema": result.get("schema"),
         "path": result.get("path"),
         "search_mode": result.get("search_mode"),
+        "compare_modes": result.get("compare_modes") or [],
         "query_count": result.get("query_count"),
         "doc_recall_at_k": result.get("doc_recall_at_k"),
+        "node_recall_at_k": result.get("node_recall_at_k"),
         "node_keyword_hit_rate": result.get("node_keyword_hit_rate"),
+        "evidence_precision": result.get("evidence_precision"),
         "mrr": result.get("mrr"),
         "evidence_count": result.get("evidence_count"),
         "fallback_count": result.get("fallback_count"),
         "weak_parse_quality_count": result.get("weak_parse_quality_count"),
+        "best_mode_by_node_recall": result.get("best_mode_by_node_recall"),
     }
+
+
+def _review_eval_summary(result: dict) -> dict:
+    return {
+        "schema": result.get("schema"),
+        "path": result.get("path"),
+        "task_id": result.get("task_id"),
+        "status": result.get("status"),
+        "section_count": result.get("section_count"),
+        "drafted_section_count": result.get("drafted_section_count"),
+        "citation_coverage_score": result.get("citation_coverage_score"),
+        "missing_ref_count": result.get("missing_ref_count"),
+        "unsupported_paragraph_count": result.get("unsupported_paragraph_count"),
+        "warnings": result.get("warnings") or [],
+    }
+
+
+def _memory_eval_summary(result: dict) -> dict:
+    return {
+        "schema": result.get("schema"),
+        "path": result.get("path"),
+        "status": result.get("status"),
+        "memory_count": result.get("memory_count"),
+        "expired_count": result.get("expired_count"),
+        "duplicate_subject_count": result.get("duplicate_subject_count"),
+        "suspected_pollution_count": result.get("suspected_pollution_count"),
+        "resume_available": result.get("resume_available"),
+        "warnings": result.get("warnings") or [],
+    }
+
+
+def _comma_list(value: str) -> List[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def _parse_report_summary(report: dict) -> dict:

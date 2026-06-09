@@ -16,7 +16,7 @@ parse -> normalize -> tree -> artifacts -> indexes -> evidence packet -> CLI / M
 - 将文档保存为 `documents` 和 `doc_nodes`。
 - 使用 SQLite FTS5 做全文检索，并支持本地 embedding + hybrid rerank。
 - 返回带 `doc_id`、`node_id`、`node_path`、页码和 excerpt 的 evidence packet。
-- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`parse-report`、`embed`、`search-report`、`eval-search`、`extract`、`innovations`、`citations`。
+- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`parse-report`、`embed`、`search-report`、`eval-search`、`eval-review`、`eval-memory`、`query-log`、`query-stats`、`extract`、`innovations`、`citations`。
 - 支持跨论文比较和综述规划任务工件，生成比较矩阵、综述大纲、章节证据表和下一步行动。
 - 支持长期 memory 写入门控、任务进度记忆、任务恢复和任务进度压缩。
 - 提供可选 MCP server，供 OpenCode 调用。
@@ -294,6 +294,37 @@ uv run python -m kb_agent.cli generate-review "任务规划方法研究综述" -
 
 `tree_search_trace` 会记录 query profile、评分分解、展开路径、最终 evidence、LLM fallback 原因和读取到的长期偏好摘要。树搜索只读取允许的 memory 偏好，不会写入论文正文、检索命中或 evidence packet。
 
+## v0.11 评测闭环、查询日志与 OpenCode 观测
+
+v0.11 增加统一 query log、搜索多模式评测、综述任务评测、memory 卫生评测和 OpenCode observer hook。日志只保存 query、doc/node ID、指标和 warning，不保存论文正文、长 excerpt 或 evidence packet。
+
+对比 hybrid、tree、fts 三种检索模式：
+
+```bash
+uv run python -m kb_agent.cli eval-search tests/fixtures/search_eval_queries.json --compare-modes hybrid,tree,fts
+```
+
+评测综述任务的引用覆盖和未支撑段落：
+
+```bash
+uv run python -m kb_agent.cli eval-review <task_id>
+```
+
+检查长期 memory 是否存在过期、重复或疑似论文资产污染：
+
+```bash
+uv run python -m kb_agent.cli eval-memory
+```
+
+查看最近查询日志和聚合统计：
+
+```bash
+uv run python -m kb_agent.cli query-log --limit 10
+uv run python -m kb_agent.cli query-stats --since-days 7
+```
+
+OpenCode 已配置 `.opencode/plugins/kb-observer/index.mjs`。它会在 `kb_tree_search`、`kb_compare`、`kb_generate_review`、`kb_check_review_citations` 和评测工具运行后，把任务状态和质量告警摘要写入 `.kb_state/opencode_observer/`，并在会话压缩时注入短上下文；不会写入论文正文或 evidence。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
@@ -371,7 +402,7 @@ DeepSeek 官方 OpenCode 接入方式：
 推荐工具调用顺序：
 
 ```text
-kb_sync -> kb_build_semantic_index -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_classify_query -> kb_tree_search -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
+kb_sync -> kb_build_semantic_index -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_classify_query -> kb_tree_search -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> kb_eval_search -> kb_eval_review -> kb_eval_memory -> kb_get_query_stats -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
 ```
 
 ## 测试
@@ -382,4 +413,4 @@ uv run python -m unittest discover -s tests
 
 ## 后续阶段
 
-- 增加更完整的评测报告、查询日志分析和 OpenCode plugin hook。
+- 增加人工反馈闭环、评测集管理、查询日志可视化和更完整的 OpenCode 工作流自动化。
