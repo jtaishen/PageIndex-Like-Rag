@@ -45,6 +45,12 @@ from kb_agent.facts import extract_facts, fact_search, get_claims, get_entities,
 from kb_agent.feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from kb_agent.ingest import sync_directory
 from kb_agent.insights import extract_doc_insights
+from kb_agent.knowledge_graph import (
+    build_knowledge_graph,
+    export_knowledge_graph,
+    get_graph_neighborhood,
+    get_graph_report,
+)
 from kb_agent.llm import LLMError
 from kb_agent.memory import compact_memory, put_memory_gated, remember_task, resume_task, search_memory
 from kb_agent.models import ParsedBlock, ParsedDocument
@@ -548,6 +554,85 @@ class IngestSearchTest(unittest.TestCase):
             with contextlib.redirect_stdout(stdout):
                 cli_main(["--db", str(db_path), "fact-conflicts", "--doc-id", doc_ids[0], "--doc-id", doc_ids[1], "--severity", "high"])
             self.assertIn("fact_conflicts.v1", stdout.getvalue())
+
+    def test_claim_graph_navigation_exports_and_dashboard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_fact_audit_samples(Path(tmp))
+
+            result = build_knowledge_graph(db_path, doc_ids=doc_ids, include_conflicts=True, min_confidence=0.5)
+
+            self.assertEqual(result["knowledge_graph"]["schema"], "knowledge_graph.v1")
+            graph = result["knowledge_graph"]
+            node_types = {item["type"] for item in graph["nodes"]}
+            edge_types = {item["type"] for item in graph["edges"]}
+            self.assertIn("document", node_types)
+            self.assertIn("claim", node_types)
+            self.assertIn("evidence", node_types)
+            self.assertIn("conflict", node_types)
+            self.assertIn("has_claim", edge_types)
+            self.assertIn("backed_by", edge_types)
+            self.assertIn("conflicts_with", edge_types)
+            self.assertGreaterEqual(result["graph_report"]["conflict_count"], 1)
+            self.assertTrue(Path(result["knowledge_graph_path"]).exists())
+
+            dumped = json.dumps(graph, ensure_ascii=False)
+            self.assertNotIn("excerpt", dumped)
+            self.assertNotIn("这是很长的论文正文", dumped)
+
+            neighborhood = get_graph_neighborhood(db_path, "claim_a_positive", graph_id=result["graph_id"], depth=2)
+            self.assertEqual(neighborhood["schema"], "knowledge_graph_neighborhood.v1")
+            self.assertGreaterEqual(neighborhood["node_count"], 2)
+            self.assertTrue(any(item["type"] == "evidence" for item in neighborhood["nodes"]))
+
+            mermaid = export_knowledge_graph(db_path, result["graph_id"], format="mermaid")
+            self.assertTrue(Path(mermaid["path"]).exists())
+            self.assertIn("graph TD", Path(mermaid["path"]).read_text(encoding="utf-8"))
+
+            html = export_knowledge_graph(db_path, result["graph_id"], format="html")
+            self.assertTrue(Path(html["path"]).exists())
+            html_text = Path(html["path"]).read_text(encoding="utf-8")
+            self.assertIn("<!doctype html>", html_text)
+            self.assertNotIn("excerpt", html_text)
+
+            report = get_graph_report(db_path, result["graph_id"])
+            self.assertEqual(report["schema"], "knowledge_graph_report.v1")
+            self.assertGreaterEqual(report["evidence_coverage_rate"], 0.5)
+
+            comparison = compare_papers(db_path, "任务完成率方法对比", doc_ids=doc_ids, use_llm=False)
+            self.assertIn("claim_graph", comparison["comparison_matrix"])
+            self.assertTrue(any("claim_graph" in warning for warning in comparison["comparison_matrix"]["warnings"]))
+
+            review = generate_review_plan(db_path, "任务完成率研究综述", doc_ids=doc_ids, use_llm=False)
+            self.assertIn("claim_graph", review["review_outline"])
+            self.assertTrue(any("Claim Graph" in item for item in review["review_outline"]["open_questions"]))
+
+            case = generate_case_study(db_path, "任务完成率", doc_ids=doc_ids, compare_modes=["hybrid"], top_k=3)
+            self.assertIn("claim_graph", case)
+            self.assertGreaterEqual(case["claim_graph"]["conflict_count"], 1)
+
+            dashboard = eval_dashboard(db_path)
+            self.assertIn("latest_claim_graph", dashboard)
+            self.assertGreaterEqual(dashboard["latest_claim_graph"]["conflict_count"], 1)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "graph-build", "--doc-id", doc_ids[0], "--doc-id", doc_ids[1], "--include-conflicts"])
+            self.assertIn("knowledge_graph_build_result.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "graph-neighborhood", "claim_a_positive", "--graph-id", result["graph_id"]])
+            self.assertIn("knowledge_graph_neighborhood.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "graph-export", result["graph_id"], "--format", "mermaid"])
+            self.assertIn("knowledge_graph_export.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "graph-report", result["graph_id"]])
+            self.assertIn("knowledge_graph_report.v1", stdout.getvalue())
 
     def test_llm_fact_extraction_and_require_llm_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1804,6 +1889,8 @@ class IngestSearchTest(unittest.TestCase):
         self.assertIn("kb_apply_search_profile", content)
         self.assertIn("kb_audit_facts", content)
         self.assertIn("kb_get_fact_conflicts", content)
+        self.assertIn("kb_build_knowledge_graph", content)
+        self.assertIn("kb_get_graph_neighborhood", content)
         self.assertIn("kb_run_benchmark", content)
         self.assertIn("kb_analyze_failures", content)
         self.assertIn("kb_generate_case_study", content)
@@ -1812,6 +1899,9 @@ class IngestSearchTest(unittest.TestCase):
         mcp_content = Path("kb_agent/mcp_server.py").read_text(encoding="utf-8")
         self.assertIn("kb_audit_facts", mcp_content)
         self.assertIn("kb_get_fact_conflicts", mcp_content)
+        self.assertIn("kb_build_knowledge_graph", mcp_content)
+        self.assertIn("kb_get_graph_neighborhood", mcp_content)
+        self.assertIn("kb_export_knowledge_graph", mcp_content)
         self.assertIn("kb_create_eval_suite", mcp_content)
         self.assertIn("kb_run_benchmark", mcp_content)
         self.assertIn("kb_analyze_failures", mcp_content)

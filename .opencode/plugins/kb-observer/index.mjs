@@ -12,6 +12,11 @@ const OBSERVED_TOOLS = new Set([
   "kb_eval_facts",
   "kb_audit_facts",
   "kb_get_fact_conflicts",
+  "kb_build_knowledge_graph",
+  "kb_get_knowledge_graph",
+  "kb_get_graph_neighborhood",
+  "kb_export_knowledge_graph",
+  "kb_get_graph_report",
   "kb_create_eval_suite",
   "kb_run_benchmark",
   "kb_analyze_failures",
@@ -32,6 +37,10 @@ const SENSITIVE_KEYS = new Set([
   "content",
   "excerpt",
   "evidence",
+  "edges",
+  "graph_index",
+  "knowledge_graph",
+  "nodes",
   "review_draft",
   "section_drafts",
   "snippet",
@@ -130,6 +139,7 @@ function parseToolOutput(output) {
 function summarizeToolEvent(tool, input, payload) {
   const safe = sanitize(payload || {});
   const taskId = stringValue(safe.task_id || safe?.review_outline?.task_id || safe?.comparison_matrix?.task_id);
+  const graphId = stringValue(safe.graph_id || safe?.graph_report?.graph_id || safe?.claim_graph?.graph_id);
   const warnings = arrayValue(safe.warnings || safe?.review_outline?.warnings || safe?.comparison_matrix?.warnings);
   const coverage = safe.evidence_coverage || safe?.review_outline?.evidence_coverage || safe?.comparison_matrix?.evidence_coverage || {};
   return {
@@ -139,6 +149,7 @@ function summarizeToolEvent(tool, input, payload) {
     call_id: input.callID,
     tool,
     task_id: taskId,
+    graph_id: graphId,
     status: stringValue(safe.status),
     query: stringValue(safe.query || safe.topic || input?.args?.query || input?.args?.topic),
     doc_id: stringValue(safe.doc_id || input?.args?.doc_id),
@@ -187,6 +198,23 @@ function summarizeMetrics(tool, safe, coverage) {
       high_severity_conflict_count: numberValue(safe.high_severity_conflict_count || safe.high_severity_count),
       table_text_mismatch_count: numberValue(safe.table_text_mismatch_count),
       citation_gap_count: numberValue(safe.citation_gap_count),
+    };
+  }
+  if (
+    tool === "kb_build_knowledge_graph" ||
+    tool === "kb_get_knowledge_graph" ||
+    tool === "kb_get_graph_neighborhood" ||
+    tool === "kb_export_knowledge_graph" ||
+    tool === "kb_get_graph_report"
+  ) {
+    const report = safe.graph_report || safe;
+    return {
+      graph_id: stringValue(safe.graph_id || report.graph_id),
+      node_count: numberValue(safe.node_count || report.node_count || safe?.knowledge_graph?.nodes?.length),
+      edge_count: numberValue(safe.edge_count || report.edge_count || safe?.knowledge_graph?.edges?.length),
+      conflict_count: numberValue(safe.conflict_count || report.conflict_count),
+      isolated_fact_count: numberValue(safe.isolated_fact_count || report.isolated_fact_count),
+      evidence_coverage_rate: numberValue(safe.evidence_coverage_rate || report.evidence_coverage_rate),
     };
   }
   if (tool === "kb_create_eval_suite") {
@@ -283,6 +311,7 @@ function formatCompactionContext(events) {
     const parts = [
       `tool=${event.tool}`,
       event.task_id ? `task_id=${event.task_id}` : "",
+      event.graph_id ? `graph_id=${event.graph_id}` : "",
       event.status ? `status=${event.status}` : "",
       event.warning_count ? `warnings=${event.warnings.join(";")}` : "",
       event.profile?.profile_name ? `profile=${event.profile.profile_name}:${event.profile.default_mode}` : "",

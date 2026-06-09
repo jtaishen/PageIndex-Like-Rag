@@ -33,6 +33,13 @@ from .facts import extract_facts, fact_search, get_claims, get_entities, get_fac
 from .feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from .ingest import sync_directory
 from .insights import extract_doc_insights
+from .knowledge_graph import (
+    build_knowledge_graph,
+    export_knowledge_graph,
+    get_graph_neighborhood,
+    get_graph_report,
+    get_knowledge_graph,
+)
 from .memory import compact_memory, put_memory_gated as write_memory_gated, remember_task, resume_task, search_memory
 from .query import classify_query
 from .query_log import list_query_logs, query_stats
@@ -151,6 +158,50 @@ if FastMCP is not None:
             severity=severity,
             min_confidence=min_confidence,
         )
+
+    @mcp.tool()
+    def kb_build_knowledge_graph(
+        doc_ids: Optional[List[str]] = None,
+        include_conflicts: bool = False,
+        min_confidence: float = 0.0,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build a lightweight claim graph from facts, evidence ids, and optional audit conflicts."""
+        return build_knowledge_graph(
+            resolve_db_path(db_path),
+            doc_ids=doc_ids,
+            include_conflicts=include_conflicts,
+            min_confidence=min_confidence,
+        )
+
+    @mcp.tool()
+    def kb_get_knowledge_graph(graph_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return a previously built lightweight claim graph."""
+        return get_knowledge_graph(resolve_db_path(db_path), graph_id)
+
+    @mcp.tool()
+    def kb_get_graph_neighborhood(
+        node_or_fact_id: str,
+        depth: int = 1,
+        graph_id: Optional[str] = None,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return a bounded graph neighborhood for a claim/entity/relation/conflict/evidence id."""
+        return get_graph_neighborhood(resolve_db_path(db_path), node_or_fact_id, depth=depth, graph_id=graph_id)
+
+    @mcp.tool()
+    def kb_export_knowledge_graph(
+        graph_id: str,
+        format: str = "json",
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Export a claim graph as json, mermaid, or static html without evidence text."""
+        return export_knowledge_graph(resolve_db_path(db_path), graph_id, format=format)
+
+    @mcp.tool()
+    def kb_get_graph_report(graph_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return a graph quality report with evidence coverage, conflicts, and isolated facts."""
+        return get_graph_report(resolve_db_path(db_path), graph_id)
 
     @mcp.tool()
     def kb_create_eval_suite(

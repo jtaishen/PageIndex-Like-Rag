@@ -37,6 +37,7 @@ from .facts import extract_facts, fact_search, get_claims, get_entities, get_fac
 from .feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from .ingest import sync_directory
 from .insights import extract_doc_insights
+from .knowledge_graph import build_knowledge_graph, export_knowledge_graph, get_graph_neighborhood, get_graph_report
 from .memory import compact_memory, put_memory_gated, remember_task, resume_task, search_memory
 from .query import classify_query
 from .query_log import list_query_logs, query_stats, write_query_log
@@ -111,6 +112,23 @@ def main(argv: Any = None) -> None:
     fact_conflicts_parser.add_argument("--doc-id", action="append", default=[], help="Limit to one document id; repeatable")
     fact_conflicts_parser.add_argument("--severity", choices=["low", "medium", "high"], default=None)
     fact_conflicts_parser.add_argument("--min-confidence", type=float, default=0.5)
+
+    graph_build_parser = subparsers.add_parser("graph-build", help="Build a lightweight claim graph from facts and audit risks")
+    graph_build_parser.add_argument("--doc-id", action="append", default=[], help="Limit graph to one document id; repeatable")
+    graph_build_parser.add_argument("--include-conflicts", action="store_true", help="Include fact audit conflict nodes")
+    graph_build_parser.add_argument("--min-confidence", type=float, default=0.0)
+
+    graph_neighborhood_parser = subparsers.add_parser("graph-neighborhood", help="Show a claim graph neighborhood")
+    graph_neighborhood_parser.add_argument("node_or_fact_id")
+    graph_neighborhood_parser.add_argument("--depth", type=int, default=1)
+    graph_neighborhood_parser.add_argument("--graph-id", default=None)
+
+    graph_export_parser = subparsers.add_parser("graph-export", help="Export a claim graph as json, mermaid, or html")
+    graph_export_parser.add_argument("graph_id")
+    graph_export_parser.add_argument("--format", choices=["json", "mermaid", "html"], default="json")
+
+    graph_report_parser = subparsers.add_parser("graph-report", help="Show a claim graph quality report")
+    graph_report_parser.add_argument("graph_id")
 
     eval_suite_parser = subparsers.add_parser("eval-suite", help="Create, list, or show reusable evaluation suites")
     eval_suite_subparsers = eval_suite_parser.add_subparsers(dest="suite_command", required=True)
@@ -417,6 +435,30 @@ def main(argv: Any = None) -> None:
                 )
             )
         )
+    elif args.command == "graph-build":
+        _print_json(
+            _graph_build_cli_summary(
+                build_knowledge_graph(
+                    db_path,
+                    doc_ids=args.doc_id or None,
+                    include_conflicts=args.include_conflicts,
+                    min_confidence=args.min_confidence,
+                )
+            )
+        )
+    elif args.command == "graph-neighborhood":
+        _print_json(
+            get_graph_neighborhood(
+                db_path,
+                args.node_or_fact_id,
+                depth=args.depth,
+                graph_id=args.graph_id,
+            )
+        )
+    elif args.command == "graph-export":
+        _print_json(export_knowledge_graph(db_path, args.graph_id, format=args.format))
+    elif args.command == "graph-report":
+        _print_json(get_graph_report(db_path, args.graph_id))
     elif args.command == "eval-suite":
         if args.suite_command == "create":
             _print_json(
@@ -990,6 +1032,25 @@ def _fact_conflicts_cli_summary(result: dict) -> dict:
     }
 
 
+def _graph_build_cli_summary(result: dict) -> dict:
+    report = result.get("graph_report") or {}
+    return {
+        "schema": result.get("schema"),
+        "graph_id": result.get("graph_id"),
+        "graph_dir": result.get("graph_dir"),
+        "knowledge_graph_path": result.get("knowledge_graph_path"),
+        "graph_index_path": result.get("graph_index_path"),
+        "graph_report_path": result.get("graph_report_path"),
+        "doc_ids": report.get("doc_ids") or [],
+        "node_count": report.get("node_count", 0),
+        "edge_count": report.get("edge_count", 0),
+        "conflict_count": report.get("conflict_count", 0),
+        "isolated_fact_count": report.get("isolated_fact_count", 0),
+        "evidence_coverage_rate": report.get("evidence_coverage_rate", 0.0),
+        "warnings": result.get("warnings") or [],
+    }
+
+
 def _suite_summary(result: dict) -> dict:
     return {
         "schema": result.get("schema"),
@@ -1032,6 +1093,7 @@ def _failure_cli_summary(result: dict) -> dict:
 
 
 def _case_cli_summary(result: dict) -> dict:
+    graph = result.get("claim_graph") or {}
     return {
         "schema": result.get("schema"),
         "path": result.get("path"),
@@ -1044,6 +1106,10 @@ def _case_cli_summary(result: dict) -> dict:
         "fact_match_count": (result.get("fact_matches") or {}).get("count", 0),
         "fact_conflict_count": (result.get("fact_conflicts") or {}).get("conflict_count", 0),
         "high_severity_fact_conflict_count": (result.get("fact_conflicts") or {}).get("high_severity_conflict_count", 0),
+        "claim_graph_id": graph.get("graph_id", ""),
+        "claim_graph_conflict_count": graph.get("conflict_count", 0),
+        "claim_graph_isolated_fact_count": graph.get("isolated_fact_count", 0),
+        "claim_graph_evidence_coverage_rate": graph.get("evidence_coverage_rate", 0.0),
         "warnings": result.get("warnings") or [],
     }
 

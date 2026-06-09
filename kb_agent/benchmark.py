@@ -10,6 +10,7 @@ from .config import DATA_DIR
 from .fact_audit import fact_conflict_summary
 from .facts import fact_search
 from .feedback import list_feedback
+from .knowledge_graph import graph_summary
 from .query import classify_query
 from .query_log import list_query_logs
 from .search import build_search_report, search_documents, search_nodes
@@ -209,6 +210,7 @@ def generate_case_study(
         mode_reports[mode] = _case_mode_summary(report)
     facts = fact_search(db_path, query, doc_ids=clean_doc_ids or None, top_k=8)
     conflicts = fact_conflict_summary(db_path, query, doc_ids=clean_doc_ids or None)
+    graph = graph_summary(db_path, doc_ids=clean_doc_ids or None, include_conflicts=True)
     created_at = time.time()
     case_id = stable_id("case", query, ",".join(clean_doc_ids), created_at, length=12)
     payload = {
@@ -221,9 +223,10 @@ def generate_case_study(
         "mode_reports": mode_reports,
         "fact_matches": _fact_summary(facts),
         "fact_conflicts": conflicts,
+        "claim_graph": graph,
         "evidence_summary": _case_evidence_summary(mode_reports),
         "answer_outline": _answer_outline(mode_reports, facts),
-        "warnings": _case_warnings(mode_reports, facts, conflicts),
+        "warnings": _case_warnings(mode_reports, facts, conflicts, graph),
         "created_at": created_at,
     }
     json_path = EVAL_DIR / f"case_study_{case_id}.json"
@@ -601,14 +604,24 @@ def _answer_outline(mode_reports: Dict[str, Any], facts: Dict[str, Any]) -> Dict
     }
 
 
-def _case_warnings(mode_reports: Dict[str, Any], facts: Dict[str, Any], conflicts: Optional[Dict[str, Any]] = None) -> List[str]:
+def _case_warnings(
+    mode_reports: Dict[str, Any],
+    facts: Dict[str, Any],
+    conflicts: Optional[Dict[str, Any]] = None,
+    graph: Optional[Dict[str, Any]] = None,
+) -> List[str]:
     warnings = []
     for report in mode_reports.values():
         warnings.extend(report.get("warnings") or [])
     warnings.extend(facts.get("warnings") or [])
     warnings.extend((conflicts or {}).get("warnings") or [])
+    warnings.extend((graph or {}).get("warnings") or [])
     if (conflicts or {}).get("conflict_count", 0) > 0:
         warnings.append(f"fact_conflicts:{(conflicts or {}).get('conflict_count')}")
+    if (graph or {}).get("conflict_count", 0) > 0:
+        warnings.append(f"claim_graph_conflicts:{(graph or {}).get('conflict_count')}")
+    if (graph or {}).get("isolated_fact_count", 0) > 0:
+        warnings.append(f"claim_graph_isolated_facts:{(graph or {}).get('isolated_fact_count')}")
     if not any((report.get("results") or []) for report in mode_reports.values()):
         warnings.append("case_has_no_evidence")
     return _unique_strings(warnings)
@@ -713,6 +726,9 @@ def _case_markdown(case: Dict[str, Any]) -> str:
         f"- modes: `{', '.join(case.get('compare_modes') or [])}`",
         f"- evidence_count: `{(case.get('evidence_summary') or {}).get('count', 0)}`",
         f"- fact_conflict_count: `{(case.get('fact_conflicts') or {}).get('conflict_count', 0)}`",
+        f"- claim_graph_id: `{(case.get('claim_graph') or {}).get('graph_id', '')}`",
+        f"- claim_graph_conflict_count: `{(case.get('claim_graph') or {}).get('conflict_count', 0)}`",
+        f"- claim_graph_isolated_fact_count: `{(case.get('claim_graph') or {}).get('isolated_fact_count', 0)}`",
         f"- warnings: `{', '.join(case.get('warnings') or [])}`",
     ]
     return "\n".join(lines) + "\n"

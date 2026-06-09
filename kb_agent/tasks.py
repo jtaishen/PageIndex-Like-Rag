@@ -11,6 +11,7 @@ from .config import DEFAULT_DB_PATH, PROJECT_ROOT
 from .fact_audit import fact_audit_summary
 from .facts import fact_summary_for_doc
 from .insights import extract_doc_insights
+from .knowledge_graph import graph_summary
 from .llm import LLMError, generate_json_object
 from .query_log import write_query_log
 from .search import get_evidence, search_documents, search_nodes
@@ -140,7 +141,9 @@ def compare_papers(
         matrix = _rule_based_comparison(query, contexts, evidence_by_dimension, warnings)
 
     coverage = _matrix_coverage(matrix)
+    graph = graph_summary(db_path, doc_ids=[context["doc_id"] for context in contexts], include_conflicts=True)
     _apply_fact_audit_to_comparison(matrix, audit)
+    _apply_graph_summary_to_comparison(matrix, graph)
     matrix["evidence_coverage"] = coverage
     matrix["warnings"] = _unique_strings([*matrix.get("warnings", []), *coverage["warnings"]])
     matrix["status"] = "partial" if matrix["warnings"] or matrix.get("source") == "rule" else "extracted"
@@ -231,7 +234,9 @@ def generate_review_plan(
         outline = _rule_based_review_plan(topic, contexts, section_evidence, warnings)
 
     coverage = _outline_coverage(outline, section_evidence)
+    graph = graph_summary(db_path, doc_ids=[context["doc_id"] for context in contexts], include_conflicts=True)
     _apply_fact_audit_to_review(outline, audit)
+    _apply_graph_summary_to_review(outline, graph)
     outline["evidence_coverage"] = coverage
     outline["warnings"] = _unique_strings([*outline.get("warnings", []), *coverage["warnings"]])
     outline["status"] = "partial" if outline["warnings"] or outline.get("source") == "rule" else "extracted"
@@ -858,6 +863,20 @@ def _fact_audit_warning_tags(audit: Dict[str, Any]) -> List[str]:
     return warnings
 
 
+def _graph_warning_tags(graph: Dict[str, Any]) -> List[str]:
+    warnings = []
+    if not graph.get("available"):
+        warnings.append("claim_graph_unavailable")
+        return warnings
+    if graph.get("conflict_count", 0) > 0:
+        warnings.append(f"claim_graph_conflicts:{graph.get('conflict_count')}")
+    if graph.get("isolated_fact_count", 0) > 0:
+        warnings.append(f"claim_graph_isolated_facts:{graph.get('isolated_fact_count')}")
+    if float(graph.get("evidence_coverage_rate") or 0.0) < 1.0:
+        warnings.append(f"claim_graph_evidence_coverage:{graph.get('evidence_coverage_rate')}")
+    return warnings
+
+
 def _apply_fact_audit_to_comparison(matrix: Dict[str, Any], audit: Dict[str, Any]) -> None:
     matrix["fact_audit"] = audit
     audit_warnings = _fact_audit_warning_tags(audit)
@@ -886,6 +905,46 @@ def _apply_fact_audit_to_review(outline: Dict[str, Any], audit: Dict[str, Any]) 
     for section in outline.get("sections") or []:
         if section.get("section_id") in {"evaluation_evidence", "limitations_future"}:
             section["warnings"] = _unique_strings([*(section.get("warnings") or []), *audit_warnings])
+
+
+def _apply_graph_summary_to_comparison(matrix: Dict[str, Any], graph: Dict[str, Any]) -> None:
+    matrix["claim_graph"] = graph
+    graph_warnings = _graph_warning_tags(graph)
+    if not graph_warnings:
+        return
+    matrix["warnings"] = _unique_strings([*matrix.get("warnings", []), *graph_warnings])
+    matrix["open_questions"] = _unique_strings(
+        [
+            *matrix.get("open_questions", []),
+            (
+                f"Claim Graph 中有 {graph.get('conflict_count', 0)} 个冲突、"
+                f"{graph.get('isolated_fact_count', 0)} 个孤立事实，比较结论需要回到 evidence packet 核验。"
+            ),
+        ]
+    )
+    for dimension in matrix.get("dimensions") or []:
+        if dimension.get("id") in {"innovation_overlap", "evidence_strength", "limitations"}:
+            dimension["warnings"] = _unique_strings([*(dimension.get("warnings") or []), *graph_warnings])
+
+
+def _apply_graph_summary_to_review(outline: Dict[str, Any], graph: Dict[str, Any]) -> None:
+    outline["claim_graph"] = graph
+    graph_warnings = _graph_warning_tags(graph)
+    if not graph_warnings:
+        return
+    outline["warnings"] = _unique_strings([*outline.get("warnings", []), *graph_warnings])
+    outline["open_questions"] = _unique_strings(
+        [
+            *outline.get("open_questions", []),
+            (
+                f"Claim Graph 提示 {graph.get('conflict_count', 0)} 个冲突和 "
+                f"{graph.get('isolated_fact_count', 0)} 个孤立事实，综述写作前需要复核相关证据链。"
+            ),
+        ]
+    )
+    for section in outline.get("sections") or []:
+        if section.get("section_id") in {"method_paradigms", "evaluation_evidence", "limitations_future"}:
+            section["warnings"] = _unique_strings([*(section.get("warnings") or []), *graph_warnings])
 
 
 def _matrix_coverage(matrix: Dict[str, Any]) -> Dict[str, Any]:
