@@ -1,13 +1,32 @@
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from . import db
+from .embeddings import (
+    EmbeddingError,
+    cosine_similarity,
+    get_embedding_provider,
+    semantic_index_status,
+    vector_from_json,
+)
 from .models import EvidencePacket, SearchResult
 from .utils import compact_whitespace
+
+
+SEARCH_MODES = {"hybrid", "fts"}
+
+
+def resolve_search_mode(search_mode: str = "hybrid") -> str:
+    mode = (search_mode or "hybrid").strip().lower()
+    if mode not in SEARCH_MODES:
+        choices = ", ".join(sorted(SEARCH_MODES))
+        raise ValueError(f"Unsupported search_mode '{search_mode}'. Expected one of: {choices}")
+    return mode
 
 
 def fts_query(text: str) -> str:
@@ -34,18 +53,149 @@ def search_nodes(
     query: str,
     doc_id: Optional[str] = None,
     top_k: int = 8,
+    search_mode: str = "hybrid",
 ) -> List[SearchResult]:
     conn = db.connect(db_path)
     db.init_db(conn)
     try:
-        return _search_nodes_conn(conn, query, doc_id=doc_id, top_k=top_k)
+        return _search_nodes_conn(conn, query, doc_id=doc_id, top_k=top_k, search_mode=search_mode)
     finally:
         conn.close()
 
 
-def search_documents(db_path: Path, query: str, top_k: int = 8) -> List[Dict[str, object]]:
+def search_documents(
+    db_path: Path,
+    query: str,
+    top_k: int = 8,
+    search_mode: str = "hybrid",
+) -> List[Dict[str, object]]:
     conn = db.connect(db_path)
     db.init_db(conn)
+    try:
+        mode = resolve_search_mode(search_mode)
+        if mode == "hybrid":
+            rows = _search_documents_hybrid_conn(conn, query, top_k)
+            if rows:
+                return rows
+        return [dict(row) for row in _search_documents_fts_conn(conn, query, top_k)]
+    finally:
+        conn.close()
+
+
+def build_search_report(
+    db_path: Path,
+    query: str,
+    doc_id: Optional[str] = None,
+    top_k: int = 8,
+    search_mode: str = "hybrid",
+) -> Dict[str, object]:
+    mode = resolve_search_mode(search_mode)
+    conn = db.connect(db_path)
+    db.init_db(conn)
+    try:
+        results = _search_nodes_conn(conn, query, doc_id=doc_id, top_k=top_k, search_mode=mode)
+        warnings = _search_report_warnings(results, mode, db_path)
+        docs = _docs_for_results(conn, results)
+    finally:
+        conn.close()
+    return {
+        "schema": "search_report.v1",
+        "query": query,
+        "doc_id": doc_id,
+        "requested_search_mode": mode,
+        "effective_search_mode": "fts" if any("fts_fallback" in item.rank_reason for item in results) else mode,
+        "top_k": top_k,
+        "warnings": warnings,
+        "embedding_status": _safe_embedding_status(db_path),
+        "documents": docs,
+        "results": [result.__dict__ for result in results],
+    }
+
+
+def get_evidence(
+    db_path: Path,
+    doc_id: str,
+    node_ids: Iterable[str],
+) -> List[EvidencePacket]:
+    conn = db.connect(db_path)
+    db.init_db(conn)
+    try:
+        return db.get_evidence_packets(conn, doc_id, node_ids)
+    finally:
+        conn.close()
+
+
+def _search_nodes_conn(
+    conn,
+    query: str,
+    doc_id: Optional[str] = None,
+    top_k: int = 8,
+    search_mode: str = "hybrid",
+) -> List[SearchResult]:  # type: ignore[no-untyped-def]
+    mode = resolve_search_mode(search_mode)
+    candidate_limit = max(top_k * 4, 20)
+    fts_rows = _rank_node_rows(_fts_node_rows(conn, query, doc_id, candidate_limit), query)
+    if mode == "fts":
+        return _rows_to_results(fts_rows[:top_k], reason_prefix="fts")
+
+    try:
+        vector_rows = _vector_node_rows(conn, query, doc_id, candidate_limit)
+    except EmbeddingError as exc:
+        return _rows_to_results(fts_rows[:top_k], reason_prefix=f"fts_fallback:{exc}")
+    if not vector_rows:
+        return _rows_to_results(fts_rows[:top_k], reason_prefix="fts_fallback:no_embedding_index")
+
+    quality_by_doc = _quality_by_doc_id(conn, [str(row["doc_id"]) for row in [*fts_rows, *vector_rows]])
+    merged = _merge_hybrid_rows(fts_rows, vector_rows, query, quality_by_doc)
+    return _rows_to_results(merged[:top_k], reason_prefix="hybrid")
+
+
+def _search_documents_hybrid_conn(conn, query: str, top_k: int) -> List[Dict[str, object]]:  # type: ignore[no-untyped-def]
+    node_results = _search_nodes_conn(conn, query, top_k=max(top_k * 6, 20), search_mode="hybrid")
+    grouped: Dict[str, Dict[str, object]] = {}
+    for rank, result in enumerate(node_results, start=1):
+        item = grouped.setdefault(
+            result.doc_id,
+            {
+                "doc_id": result.doc_id,
+                "node_matches": 0,
+                "score": 0.0,
+                "hybrid_score": 0.0,
+                "rank_reason": result.rank_reason,
+                "best_node_id": result.node_id,
+            },
+        )
+        item["node_matches"] = int(item["node_matches"]) + 1
+        score = float(result.hybrid_score if result.hybrid_score is not None else result.score)
+        item["hybrid_score"] = max(float(item["hybrid_score"]), score)
+        item["score"] = -float(item["hybrid_score"]) if score > 0 else result.score
+        if rank == 1 or score >= float(item["hybrid_score"]):
+            item["best_node_id"] = result.node_id
+            item["rank_reason"] = result.rank_reason
+
+    if not grouped:
+        return []
+
+    doc_ids = list(grouped.keys())
+    placeholders = ",".join("?" for _ in doc_ids)
+    rows = conn.execute(
+        f"""
+        SELECT d.doc_id, d.title, d.path, d.file_type, d.summary, d.abstract, d.keywords
+        FROM documents d
+        WHERE d.doc_id IN ({placeholders}) AND d.status = 'ready'
+        """,
+        doc_ids,
+    ).fetchall()
+    docs = []
+    for row in rows:
+        item = dict(row)
+        item.update(grouped[row["doc_id"]])
+        docs.append(item)
+    docs.sort(key=lambda item: (-float(item.get("hybrid_score") or 0.0), -int(item.get("node_matches") or 0)))
+    return docs[:top_k]
+
+
+def _search_documents_fts_conn(conn, query: str, top_k: int):  # type: ignore[no-untyped-def]
     try:
         match = fts_query(query)
         rows = list(conn.execute(
@@ -76,32 +226,12 @@ def search_documents(db_path: Path, query: str, top_k: int = 8) -> List[Dict[str
                     seen.add(row["doc_id"])
                 if len(rows) >= top_k:
                     break
+        return rows
     except sqlite3.OperationalError:
-        rows = list(_fallback_doc_search(conn, query, top_k))
-    finally:
-        conn.close()
-    return [dict(row) for row in rows]
+        return list(_fallback_doc_search(conn, query, top_k))
 
 
-def get_evidence(
-    db_path: Path,
-    doc_id: str,
-    node_ids: Iterable[str],
-) -> List[EvidencePacket]:
-    conn = db.connect(db_path)
-    db.init_db(conn)
-    try:
-        return db.get_evidence_packets(conn, doc_id, node_ids)
-    finally:
-        conn.close()
-
-
-def _search_nodes_conn(
-    conn,
-    query: str,
-    doc_id: Optional[str] = None,
-    top_k: int = 8,
-) -> List[SearchResult]:  # type: ignore[no-untyped-def]
+def _fts_node_rows(conn, query: str, doc_id: Optional[str], top_k: int) -> List[Dict[str, object]]:  # type: ignore[no-untyped-def]
     match = fts_query(query)
     params: List[object] = [match]
     doc_filter = ""
@@ -138,22 +268,162 @@ def _search_nodes_conn(
                     break
     except sqlite3.OperationalError:
         rows = list(_fallback_node_search(conn, query, doc_id, top_k))
-    rows = _rank_node_rows(rows, query)[:top_k]
-    return [
-        SearchResult(
-            doc_id=row["doc_id"],
-            node_id=row["node_id"],
-            title=row["title"],
-            path=row["path"],
-            node_path=row["node_path"],
-            heading=row["heading"],
-            snippet=compact_whitespace(row["snippet"] or ""),
-            score=float(row["score"] or 0.0),
-            page_start=row["page_start"],
-            page_end=row["page_end"],
+    return [_row_dict(row) for row in rows]
+
+
+def _vector_node_rows(conn, query: str, doc_id: Optional[str], top_k: int) -> List[Dict[str, object]]:  # type: ignore[no-untyped-def]
+    provider = get_embedding_provider()
+    query_vector = provider.embed(query)
+    embedding_rows = db.get_node_embedding_rows(conn, provider=provider.name, model=provider.model, doc_id=doc_id)
+    if not embedding_rows:
+        return []
+    rows: List[Dict[str, object]] = []
+    for embedding_row in embedding_rows:
+        vector = vector_from_json(str(embedding_row["vector_json"] or "[]"))
+        vector_score = cosine_similarity(query_vector, vector)
+        if vector_score <= 0:
+            continue
+        text = str(embedding_row["text"] or embedding_row["summary"] or embedding_row["heading"] or "")
+        rows.append(
+            {
+                "node_id": embedding_row["node_id"],
+                "doc_id": embedding_row["doc_id"],
+                "title": embedding_row["title"],
+                "path": embedding_row["path"],
+                "node_path": embedding_row["node_path"],
+                "heading": embedding_row["heading"],
+                "type": embedding_row["type"],
+                "snippet": compact_whitespace(text[:500]),
+                "score": -vector_score,
+                "vector_score": vector_score,
+                "page_start": embedding_row["page_start"],
+                "page_end": embedding_row["page_end"],
+                "order_index": embedding_row["order_index"],
+            }
         )
-        for row in rows
-    ]
+    rows.sort(key=lambda item: (-float(item["vector_score"]), int(item["order_index"] or 0)))
+    return rows[:top_k]
+
+
+def _merge_hybrid_rows(
+    fts_rows: List[Dict[str, object]],
+    vector_rows: List[Dict[str, object]],
+    query: str,
+    quality_by_doc: Dict[str, Dict[str, object]],
+) -> List[Dict[str, object]]:
+    merged: Dict[str, Dict[str, object]] = {}
+    reasons: Dict[str, List[str]] = {}
+    for rank, row in enumerate(fts_rows, start=1):
+        item = merged.setdefault(str(row["node_id"]), dict(row))
+        item["fts_rank"] = rank
+        item["fts_score"] = float(row.get("score") or 0.0)
+        reasons.setdefault(str(row["node_id"]), []).append("fts")
+    for rank, row in enumerate(vector_rows, start=1):
+        item = merged.setdefault(str(row["node_id"]), dict(row))
+        item["vector_rank"] = rank
+        item["vector_score"] = float(row.get("vector_score") or 0.0)
+        for key, value in row.items():
+            item.setdefault(key, value)
+        reasons.setdefault(str(row["node_id"]), []).append("vector")
+
+    terms = _fallback_terms(query)
+    for node_id, item in merged.items():
+        fts_rank = item.get("fts_rank")
+        vector_rank = item.get("vector_rank")
+        score = 0.0
+        if fts_rank:
+            score += 1.0 / (60.0 + int(fts_rank))
+        if vector_rank:
+            score += 1.0 / (60.0 + int(vector_rank))
+        penalty, rerank_reasons = _rerank_penalty(item, terms, query, quality_by_doc)
+        item["hybrid_score"] = round(score - penalty, 8)
+        item["rank_reason"] = ",".join([*reasons.get(node_id, []), *rerank_reasons])
+    return sorted(
+        merged.values(),
+        key=lambda item: (-float(item.get("hybrid_score") or 0.0), int(item.get("order_index") or 0)),
+    )
+
+
+def _rerank_penalty(
+    row: Dict[str, object],
+    terms: List[str],
+    query: str,
+    quality_by_doc: Dict[str, Dict[str, object]],
+) -> Tuple[float, List[str]]:
+    text = " ".join(str(row.get(name) or "") for name in ("heading", "node_path", "snippet"))
+    reasons: List[str] = []
+    penalty = 0.0
+    if row.get("type") in {"document", "page"}:
+        penalty += 0.004
+        reasons.append("page_penalty")
+    if row.get("type") == "reference" and not any(term in query for term in ("参考", "引用", "reference")):
+        penalty += 0.006
+        reasons.append("reference_penalty")
+    if _looks_like_front_matter(text):
+        penalty += 0.006
+        reasons.append("front_matter_penalty")
+    if any(term and term in text for term in terms):
+        penalty -= 0.006
+        reasons.append("exact_term_boost")
+    if row.get("type") in {"section", "abstract"}:
+        penalty -= 0.002
+        reasons.append("structure_boost")
+    quality = quality_by_doc.get(str(row.get("doc_id") or "")) or {}
+    if quality.get("quality_level") == "weak" or quality.get("page_only_tree"):
+        penalty += 0.004
+        reasons.append("parse_quality_penalty")
+    return penalty, reasons
+
+
+def _rank_node_rows(rows: List[Dict[str, object]], query: str) -> List[Dict[str, object]]:
+    terms = _fallback_terms(query)
+
+    def key(row: Dict[str, object]) -> tuple:
+        text = " ".join(str(row.get(name) or "") for name in ("heading", "node_path", "snippet"))
+        penalty = 0
+        if row.get("type") in {"document", "page"}:
+            penalty += 3
+        if row.get("type") == "reference" and not any(term in query for term in ("参考", "引用", "reference")):
+            penalty += 3
+        if _looks_like_front_matter(text):
+            penalty += 3
+        if any(term and term in text for term in terms):
+            penalty -= 3
+        if row.get("type") in {"section", "abstract"}:
+            penalty -= 1
+        return (penalty, float(row.get("score") or 0.0), int(row.get("order_index") or 0))
+
+    return sorted(rows, key=key)
+
+
+def _rows_to_results(rows: List[Dict[str, object]], reason_prefix: str) -> List[SearchResult]:
+    results = []
+    for row in rows:
+        rank_reason = str(row.get("rank_reason") or reason_prefix)
+        if reason_prefix not in rank_reason:
+            rank_reason = f"{reason_prefix},{rank_reason}"
+        score = row.get("hybrid_score")
+        if score is None:
+            score = row.get("score") or 0.0
+        results.append(
+            SearchResult(
+                doc_id=str(row["doc_id"]),
+                node_id=str(row["node_id"]),
+                title=str(row["title"]),
+                path=str(row["path"]),
+                node_path=str(row["node_path"]),
+                heading=str(row["heading"] or ""),
+                snippet=compact_whitespace(str(row.get("snippet") or "")),
+                score=float(score or 0.0),
+                page_start=row.get("page_start"),  # type: ignore[arg-type]
+                page_end=row.get("page_end"),  # type: ignore[arg-type]
+                fts_score=_optional_float(row.get("fts_score", row.get("score"))),
+                vector_score=_optional_float(row.get("vector_score")),
+                hybrid_score=_optional_float(row.get("hybrid_score")),
+                rank_reason=rank_reason,
+            )
+        )
+    return results
 
 
 def _fallback_node_search(conn, query: str, doc_id: Optional[str], top_k: int):  # type: ignore[no-untyped-def]
@@ -188,27 +458,6 @@ def _fallback_node_search(conn, query: str, doc_id: Optional[str], top_k: int): 
         """,
         params,
     ).fetchall()
-
-
-def _rank_node_rows(rows, query: str):  # type: ignore[no-untyped-def]
-    terms = _fallback_terms(query)
-
-    def key(row):  # type: ignore[no-untyped-def]
-        text = " ".join(str(row[name] or "") for name in ("heading", "node_path", "snippet"))
-        penalty = 0
-        if row["type"] in {"document", "page"}:
-            penalty += 3
-        if row["type"] == "reference" and not any(term in query for term in ("参考", "引用", "reference")):
-            penalty += 3
-        if _looks_like_front_matter(text):
-            penalty += 3
-        if any(term and term in text for term in terms):
-            penalty -= 3
-        if row["type"] in {"section", "abstract"}:
-            penalty -= 1
-        return (penalty, float(row["score"] or 0.0), int(row["order_index"] or 0))
-
-    return sorted(rows, key=key)
 
 
 def _fallback_terms(query: str) -> List[str]:
@@ -249,7 +498,23 @@ def _fallback_terms(query: str) -> List[str]:
 
 def _looks_like_front_matter(text: str) -> bool:
     compacted = text.replace(" ", "")
-    front_matter_tokens = ("目录", "学院", "专业", "研究生", "指导教师", "答辩", "分类号", "学号", "密级")
+    front_matter_tokens = (
+        "目录",
+        "学院",
+        "专业",
+        "研究生",
+        "指导教师",
+        "答辩",
+        "分类号",
+        "学号",
+        "密级",
+        "网络首发",
+        "收稿日期",
+        "引用格式",
+        "出版确认",
+        "doi",
+        "issn",
+    )
     return any(token in compacted for token in front_matter_tokens) or bool(re.search(r"(\.{4,}|…{2,})", text))
 
 
@@ -273,3 +538,91 @@ def _fallback_doc_search(conn, query: str, top_k: int):  # type: ignore[no-untyp
         """,
         (like, like, like, like, like, top_k),
     ).fetchall()
+
+
+def _quality_by_doc_id(conn, doc_ids: List[str]) -> Dict[str, Dict[str, object]]:  # type: ignore[no-untyped-def]
+    unique = sorted({doc_id for doc_id in doc_ids if doc_id})
+    if not unique:
+        return {}
+    placeholders = ",".join("?" for _ in unique)
+    rows = conn.execute(
+        f"SELECT doc_id, card_json FROM doc_cards WHERE doc_id IN ({placeholders})",
+        unique,
+    ).fetchall()
+    result: Dict[str, Dict[str, object]] = {}
+    for row in rows:
+        try:
+            card = json.loads(row["card_json"])
+        except json.JSONDecodeError:
+            continue
+        quality = card.get("parse_quality")
+        if isinstance(quality, dict):
+            result[row["doc_id"]] = quality
+    return result
+
+
+def _docs_for_results(conn, results: List[SearchResult]) -> List[Dict[str, object]]:  # type: ignore[no-untyped-def]
+    doc_ids = sorted({result.doc_id for result in results})
+    if not doc_ids:
+        return []
+    placeholders = ",".join("?" for _ in doc_ids)
+    rows = conn.execute(
+        f"""
+        SELECT doc_id, title, path, file_type, summary, abstract, keywords
+        FROM documents
+        WHERE doc_id IN ({placeholders})
+        """,
+        doc_ids,
+    ).fetchall()
+    matches = {doc_id: 0 for doc_id in doc_ids}
+    for result in results:
+        matches[result.doc_id] += 1
+    return [{**dict(row), "node_matches": matches.get(row["doc_id"], 0)} for row in rows]
+
+
+def _search_report_warnings(results: List[SearchResult], mode: str, db_path: Path) -> List[str]:
+    warnings: List[str] = []
+    if mode == "hybrid" and any("fts_fallback" in result.rank_reason for result in results):
+        warnings.append("hybrid_fallback_to_fts")
+    status = _safe_embedding_status(db_path)
+    if mode == "hybrid" and not status.get("ready"):
+        warnings.append("missing_embedding_index")
+    if not results:
+        warnings.append("no_search_results")
+    return _unique_strings(warnings)
+
+
+def _safe_embedding_status(db_path: Path) -> Dict[str, object]:
+    try:
+        return semantic_index_status(db_path)
+    except EmbeddingError as exc:
+        return {
+            "schema": "semantic_index_status.v1",
+            "ready": False,
+            "error": str(exc),
+        }
+
+
+def _row_dict(row) -> Dict[str, object]:  # type: ignore[no-untyped-def]
+    if isinstance(row, dict):
+        return dict(row)
+    return dict(row)
+
+
+def _optional_float(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _unique_strings(values: Iterable[str]) -> List[str]:
+    seen = set()
+    result = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result

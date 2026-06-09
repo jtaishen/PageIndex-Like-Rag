@@ -14,9 +14,9 @@ parse -> normalize -> tree -> artifacts -> indexes -> evidence packet -> CLI / M
 - 解析后生成 `raw_text.txt`、`body.md`、`structured.json`、`metadata.json`、`references.json`、`parse_report.json`、`tree.json`、`node_index.jsonl`、`doc_card.json` 等工件。
 - 对中文论文常见结构做规则识别，包括摘要、关键词、第 X 章、`1.1`/`1.1.1` 小节、结论、参考文献、图和表。
 - 将文档保存为 `documents` 和 `doc_nodes`。
-- 使用 SQLite FTS5 做全文检索。
+- 使用 SQLite FTS5 做全文检索，并支持本地 embedding + hybrid rerank。
 - 返回带 `doc_id`、`node_id`、`node_path`、页码和 excerpt 的 evidence packet。
-- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`parse-report`、`extract`、`innovations`、`citations`。
+- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`parse-report`、`embed`、`search-report`、`eval-search`、`extract`、`innovations`、`citations`。
 - 支持跨论文比较和综述规划任务工件，生成比较矩阵、综述大纲、章节证据表和下一步行动。
 - 支持长期 memory 写入门控、任务进度记忆、任务恢复和任务进度压缩。
 - 提供可选 MCP server，供 OpenCode 调用。
@@ -225,6 +225,49 @@ uv run python -m kb_agent.cli parse-report <doc_id>
 
 `parse_report.json` 会记录 `parser_chain`、`fallback_used`、外部解析器失败原因和 adapter 状态；Marker 本轮只作为可检测占位，不作为默认解析器。`parse_quality` 会输出 `metadata_score`、`structure_score`、`reference_score`、`warning_count` 和 `quality_level`。
 
+## v0.9 混合检索、重排与评测
+
+v0.9 在 FTS5 基础上增加本地 embedding、混合检索和搜索评测。默认 provider 是离线可用的 `hash`，不会下载模型；如果没有构建 embedding，`hybrid` 会自动降级为 FTS。
+
+构建语义索引：
+
+```bash
+uv run python -m kb_agent.cli embed --provider hash --force
+```
+
+同步后立即构建默认 embedding：
+
+```bash
+uv run --extra pdf python -m kb_agent.cli sync articles --force --pdf-parser pypdf --build-embeddings
+```
+
+查看混合检索候选、融合分数和降级原因：
+
+```bash
+uv run python -m kb_agent.cli search-report "多智能体任务规划的主要方法"
+```
+
+问答、比较和综述规划都可以选择检索模式：
+
+```bash
+uv run python -m kb_agent.cli ask "这两篇论文的任务规划方法有什么区别？" --no-llm --search-mode hybrid
+uv run python -m kb_agent.cli compare "服务机器人与多智能体任务规划方法对比" --no-llm --search-mode hybrid
+uv run python -m kb_agent.cli generate-review "任务规划方法研究综述" --no-llm --search-mode hybrid
+```
+
+运行搜索评测：
+
+```bash
+uv run python -m kb_agent.cli eval-search tests/fixtures/search_eval_queries.json --search-mode hybrid
+```
+
+如果需要 sentence-transformers：
+
+```bash
+uv sync --extra embeddings
+KB_EMBEDDING_PROVIDER=sentence-transformers uv run python -m kb_agent.cli embed --force
+```
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
@@ -237,6 +280,12 @@ uv sync --extra pdf
 
 ```bash
 uv sync --extra pdf --extra docling
+```
+
+如果要启用 sentence-transformers embedding 增强：
+
+```bash
+uv sync --extra embeddings
 ```
 
 如果要启用 OpenCode MCP server：
@@ -296,7 +345,7 @@ DeepSeek 官方 OpenCode 接入方式：
 推荐工具调用顺序：
 
 ```text
-kb_sync -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
+kb_sync -> kb_build_semantic_index -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
 ```
 
 ## 测试
@@ -307,5 +356,4 @@ uv run python -m unittest discover -s tests
 
 ## 后续阶段
 
-- 增加 embedding / rerank / eval，进一步提升跨论文检索质量。
-- 增加 OpenCode plugin hook 和更完整的评测报告。
+- 增加更完整的评测报告、查询日志分析和 OpenCode plugin hook。

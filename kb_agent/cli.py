@@ -9,11 +9,13 @@ from . import db
 from .answer import answer_query, route_documents
 from .artifacts import get_citation_map, get_doc_card, get_innovations, get_parse_quality, get_parse_report, list_artifacts
 from .config import resolve_db_path
+from .embeddings import build_semantic_index
+from .eval import eval_search
 from .ingest import sync_directory
 from .insights import extract_doc_insights
 from .memory import compact_memory, put_memory_gated, remember_task, resume_task, search_memory
 from .review import assemble_review, check_review_citations, draft_review
-from .search import get_evidence, search_nodes
+from .search import build_search_report, get_evidence, search_nodes
 from .tasks import compare_papers, generate_review_plan, get_task_artifact
 
 
@@ -26,6 +28,7 @@ def main(argv: Any = None) -> None:
     sync_parser.add_argument("path")
     sync_parser.add_argument("--force", action="store_true")
     sync_parser.add_argument("--pdf-parser", choices=["auto", "pypdf", "docling", "grobid"], default=None)
+    sync_parser.add_argument("--build-embeddings", action="store_true", help="Build semantic index after sync")
 
     subparsers.add_parser("list", help="List indexed documents")
 
@@ -33,10 +36,28 @@ def main(argv: Any = None) -> None:
     search_parser.add_argument("query")
     search_parser.add_argument("--doc-id", default=None)
     search_parser.add_argument("--top-k", type=int, default=8)
+    search_parser.add_argument("--search-mode", choices=["hybrid", "fts"], default="hybrid")
 
     docs_parser = subparsers.add_parser("docs", help="Search candidate documents")
     docs_parser.add_argument("query")
     docs_parser.add_argument("--top-k", type=int, default=8)
+    docs_parser.add_argument("--search-mode", choices=["hybrid", "fts"], default="hybrid")
+
+    embed_parser = subparsers.add_parser("embed", help="Build semantic embeddings for ready documents")
+    embed_parser.add_argument("--doc-id", action="append", default=[], help="Build only one document id; repeatable")
+    embed_parser.add_argument("--force", action="store_true")
+    embed_parser.add_argument("--provider", choices=["hash", "sentence-transformers"], default=None)
+
+    report_parser = subparsers.add_parser("search-report", help="Explain hybrid search candidates and scores")
+    report_parser.add_argument("query")
+    report_parser.add_argument("--doc-id", default=None)
+    report_parser.add_argument("--top-k", type=int, default=8)
+    report_parser.add_argument("--search-mode", choices=["hybrid", "fts"], default="hybrid")
+
+    eval_parser = subparsers.add_parser("eval-search", help="Run a JSON search evaluation set")
+    eval_parser.add_argument("queries_json")
+    eval_parser.add_argument("--top-k", type=int, default=5)
+    eval_parser.add_argument("--search-mode", choices=["hybrid", "fts"], default="hybrid")
 
     tree_parser = subparsers.add_parser("tree", help="Show a document tree")
     tree_parser.add_argument("doc_id")
@@ -73,6 +94,7 @@ def main(argv: Any = None) -> None:
     compare_parser.add_argument("--top-k-docs", type=int, default=5)
     compare_parser.add_argument("--no-llm", action="store_true", help="Use rule-based comparison only")
     compare_parser.add_argument("--require-llm", action="store_true", help="Fail if DeepSeek cannot be called")
+    compare_parser.add_argument("--search-mode", choices=["hybrid", "fts"], default="hybrid")
 
     review_parser = subparsers.add_parser("generate-review", help="Generate review planning task artifacts")
     review_parser.add_argument("topic")
@@ -80,6 +102,7 @@ def main(argv: Any = None) -> None:
     review_parser.add_argument("--top-k-docs", type=int, default=8)
     review_parser.add_argument("--no-llm", action="store_true", help="Use rule-based planning only")
     review_parser.add_argument("--require-llm", action="store_true", help="Fail if DeepSeek cannot be called")
+    review_parser.add_argument("--search-mode", choices=["hybrid", "fts"], default="hybrid")
 
     task_artifact_parser = subparsers.add_parser("task-artifact", help="Read a task artifact")
     task_artifact_parser.add_argument("task_id")
@@ -107,6 +130,7 @@ def main(argv: Any = None) -> None:
     ask_parser.add_argument("--no-llm", action="store_true", help="Only print evidence; do not call DeepSeek")
     ask_parser.add_argument("--require-llm", action="store_true", help="Fail if DeepSeek cannot be called")
     ask_parser.add_argument("--json", action="store_true", help="Print full JSON result")
+    ask_parser.add_argument("--search-mode", choices=["hybrid", "fts"], default="hybrid")
 
     mem_put_parser = subparsers.add_parser("memory-put", help="Store explicit long-term memory")
     mem_put_parser.add_argument("scope")
@@ -136,13 +160,25 @@ def main(argv: Any = None) -> None:
     db_path = resolve_db_path(args.db)
 
     if args.command == "sync":
-        _print_json(sync_directory(Path(args.path), db_path, force=args.force, pdf_parser=args.pdf_parser))
+        result = sync_directory(Path(args.path), db_path, force=args.force, pdf_parser=args.pdf_parser)
+        if args.build_embeddings:
+            result["semantic_index"] = build_semantic_index(db_path)
+        _print_json(result)
     elif args.command == "list":
         _list_documents(db_path)
     elif args.command == "search":
-        _print_json([result.__dict__ for result in search_nodes(db_path, args.query, args.doc_id, args.top_k)])
+        _print_json([
+            result.__dict__
+            for result in search_nodes(db_path, args.query, args.doc_id, args.top_k, search_mode=args.search_mode)
+        ])
     elif args.command == "docs":
-        _print_json(route_documents(db_path, args.query, args.top_k))
+        _print_json(route_documents(db_path, args.query, args.top_k, search_mode=args.search_mode))
+    elif args.command == "embed":
+        _print_json(build_semantic_index(db_path, doc_ids=args.doc_id or None, force=args.force, provider=args.provider))
+    elif args.command == "search-report":
+        _print_json(build_search_report(db_path, args.query, doc_id=args.doc_id, top_k=args.top_k, search_mode=args.search_mode))
+    elif args.command == "eval-search":
+        _print_json(_eval_summary(eval_search(db_path, Path(args.queries_json), search_mode=args.search_mode, top_k=args.top_k)))
     elif args.command == "tree":
         _print_tree(db_path, args.doc_id)
     elif args.command == "card":
@@ -174,6 +210,7 @@ def main(argv: Any = None) -> None:
             top_k_docs=args.top_k_docs,
             use_llm=not args.no_llm,
             require_llm=args.require_llm,
+            search_mode=args.search_mode,
         )
         _print_json(_task_summary(result))
     elif args.command == "generate-review":
@@ -184,6 +221,7 @@ def main(argv: Any = None) -> None:
             top_k_docs=args.top_k_docs,
             use_llm=not args.no_llm,
             require_llm=args.require_llm,
+            search_mode=args.search_mode,
         )
         _print_json(_task_summary(result))
     elif args.command == "task-artifact":
@@ -212,6 +250,7 @@ def main(argv: Any = None) -> None:
             top_k=args.top_k,
             use_llm=not args.no_llm,
             require_llm=args.require_llm,
+            search_mode=args.search_mode,
         )
         if args.json:
             _print_json(result)
@@ -346,6 +385,21 @@ def _review_summary(result: dict) -> dict:
         "artifact_paths": result.get("artifact_paths", {}),
         "warnings": report.get("warnings", []),
         "llm_error": result.get("llm_error", ""),
+    }
+
+
+def _eval_summary(result: dict) -> dict:
+    return {
+        "schema": result.get("schema"),
+        "path": result.get("path"),
+        "search_mode": result.get("search_mode"),
+        "query_count": result.get("query_count"),
+        "doc_recall_at_k": result.get("doc_recall_at_k"),
+        "node_keyword_hit_rate": result.get("node_keyword_hit_rate"),
+        "mrr": result.get("mrr"),
+        "evidence_count": result.get("evidence_count"),
+        "fallback_count": result.get("fallback_count"),
+        "weak_parse_quality_count": result.get("weak_parse_quality_count"),
     }
 
 

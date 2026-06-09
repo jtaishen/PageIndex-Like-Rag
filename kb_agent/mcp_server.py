@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 from .answer import answer_query, route_documents
 from .artifacts import get_artifact, get_citation_map, get_doc_card, get_innovations, get_parse_quality, get_parse_report
 from .config import resolve_db_path
+from .embeddings import build_semantic_index
 from .ingest import sync_directory
 from .insights import extract_doc_insights
 from .memory import compact_memory, put_memory_gated as write_memory_gated, remember_task, resume_task, search_memory
@@ -36,21 +37,37 @@ if FastMCP is not None:
         return sync_directory(Path(path), resolve_db_path(db_path), force=force, pdf_parser=pdf_parser)
 
     @mcp.tool()
-    def kb_search_docs(query: str, top_k: int = 8, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Route a query to candidate documents using the local full-text index."""
-        return route_documents(resolve_db_path(db_path), query, top_k=top_k)
+    def kb_search_docs(
+        query: str,
+        top_k: int = 8,
+        search_mode: str = "hybrid",
+        db_path: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Route a query to candidate documents using hybrid or FTS search."""
+        return route_documents(resolve_db_path(db_path), query, top_k=top_k, search_mode=search_mode)
+
+    @mcp.tool()
+    def kb_build_semantic_index(
+        doc_ids: Optional[List[str]] = None,
+        force: bool = False,
+        provider: Optional[str] = None,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build or refresh semantic embeddings for ready documents."""
+        return build_semantic_index(resolve_db_path(db_path), doc_ids=doc_ids, force=force, provider=provider)
 
     @mcp.tool()
     def kb_search_tree(
         doc_id: str,
         query: str,
         top_k: int = 8,
+        search_mode: str = "hybrid",
         db_path: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Search evidence nodes inside one indexed document."""
         return [
             result.__dict__
-            for result in search_nodes(resolve_db_path(db_path), query, doc_id=doc_id, top_k=top_k)
+            for result in search_nodes(resolve_db_path(db_path), query, doc_id=doc_id, top_k=top_k, search_mode=search_mode)
         ]
 
     @mcp.tool()
@@ -96,6 +113,7 @@ if FastMCP is not None:
         force: bool = False,
         use_llm: bool = True,
         require_llm: bool = False,
+        search_mode: str = "hybrid",
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Extract or refresh innovation and citation-map artifacts for one document."""
@@ -134,6 +152,7 @@ if FastMCP is not None:
             top_k_docs=top_k_docs,
             use_llm=use_llm,
             require_llm=require_llm,
+            search_mode=search_mode,
         )
 
     @mcp.tool()
@@ -143,6 +162,7 @@ if FastMCP is not None:
         top_k_docs: int = 8,
         use_llm: bool = True,
         require_llm: bool = False,
+        search_mode: str = "hybrid",
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Generate review planning artifacts with section-level evidence."""
@@ -153,6 +173,7 @@ if FastMCP is not None:
             top_k_docs=top_k_docs,
             use_llm=use_llm,
             require_llm=require_llm,
+            search_mode=search_mode,
         )
 
     @mcp.tool()
@@ -196,10 +217,11 @@ if FastMCP is not None:
         query: str,
         top_k: int = 6,
         use_llm: bool = True,
+        search_mode: str = "hybrid",
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Return a grounded answer draft plus evidence packets."""
-        return answer_query(resolve_db_path(db_path), query, top_k=top_k, use_llm=use_llm)
+        return answer_query(resolve_db_path(db_path), query, top_k=top_k, use_llm=use_llm, search_mode=search_mode)
 
     @mcp.tool()
     def memory_put(

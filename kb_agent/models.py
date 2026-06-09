@@ -101,3 +101,7 @@ class SearchResult:
     score: float
     page_start: Optional[int]
     page_end: Optional[int]
+    fts_score: Optional[float] = None
+    vector_score: Optional[float] = None
+    hybrid_score: Optional[float] = None
+    rank_reason: str = ""

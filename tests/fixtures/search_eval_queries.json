@@ -1,0 +1,14 @@
+[
+  {
+    "query": "多智能体任务规划的主要方法",
+    "expected_doc_ids": [],
+    "expected_node_keywords": ["任务规划"],
+    "intent": "method"
+  },
+  {
+    "query": "服务机器人任务规划有哪些实验结果",
+    "expected_doc_ids": [],
+    "expected_node_keywords": ["实验"],
+    "intent": "result"
+  }
+]

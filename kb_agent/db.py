@@ -9,7 +9,7 @@ import json
 from .models import DocumentRecord, EvidencePacket, NodeRecord
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -125,10 +125,36 @@ def init_db(conn: sqlite3.Connection) -> None:
             updated_at REAL NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS node_embeddings (
+            node_id TEXT NOT NULL REFERENCES doc_nodes(node_id) ON DELETE CASCADE,
+            doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+            content_hash TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            dim INTEGER NOT NULL,
+            vector_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY(node_id, provider, model)
+        );
+
+        CREATE TABLE IF NOT EXISTS document_embeddings (
+            doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+            content_hash TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            dim INTEGER NOT NULL,
+            vector_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY(doc_id, provider, model)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_doc_nodes_doc_id ON doc_nodes(doc_id);
         CREATE INDEX IF NOT EXISTS idx_doc_nodes_parent_id ON doc_nodes(parent_id);
         CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path);
         CREATE INDEX IF NOT EXISTS idx_document_versions_doc_id ON document_versions(doc_id);
+        CREATE INDEX IF NOT EXISTS idx_node_embeddings_doc_id ON node_embeddings(doc_id);
+        CREATE INDEX IF NOT EXISTS idx_node_embeddings_provider_model ON node_embeddings(provider, model);
+        CREATE INDEX IF NOT EXISTS idx_document_embeddings_provider_model ON document_embeddings(provider, model);
         """
     )
     _ensure_columns(
@@ -184,6 +210,8 @@ def delete_document_by_path(conn: sqlite3.Connection, path: str) -> None:
 
 def delete_document(conn: sqlite3.Connection, doc_id: str) -> None:
     conn.execute("DELETE FROM doc_nodes_fts WHERE doc_id = ?", (doc_id,))
+    conn.execute("DELETE FROM node_embeddings WHERE doc_id = ?", (doc_id,))
+    conn.execute("DELETE FROM document_embeddings WHERE doc_id = ?", (doc_id,))
     conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
 
 
@@ -386,6 +414,210 @@ def get_doc_tree_rows(conn: sqlite3.Connection, doc_id: str) -> List[sqlite3.Row
         """,
         (doc_id,),
     ).fetchall()
+
+
+def get_ready_document_rows(conn: sqlite3.Connection, doc_ids: Optional[List[str]] = None) -> List[sqlite3.Row]:
+    if doc_ids:
+        placeholders = ",".join("?" for _ in doc_ids)
+        return conn.execute(
+            f"""
+            SELECT *
+            FROM documents
+            WHERE status = 'ready' AND doc_id IN ({placeholders})
+            ORDER BY updated_at DESC, title ASC
+            """,
+            doc_ids,
+        ).fetchall()
+    return conn.execute(
+        """
+        SELECT *
+        FROM documents
+        WHERE status = 'ready'
+        ORDER BY updated_at DESC, title ASC
+        """
+    ).fetchall()
+
+
+def get_indexable_node_rows(conn: sqlite3.Connection, doc_ids: Optional[List[str]] = None) -> List[sqlite3.Row]:
+    params: List[object] = []
+    doc_filter = ""
+    if doc_ids:
+        placeholders = ",".join("?" for _ in doc_ids)
+        doc_filter = f"AND n.doc_id IN ({placeholders})"
+        params.extend(doc_ids)
+    return conn.execute(
+        f"""
+        SELECT n.*, d.title
+        FROM doc_nodes n
+        JOIN documents d ON d.doc_id = n.doc_id
+        WHERE d.status = 'ready'
+          AND n.type != 'document'
+          AND COALESCE(NULLIF(n.text, ''), NULLIF(n.summary, ''), NULLIF(n.heading, '')) IS NOT NULL
+          {doc_filter}
+        ORDER BY n.doc_id, n.order_index ASC
+        """,
+        params,
+    ).fetchall()
+
+
+def get_existing_node_embedding(
+    conn: sqlite3.Connection,
+    node_id: str,
+    provider: str,
+    model: str,
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT *
+        FROM node_embeddings
+        WHERE node_id = ? AND provider = ? AND model = ?
+        """,
+        (node_id, provider, model),
+    ).fetchone()
+
+
+def get_existing_document_embedding(
+    conn: sqlite3.Connection,
+    doc_id: str,
+    provider: str,
+    model: str,
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT *
+        FROM document_embeddings
+        WHERE doc_id = ? AND provider = ? AND model = ?
+        """,
+        (doc_id, provider, model),
+    ).fetchone()
+
+
+def upsert_node_embedding(
+    conn: sqlite3.Connection,
+    *,
+    node_id: str,
+    doc_id: str,
+    content_hash: str,
+    provider: str,
+    model: str,
+    dim: int,
+    vector: List[float],
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO node_embeddings(
+            node_id, doc_id, content_hash, provider, model, dim, vector_json, created_at
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(node_id, provider, model) DO UPDATE SET
+            doc_id = excluded.doc_id,
+            content_hash = excluded.content_hash,
+            dim = excluded.dim,
+            vector_json = excluded.vector_json,
+            created_at = excluded.created_at
+        """,
+        (
+            node_id,
+            doc_id,
+            content_hash,
+            provider,
+            model,
+            dim,
+            json.dumps(vector),
+            time.time(),
+        ),
+    )
+
+
+def upsert_document_embedding(
+    conn: sqlite3.Connection,
+    *,
+    doc_id: str,
+    content_hash: str,
+    provider: str,
+    model: str,
+    dim: int,
+    vector: List[float],
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO document_embeddings(
+            doc_id, content_hash, provider, model, dim, vector_json, created_at
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(doc_id, provider, model) DO UPDATE SET
+            content_hash = excluded.content_hash,
+            dim = excluded.dim,
+            vector_json = excluded.vector_json,
+            created_at = excluded.created_at
+        """,
+        (
+            doc_id,
+            content_hash,
+            provider,
+            model,
+            dim,
+            json.dumps(vector),
+            time.time(),
+        ),
+    )
+
+
+def get_node_embedding_rows(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    model: str,
+    doc_id: Optional[str] = None,
+) -> List[sqlite3.Row]:
+    params: List[object] = [provider, model]
+    doc_filter = ""
+    if doc_id:
+        doc_filter = "AND e.doc_id = ?"
+        params.append(doc_id)
+    return conn.execute(
+        f"""
+        SELECT e.*, n.heading, n.summary, n.text, n.node_path, n.type,
+               n.page_start, n.page_end, n.order_index, d.title, d.path
+        FROM node_embeddings e
+        JOIN doc_nodes n ON n.node_id = e.node_id
+        JOIN documents d ON d.doc_id = e.doc_id
+        WHERE e.provider = ? AND e.model = ?
+          AND d.status = 'ready'
+          {doc_filter}
+        """,
+        params,
+    ).fetchall()
+
+
+def get_document_embedding_rows(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    model: str,
+) -> List[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT e.*, d.title, d.path, d.file_type, d.summary, d.abstract, d.keywords
+        FROM document_embeddings e
+        JOIN documents d ON d.doc_id = e.doc_id
+        WHERE e.provider = ? AND e.model = ?
+          AND d.status = 'ready'
+        """,
+        (provider, model),
+    ).fetchall()
+
+
+def embedding_counts(conn: sqlite3.Connection, provider: str, model: str) -> Dict[str, int]:
+    node_count = conn.execute(
+        "SELECT COUNT(*) AS count FROM node_embeddings WHERE provider = ? AND model = ?",
+        (provider, model),
+    ).fetchone()["count"]
+    doc_count = conn.execute(
+        "SELECT COUNT(*) AS count FROM document_embeddings WHERE provider = ? AND model = ?",
+        (provider, model),
+    ).fetchone()["count"]
+    return {"node_count": int(node_count or 0), "document_count": int(doc_count or 0)}
 
 
 def get_evidence_packets(

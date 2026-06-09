@@ -10,6 +10,7 @@ dependencies = []
 mcp = ["mcp>=1.10.0; python_version >= '3.10'"]
 pdf = ["pypdf>=5.0.0"]
 docling = ["docling>=2.0.0"]
+embeddings = ["sentence-transformers>=3.0.0"]
 
 [project.scripts]
 kb = "kb_agent.cli:main"

@@ -14,8 +14,9 @@ def answer_query(
     top_k: int = 6,
     use_llm: bool = True,
     require_llm: bool = False,
+    search_mode: str = "hybrid",
 ) -> Dict[str, object]:
-    results = search_nodes(db_path, query, top_k=top_k)
+    results = search_nodes(db_path, query, top_k=top_k, search_mode=search_mode)
     evidence = []
     for result in results:
         packets = get_evidence(db_path, result.doc_id, [result.node_id])
@@ -38,14 +39,15 @@ def answer_query(
 
     return {
         "query": query,
+        "search_mode": search_mode,
         "answer": "\n".join(lines),
         "evidence": evidence,
         "llm_error": llm_error,
     }
 
 
-def route_documents(db_path: Path, query: str, top_k: int = 8) -> List[Dict[str, object]]:
-    return search_documents(db_path, query, top_k=top_k)
+def route_documents(db_path: Path, query: str, top_k: int = 8, search_mode: str = "hybrid") -> List[Dict[str, object]]:
+    return search_documents(db_path, query, top_k=top_k, search_mode=search_mode)
 
 
 def _format_evidence_fallback(evidence: List[Dict[str, object]]) -> List[str]:

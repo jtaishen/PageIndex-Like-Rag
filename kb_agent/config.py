@@ -88,3 +88,4 @@ def ensure_data_dirs() -> None:
     (DATA_DIR / "parsed").mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "state").mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "logs").mkdir(parents=True, exist_ok=True)
+    (DATA_DIR / "eval").mkdir(parents=True, exist_ok=True)

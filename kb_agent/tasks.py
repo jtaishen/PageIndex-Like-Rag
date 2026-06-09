@@ -102,10 +102,11 @@ def compare_papers(
     top_k_docs: int = 5,
     use_llm: bool = True,
     require_llm: bool = False,
+    search_mode: str = "hybrid",
 ) -> Dict[str, Any]:
-    selected = _select_papers(db_path, query, doc_ids, top_k_docs)
+    selected = _select_papers(db_path, query, doc_ids, top_k_docs, search_mode)
     contexts, prepare_warnings = _prepare_paper_contexts(db_path, selected)
-    evidence_by_dimension = _collect_dimension_evidence(db_path, query, contexts, COMPARE_DIMENSIONS)
+    evidence_by_dimension = _collect_dimension_evidence(db_path, query, contexts, COMPARE_DIMENSIONS, search_mode)
     warnings = [*prepare_warnings]
     if len(contexts) < 2:
         warnings.append("insufficient_papers_for_comparison")
@@ -175,10 +176,11 @@ def generate_review_plan(
     top_k_docs: int = 8,
     use_llm: bool = True,
     require_llm: bool = False,
+    search_mode: str = "hybrid",
 ) -> Dict[str, Any]:
-    selected = _select_papers(db_path, topic, doc_ids, top_k_docs)
+    selected = _select_papers(db_path, topic, doc_ids, top_k_docs, search_mode)
     contexts, prepare_warnings = _prepare_paper_contexts(db_path, selected)
-    section_evidence = _collect_section_evidence(db_path, topic, contexts)
+    section_evidence = _collect_section_evidence(db_path, topic, contexts, search_mode)
     warnings = [*prepare_warnings]
     if not contexts:
         warnings.append("no_selected_papers")
@@ -275,10 +277,11 @@ def _select_papers(
     query: str,
     doc_ids: Optional[List[str]],
     top_k_docs: int,
+    search_mode: str,
 ) -> List[Dict[str, Any]]:
     if doc_ids:
         return [{"doc_id": doc_id, "score": None, "node_matches": None} for doc_id in _unique_strings(doc_ids)]
-    return search_documents(db_path, query, top_k=max(1, top_k_docs))
+    return search_documents(db_path, query, top_k=max(1, top_k_docs), search_mode=search_mode)
 
 
 def _prepare_paper_contexts(db_path: Path, selected: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], List[str]]:
@@ -335,6 +338,7 @@ def _collect_dimension_evidence(
     query: str,
     contexts: List[Dict[str, Any]],
     dimensions: List[Dict[str, Any]],
+    search_mode: str,
 ) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
     result: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
     for dimension in dimensions:
@@ -343,7 +347,7 @@ def _collect_dimension_evidence(
         terms = " ".join(str(term) for term in dimension["search_terms"])
         search_query = f"{query} {terms}"
         for context in contexts:
-            evidence = _search_doc_evidence(db_path, context["doc_id"], search_query, top_k=4)
+            evidence = _search_doc_evidence(db_path, context["doc_id"], search_query, top_k=4, search_mode=search_mode)
             if not evidence:
                 evidence = _innovation_evidence_for_dimension(context, dimension_id)[:3]
             result[dimension_id][context["doc_id"]] = evidence[:4]
@@ -354,6 +358,7 @@ def _collect_section_evidence(
     db_path: Path,
     topic: str,
     contexts: List[Dict[str, Any]],
+    search_mode: str,
 ) -> Dict[str, List[Dict[str, Any]]]:
     result: Dict[str, List[Dict[str, Any]]] = {}
     for section in REVIEW_SECTIONS:
@@ -362,13 +367,13 @@ def _collect_section_evidence(
         search_query = f"{topic} {terms}"
         evidence: List[Dict[str, Any]] = []
         for context in contexts:
-            evidence.extend(_search_doc_evidence(db_path, context["doc_id"], search_query, top_k=3))
+            evidence.extend(_search_doc_evidence(db_path, context["doc_id"], search_query, top_k=3, search_mode=search_mode))
         result[section_id] = _dedupe_evidence(evidence)[:12]
     return result
 
 
-def _search_doc_evidence(db_path: Path, doc_id: str, query: str, top_k: int) -> List[Dict[str, Any]]:
-    results = search_nodes(db_path, query, doc_id=doc_id, top_k=top_k)
+def _search_doc_evidence(db_path: Path, doc_id: str, query: str, top_k: int, search_mode: str = "hybrid") -> List[Dict[str, Any]]:
+    results = search_nodes(db_path, query, doc_id=doc_id, top_k=top_k, search_mode=search_mode)
     packets = []
     for result in results:
         packets.extend(packet.to_dict() for packet in get_evidence(db_path, result.doc_id, [result.node_id]))

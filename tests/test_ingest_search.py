@@ -13,13 +13,15 @@ from kb_agent import db
 from kb_agent.answer import answer_query
 from kb_agent.artifacts import get_artifact, get_citation_map, get_doc_card, get_innovations, get_parse_quality, get_parse_report, list_artifacts
 from kb_agent.cli import main as cli_main
+from kb_agent.embeddings import HashEmbeddingProvider, build_semantic_index
+from kb_agent.eval import eval_search
 from kb_agent.ingest import sync_directory
 from kb_agent.insights import extract_doc_insights
 from kb_agent.llm import LLMError
 from kb_agent.memory import compact_memory, put_memory_gated, remember_task, resume_task, search_memory
 from kb_agent.models import ParsedBlock, ParsedDocument
 from kb_agent.review import assemble_review, check_review_citations, draft_review
-from kb_agent.search import get_evidence, search_documents, search_nodes
+from kb_agent.search import build_search_report, get_evidence, search_documents, search_nodes
 from kb_agent.tasks import compare_papers, generate_review_plan, get_task_artifact
 
 
@@ -644,6 +646,113 @@ class IngestSearchTest(unittest.TestCase):
                 cli_main(["--db", str(db_path), "memory-compact", "--scope", "project"])
             self.assertIn("memory_compact.v1", stdout.getvalue())
 
+    def test_hash_embedding_index_is_stable_and_skips_unchanged_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, _ = _sync_insight_sample(Path(tmp))
+            provider = HashEmbeddingProvider()
+            vector_a = provider.embed("多智能体任务规划")
+            vector_b = provider.embed("多智能体任务规划")
+            self.assertEqual(vector_a, vector_b)
+            self.assertEqual(len(vector_a), 256)
+
+            first = build_semantic_index(db_path, force=True, provider="hash")
+            self.assertEqual(first["schema"], "semantic_index.v1")
+            self.assertGreater(first["indexed_nodes"], 0)
+            self.assertGreater(first["indexed_documents"], 0)
+
+            second = build_semantic_index(db_path, provider="hash")
+            self.assertEqual(second["indexed_nodes"], 0)
+            self.assertGreater(second["skipped_nodes"], 0)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "embed", "--provider", "hash"])
+            self.assertIn("semantic_index.v1", stdout.getvalue())
+
+    def test_hybrid_search_falls_back_without_embedding_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_id = _sync_insight_sample(Path(tmp))
+            results = search_nodes(db_path, "动态角色", top_k=3, search_mode="hybrid")
+            self.assertGreaterEqual(len(results), 1)
+            self.assertIn("fts_fallback", results[0].rank_reason)
+
+            report = build_search_report(db_path, "动态角色", top_k=3, search_mode="hybrid")
+            self.assertIn("missing_embedding_index", report["warnings"])
+            self.assertEqual(report["effective_search_mode"], "fts")
+
+            fts_results = search_nodes(db_path, "动态角色", top_k=3, search_mode="fts")
+            self.assertGreaterEqual(len(fts_results), 1)
+            self.assertEqual(fts_results[0].doc_id, doc_id)
+
+    def test_hybrid_search_uses_vector_candidates(self) -> None:
+        class FakeProvider:
+            name = "hash"
+            model = "fake-semantic-v1"
+            dim = 2
+
+            def embed(self, text: str) -> list[float]:
+                if "目标节点" in text or "语义查询" in text:
+                    return [1.0, 0.0]
+                return [0.0, 1.0]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "target.txt").write_text(
+                "摘要：本文提出目标节点方法，用于机器人协同规划。\n\n"
+                "第一章 方法\n目标节点方法通过共享任务图完成协作。\n",
+                encoding="utf-8",
+            )
+            (papers / "other.txt").write_text(
+                "摘要：本文研究普通调度规则。\n\n第一章 方法\n普通调度规则依赖人工配置。\n",
+                encoding="utf-8",
+            )
+            sync_directory(papers, db_path)
+            provider = FakeProvider()
+            with mock.patch("kb_agent.embeddings.get_embedding_provider", return_value=provider):
+                build_semantic_index(db_path, force=True)
+            with mock.patch("kb_agent.search.get_embedding_provider", return_value=provider):
+                results = search_nodes(db_path, "语义查询", top_k=2, search_mode="hybrid")
+
+            self.assertGreaterEqual(len(results), 1)
+            self.assertIn("target", results[0].path)
+            self.assertIn("vector", results[0].rank_reason)
+            self.assertIsNotNone(results[0].vector_score)
+
+    def test_search_eval_writes_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path, doc_id = _sync_insight_sample(root)
+            build_semantic_index(db_path, force=True, provider="hash")
+            queries_path = root / "queries.json"
+            queries_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "query": "动态角色任务规划",
+                            "expected_doc_ids": [doc_id],
+                            "expected_node_keywords": ["动态角色"],
+                            "intent": "method",
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            report = eval_search(db_path, queries_path, search_mode="hybrid", top_k=3)
+            self.assertEqual(report["schema"], "search_eval.v1")
+            self.assertEqual(report["query_count"], 1)
+            self.assertGreaterEqual(report["doc_recall_at_k"], 1.0)
+            self.assertTrue(Path(report["path"]).exists())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "eval-search", str(queries_path), "--search-mode", "hybrid"])
+            self.assertIn("search_eval.v1", stdout.getvalue())
+
     def test_pdf_parser_choice_pypdf_records_quality_chain(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -813,7 +922,7 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(parse_report["status"], "failed")
             self.assertIn("Cannot read DOCX", parse_report["error"])
 
-    def test_v1_database_migrates_to_v2(self) -> None:
+    def test_v1_database_migrates_to_v3(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "v1.sqlite"
             conn = sqlite3.connect(db_path)
@@ -863,12 +972,15 @@ class IngestSearchTest(unittest.TestCase):
                 db.init_db(conn)
                 doc_columns = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
                 node_columns = {row["name"] for row in conn.execute("PRAGMA table_info(doc_nodes)")}
+                tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
                 self.assertIn("authors", doc_columns)
                 self.assertIn("parser_version", doc_columns)
                 self.assertIn("keywords", node_columns)
                 self.assertIn("source_offsets", node_columns)
                 self.assertIn("doc_hash", node_columns)
-                self.assertEqual(conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()["value"], "2")
+                self.assertIn("node_embeddings", tables)
+                self.assertIn("document_embeddings", tables)
+                self.assertEqual(conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()["value"], "3")
             finally:
                 conn.close()
 
