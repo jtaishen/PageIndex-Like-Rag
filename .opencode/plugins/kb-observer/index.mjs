@@ -10,6 +10,10 @@ const OBSERVED_TOOLS = new Set([
   "kb_eval_review",
   "kb_eval_memory",
   "kb_eval_facts",
+  "kb_create_eval_suite",
+  "kb_run_benchmark",
+  "kb_analyze_failures",
+  "kb_generate_case_study",
   "kb_get_table_content",
   "kb_get_table_summaries",
   "kb_put_feedback",
@@ -28,6 +32,7 @@ const SENSITIVE_KEYS = new Set([
   "evidence",
   "review_draft",
   "section_drafts",
+  "snippet",
   "rows",
   "cells",
   "table_content",
@@ -171,6 +176,36 @@ function summarizeMetrics(tool, safe, coverage) {
       table_backed_fact_count: numberValue(safe.table_backed_fact_count),
       low_confidence_count: numberValue(safe.low_confidence_count),
       duplicate_group_count: numberValue(safe.duplicate_group_count),
+    };
+  }
+  if (tool === "kb_create_eval_suite") {
+    return {
+      query_count: numberValue(safe.query_count),
+      source_count: numberValue(safe.sources?.length),
+      warning_count: numberValue(safe.warnings?.length),
+    };
+  }
+  if (tool === "kb_run_benchmark") {
+    return {
+      query_count: numberValue(safe.query_count),
+      mode_count: numberValue(safe.compare_modes?.length),
+      best_mode_by_score: stringValue(safe.best_mode_by_score),
+      best_mode_by_node_recall: stringValue(safe.best_mode_by_node_recall),
+      warning_count: numberValue(safe.warnings?.length),
+    };
+  }
+  if (tool === "kb_analyze_failures") {
+    return {
+      failure_count: numberValue(safe.failure_count),
+      next_action_count: numberValue(safe.next_actions?.length),
+    };
+  }
+  if (tool === "kb_generate_case_study") {
+    return {
+      mode_count: numberValue(safe.compare_modes?.length),
+      evidence_count: numberValue(safe?.evidence_summary?.count),
+      fact_match_count: numberValue(safe?.fact_matches?.count),
+      warning_count: numberValue(safe.warnings?.length),
     };
   }
   if (tool === "kb_get_table_content" || tool === "kb_get_table_summaries") {

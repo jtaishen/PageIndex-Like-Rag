@@ -17,6 +17,14 @@ from .artifacts import (
     get_table_summaries,
     get_tables,
 )
+from .benchmark import (
+    analyze_failures,
+    create_eval_suite,
+    generate_case_study,
+    get_eval_suite,
+    list_eval_suites,
+    run_benchmark,
+)
 from .config import resolve_db_path
 from .embeddings import build_semantic_index, semantic_index_status
 from .eval import eval_facts, eval_memory, eval_review, eval_search
@@ -118,6 +126,76 @@ if FastMCP is not None:
     def kb_eval_facts(doc_ids: Optional[List[str]] = None, db_path: Optional[str] = None) -> Dict[str, Any]:
         """Evaluate grounded fact coverage, confidence, duplicates, and table-backed facts."""
         return eval_facts(resolve_db_path(db_path), doc_ids=doc_ids)
+
+    @mcp.tool()
+    def kb_create_eval_suite(
+        name: str,
+        input_json: Optional[str] = None,
+        from_feedback: bool = False,
+        from_query_log: bool = False,
+        doc_ids: Optional[List[str]] = None,
+        limit: int = 100,
+        min_rating: int = 4,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create a reusable evaluation suite without storing evidence text."""
+        return create_eval_suite(
+            resolve_db_path(db_path),
+            name,
+            input_json=Path(input_json) if input_json else None,
+            from_feedback=from_feedback,
+            from_query_log=from_query_log,
+            doc_ids=doc_ids,
+            limit=limit,
+            min_rating=min_rating,
+        )
+
+    @mcp.tool()
+    def kb_list_eval_suites() -> Dict[str, Any]:
+        """List saved local evaluation suites."""
+        return list_eval_suites()
+
+    @mcp.tool()
+    def kb_get_eval_suite(name: str) -> Dict[str, Any]:
+        """Return one saved local evaluation suite."""
+        return get_eval_suite(name)
+
+    @mcp.tool()
+    def kb_run_benchmark(
+        suite_name: str,
+        compare_modes: Optional[List[str]] = None,
+        top_k: int = 5,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Run a retrieval benchmark across fts/hybrid/tree/auto modes."""
+        return run_benchmark(
+            resolve_db_path(db_path),
+            suite_name,
+            compare_modes=compare_modes,
+            top_k=top_k,
+        )
+
+    @mcp.tool()
+    def kb_analyze_failures(benchmark_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Analyze benchmark misses, fallbacks, weak parse warnings, and next actions."""
+        return analyze_failures(resolve_db_path(db_path), benchmark_id)
+
+    @mcp.tool()
+    def kb_generate_case_study(
+        query: str,
+        doc_ids: Optional[List[str]] = None,
+        compare_modes: Optional[List[str]] = None,
+        top_k: int = 5,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Generate a retrieval case study with mode summaries and no evidence body text."""
+        return generate_case_study(
+            resolve_db_path(db_path),
+            query,
+            doc_ids=doc_ids,
+            compare_modes=compare_modes,
+            top_k=top_k,
+        )
 
     @mcp.tool()
     def kb_get_query_log(

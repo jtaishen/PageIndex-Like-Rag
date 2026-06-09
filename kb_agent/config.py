@@ -90,4 +90,5 @@ def ensure_data_dirs() -> None:
     (DATA_DIR / "logs").mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "eval").mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "eval_sets").mkdir(parents=True, exist_ok=True)
+    (DATA_DIR / "eval_suites").mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "state" / "search_profiles").mkdir(parents=True, exist_ok=True)

@@ -16,7 +16,7 @@ parse -> normalize -> tree -> artifacts -> indexes -> evidence packet -> CLI / M
 - 将文档保存为 `documents` 和 `doc_nodes`。
 - 使用 SQLite FTS5 做全文检索，并支持本地 embedding + hybrid rerank。
 - 返回带 `doc_id`、`node_id`、`node_path`、页码和 excerpt 的 evidence packet。
-- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`parse-report`、`layout`、`tables`、`table-content`、`table-summaries`、`embed`、`search-report`、`eval-search`、`eval-review`、`eval-memory`、`eval-facts`、`query-log`、`query-stats`、`feedback-put`、`feedback-to-eval`、`eval-dashboard`、`tune-search`、`search-profile`、`extract`、`innovations`、`citations`、`extract-facts`、`claims`、`entities`、`relations`、`fact-search`。
+- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`parse-report`、`layout`、`tables`、`table-content`、`table-summaries`、`embed`、`search-report`、`eval-search`、`eval-review`、`eval-memory`、`eval-facts`、`eval-suite`、`benchmark`、`analyze-failures`、`case-study`、`query-log`、`query-stats`、`feedback-put`、`feedback-to-eval`、`eval-dashboard`、`tune-search`、`search-profile`、`extract`、`innovations`、`citations`、`extract-facts`、`claims`、`entities`、`relations`、`fact-search`。
 - 支持跨论文比较和综述规划任务工件，生成比较矩阵、综述大纲、章节证据表和下一步行动。
 - 支持长期 memory 写入门控、任务进度记忆、任务恢复和任务进度压缩。
 - 支持人工反馈闭环，可将用户评分、期望 doc/node/keyword 转为搜索评测集。
@@ -489,6 +489,35 @@ uv run python -m kb_agent.cli eval-facts --doc-id <doc_id>
 
 `eval-facts` 会生成 `fact_eval.v1` 到 `data/eval/`，统计 claim/entity/relation 数量、证据覆盖率、低置信率、重复率、无 `node_id` 事实数、表格事实覆盖率和弱解析 warning。`search-report` 的 `fact_matches` 会标出 `source_kind` 与 confidence；`eval-dashboard` 会展示最新事实评测与表格事实数量。
 
+## v0.17 真实评测套件与 PageIndex-like 核心能力验证
+
+v0.17 把零散评测升级为可复用的真实评测套件。评测套件只保存 query、期望 doc/node/keyword、期望事实来源和短标签；benchmark 报告只保存指标、ID、warning 和短摘要，不保存论文正文、长 excerpt 或 evidence packet。
+
+创建评测套件：
+
+```bash
+uv run python -m kb_agent.cli eval-suite create paper-core --input-json data/eval_sets/core_queries.json
+uv run python -m kb_agent.cli eval-suite create feedback-core --from-feedback --min-rating 4
+uv run python -m kb_agent.cli eval-suite list
+uv run python -m kb_agent.cli eval-suite show paper-core
+```
+
+比较 `fts / hybrid / tree / auto`：
+
+```bash
+uv run python -m kb_agent.cli benchmark paper-core --compare-modes fts,hybrid,tree,auto --top-k 5
+uv run python -m kb_agent.cli analyze-failures <benchmark_id>
+```
+
+复盘代表性查询：
+
+```bash
+uv run python -m kb_agent.cli case-study "这篇论文的方法设计是什么？" --doc-id <doc_id> --compare-modes hybrid,tree
+uv run python -m kb_agent.cli eval-dashboard --format html --since-days 7
+```
+
+`benchmark` 会生成 `benchmark_report.v1`，覆盖 doc recall、node recall、precision、MRR、表格事实命中率、tree trace 完整度、fallback 和弱解析风险。`analyze-failures` 会生成失败原因和 next actions，帮助判断下一步应该刷新 embedding、重建 PDF 工件、补充表格事实，还是调整评测样例。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
@@ -566,7 +595,7 @@ DeepSeek 官方 OpenCode 接入方式：
 推荐工具调用顺序：
 
 ```text
-kb_sync -> kb_build_semantic_index -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_get_layout_blocks -> kb_get_figures -> kb_get_tables -> kb_get_table_content -> kb_get_table_summaries -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_extract_facts -> kb_get_claims -> kb_get_entities -> kb_get_relations -> kb_get_fact_graph -> kb_fact_search -> kb_classify_query -> kb_tree_search -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> kb_eval_search -> kb_eval_review -> kb_eval_memory -> kb_eval_facts -> kb_get_query_stats -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
+kb_sync -> kb_build_semantic_index -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_get_layout_blocks -> kb_get_figures -> kb_get_tables -> kb_get_table_content -> kb_get_table_summaries -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_extract_facts -> kb_get_claims -> kb_get_entities -> kb_get_relations -> kb_get_fact_graph -> kb_fact_search -> kb_classify_query -> kb_tree_search -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> kb_eval_search -> kb_eval_review -> kb_eval_memory -> kb_eval_facts -> kb_create_eval_suite -> kb_run_benchmark -> kb_analyze_failures -> kb_generate_case_study -> kb_get_query_stats -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
 ```
 
 当用户明确指出某次结果好坏时，推荐追加：
@@ -581,6 +610,12 @@ kb_get_query_log -> kb_put_feedback -> kb_build_eval_set_from_feedback -> kb_eva
 kb_build_eval_set_from_feedback -> kb_eval_search -> kb_tune_search -> kb_apply_search_profile -> search_mode="auto"
 ```
 
+验证 PageIndex-like 树检索是否有效时，推荐追加：
+
+```text
+kb_create_eval_suite -> kb_run_benchmark -> kb_analyze_failures -> kb_generate_case_study -> kb_eval_dashboard
+```
+
 ## 测试
 
 ```bash
@@ -589,4 +624,4 @@ uv run python -m unittest discover -s tests
 
 ## 后续阶段
 
-- 继续增强扫描版 OCR、表格内容深度抽取、事实层评测和更完整的 OpenCode 多智能体工作流。
+- 继续增强扫描版 OCR、事实冲突检测、图谱可视化和更完整的 OpenCode 多智能体工作流。

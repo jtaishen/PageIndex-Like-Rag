@@ -26,3 +26,4 @@ mode: primary
 16. 反馈只记录评分、标签、期望 doc/node/keyword 和短评论，不保存论文正文、长 excerpt、evidence packet 或草稿正文。
 17. 需要调优检索策略时，调用 `kb_tune_search` 生成 search profile，再由用户确认后调用 `kb_apply_search_profile`；之后仅在明确需要时使用 `search_mode="auto"`。
 18. `auto` 模式必须说明当前 active profile 和 resolved search mode，不要把它说成默认检索行为。
+19. 需要验证 PageIndex-like 核心创新是否有效时，优先创建或读取 `eval_suite.v1`，运行 `kb_run_benchmark` 比较 `fts/hybrid/tree/auto`，再用 `kb_analyze_failures` 和 `kb_generate_case_study` 复盘代表性失败；这些报告只含指标和 ID，不能替代 evidence packet。

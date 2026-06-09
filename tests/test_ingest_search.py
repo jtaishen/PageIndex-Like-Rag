@@ -29,6 +29,14 @@ from kb_agent.artifacts import (
     get_tables,
     list_artifacts,
 )
+from kb_agent.benchmark import (
+    analyze_failures,
+    create_eval_suite,
+    generate_case_study,
+    get_eval_suite,
+    list_eval_suites,
+    run_benchmark,
+)
 from kb_agent.cli import main as cli_main
 from kb_agent.embeddings import HashEmbeddingProvider, build_semantic_index, semantic_index_status
 from kb_agent.eval import eval_facts, eval_memory, eval_review, eval_search
@@ -1315,6 +1323,132 @@ class IngestSearchTest(unittest.TestCase):
                 ])
             self.assertIn("search_eval.v2", stdout.getvalue())
 
+    def test_eval_suite_benchmark_failure_analysis_and_case_study(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path, doc_id = _sync_insight_sample(root)
+            build_semantic_index(db_path, force=True, provider="hash")
+            extract_doc_insights(db_path, doc_id, use_llm=False)
+            extract_facts(db_path, doc_id, force=True, use_llm=False)
+            node_index = get_artifact(db_path, doc_id, "node_index.jsonl")["content"]
+            target_node = next(node for node in node_index if "动态角色发现机制" in node.get("text", ""))
+            suite_name = f"paper_core_{root.name}"
+            suite_json = root / "suite.json"
+            suite_json.write_text(
+                json.dumps(
+                    {
+                        "schema": "eval_suite_seed.v1",
+                        "queries": [
+                            {
+                                "query": "动态角色任务规划方法",
+                                "intent": "method",
+                                "category": "core_retrieval",
+                                "expected_doc_ids": [doc_id],
+                                "expected_node_ids": [target_node["node_id"]],
+                                "expected_node_keywords": ["动态角色"],
+                            },
+                            {
+                                "query": "不存在的严格节点",
+                                "intent": "qa",
+                                "category": "expected_failure",
+                                "expected_doc_ids": [doc_id],
+                                "expected_node_ids": ["node_missing_for_test"],
+                                "expected_node_keywords": ["不存在关键词"],
+                            },
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            suite = create_eval_suite(db_path, suite_name, input_json=suite_json, doc_ids=[doc_id])
+            self.assertEqual(suite["schema"], "eval_suite.v1")
+            self.assertEqual(suite["query_count"], 3)
+            self.assertTrue(Path(suite["path"]).exists())
+            self.assertTrue(any(item["name"] == suite["name"] for item in list_eval_suites()["items"]))
+            self.assertEqual(get_eval_suite(suite_name)["suite_id"], suite["suite_id"])
+
+            benchmark = run_benchmark(db_path, suite_name, compare_modes=["hybrid", "tree", "fts"], top_k=3)
+            self.assertEqual(benchmark["schema"], "benchmark_report.v1")
+            self.assertEqual(set(benchmark["mode_results"].keys()), {"hybrid", "tree", "fts"})
+            self.assertTrue(Path(benchmark["path"]).exists())
+            self.assertTrue(Path(benchmark["md_path"]).exists())
+            self.assertIn(benchmark["best_mode_by_score"], {"hybrid", "tree", "fts"})
+            dumped_benchmark = json.dumps(benchmark, ensure_ascii=False)
+            self.assertNotIn("snippet", dumped_benchmark)
+            self.assertNotIn("excerpt", dumped_benchmark)
+            self.assertNotIn("实验结果表明，该方法在任务完成率", dumped_benchmark)
+
+            failure = analyze_failures(db_path, benchmark["benchmark_id"])
+            self.assertEqual(failure["schema"], "failure_analysis.v1")
+            self.assertGreaterEqual(failure["failure_count"], 1)
+            self.assertIn("node_recall_miss", failure["reason_counts"])
+            self.assertTrue(failure["next_actions"])
+
+            case = generate_case_study(
+                db_path,
+                "动态角色任务规划方法",
+                doc_ids=[doc_id],
+                compare_modes=["hybrid", "tree"],
+                top_k=3,
+            )
+            self.assertEqual(case["schema"], "case_study.v1")
+            self.assertEqual(set(case["mode_reports"].keys()), {"hybrid", "tree"})
+            self.assertEqual(case["query_profile"]["intent"], "method")
+            self.assertTrue(Path(case["path"]).exists())
+            self.assertTrue(Path(case["md_path"]).exists())
+            dumped_case = json.dumps(case, ensure_ascii=False)
+            self.assertNotIn("snippet", dumped_case)
+            self.assertNotIn("excerpt", dumped_case)
+            self.assertNotIn("实验结果表明，该方法在任务完成率", dumped_case)
+
+            dashboard = eval_dashboard(db_path)
+            self.assertTrue(dashboard["latest_benchmarks"])
+            self.assertTrue(dashboard["latest_failure_analyses"])
+            self.assertTrue(dashboard["latest_case_studies"])
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "eval-suite", "create", f"{suite_name}_cli", "--input-json", str(suite_json)])
+            self.assertIn("eval_suite.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "eval-suite", "list"])
+            self.assertIn("eval_suite_list.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "eval-suite", "show", suite_name])
+            self.assertIn("eval_suite.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "benchmark", suite_name, "--compare-modes", "hybrid,tree", "--top-k", "3"])
+            benchmark_stdout = stdout.getvalue()
+            self.assertIn("benchmark_report.v1", benchmark_stdout)
+            cli_benchmark_id = json.loads(benchmark_stdout)["benchmark_id"]
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "analyze-failures", cli_benchmark_id])
+            self.assertIn("failure_analysis.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main([
+                    "--db",
+                    str(db_path),
+                    "case-study",
+                    "动态角色任务规划方法",
+                    "--doc-id",
+                    doc_id,
+                    "--compare-modes",
+                    "hybrid,tree",
+                ])
+            self.assertIn("case_study.v1", stdout.getvalue())
+
     def test_eval_review_and_memory_reports(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path, doc_ids = _sync_compare_samples(Path(tmp))
@@ -1603,7 +1737,16 @@ class IngestSearchTest(unittest.TestCase):
         self.assertIn("kb_put_feedback", content)
         self.assertIn("kb_tune_search", content)
         self.assertIn("kb_apply_search_profile", content)
+        self.assertIn("kb_run_benchmark", content)
+        self.assertIn("kb_analyze_failures", content)
+        self.assertIn("kb_generate_case_study", content)
+        self.assertIn("snippet", content)
         self.assertIn("feedback_hint", content)
+        mcp_content = Path("kb_agent/mcp_server.py").read_text(encoding="utf-8")
+        self.assertIn("kb_create_eval_suite", mcp_content)
+        self.assertIn("kb_run_benchmark", mcp_content)
+        self.assertIn("kb_analyze_failures", mcp_content)
+        self.assertIn("kb_generate_case_study", mcp_content)
         node = shutil.which("node")
         if node:
             result = subprocess.run([node, "--check", str(plugin_path)], capture_output=True, text=True)

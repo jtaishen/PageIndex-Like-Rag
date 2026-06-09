@@ -21,6 +21,14 @@ from .artifacts import (
     get_tables,
     list_artifacts,
 )
+from .benchmark import (
+    analyze_failures,
+    create_eval_suite,
+    generate_case_study,
+    get_eval_suite,
+    list_eval_suites,
+    run_benchmark,
+)
 from .config import resolve_db_path
 from .embeddings import build_semantic_index, semantic_index_status
 from .eval import eval_facts, eval_memory, eval_review, eval_search
@@ -93,6 +101,34 @@ def main(argv: Any = None) -> None:
 
     eval_facts_parser = subparsers.add_parser("eval-facts", help="Evaluate grounded paper facts and table-backed coverage")
     eval_facts_parser.add_argument("--doc-id", action="append", default=[], help="Limit to one document id; repeatable")
+
+    eval_suite_parser = subparsers.add_parser("eval-suite", help="Create, list, or show reusable evaluation suites")
+    eval_suite_subparsers = eval_suite_parser.add_subparsers(dest="suite_command", required=True)
+    eval_suite_create = eval_suite_subparsers.add_parser("create", help="Create an eval suite from JSON, feedback, query logs, or docs")
+    eval_suite_create.add_argument("name")
+    eval_suite_create.add_argument("--input-json", default=None)
+    eval_suite_create.add_argument("--from-feedback", action="store_true")
+    eval_suite_create.add_argument("--from-query-log", action="store_true")
+    eval_suite_create.add_argument("--doc-id", action="append", default=[], help="Add document smoke cases; repeatable")
+    eval_suite_create.add_argument("--limit", type=int, default=100)
+    eval_suite_create.add_argument("--min-rating", type=int, default=4)
+    eval_suite_subparsers.add_parser("list", help="List saved eval suites")
+    eval_suite_show = eval_suite_subparsers.add_parser("show", help="Show one saved eval suite")
+    eval_suite_show.add_argument("name")
+
+    benchmark_parser = subparsers.add_parser("benchmark", help="Run a benchmark suite across search modes")
+    benchmark_parser.add_argument("suite_name")
+    benchmark_parser.add_argument("--compare-modes", default="fts,hybrid,tree,auto")
+    benchmark_parser.add_argument("--top-k", type=int, default=5)
+
+    failure_parser = subparsers.add_parser("analyze-failures", help="Analyze benchmark failures and next actions")
+    failure_parser.add_argument("benchmark_id")
+
+    case_parser = subparsers.add_parser("case-study", help="Generate a retrieval case study without evidence text")
+    case_parser.add_argument("query")
+    case_parser.add_argument("--doc-id", action="append", default=[], help="Limit case study to one document id; repeatable")
+    case_parser.add_argument("--compare-modes", default="hybrid,tree")
+    case_parser.add_argument("--top-k", type=int, default=5)
 
     classify_parser = subparsers.add_parser("classify-query", help="Classify a query intent for tree search")
     classify_parser.add_argument("query")
@@ -358,6 +394,51 @@ def main(argv: Any = None) -> None:
         _print_json(_memory_eval_summary(eval_memory(db_path)))
     elif args.command == "eval-facts":
         _print_json(_fact_eval_summary(eval_facts(db_path, doc_ids=args.doc_id or None)))
+    elif args.command == "eval-suite":
+        if args.suite_command == "create":
+            _print_json(
+                _suite_summary(
+                    create_eval_suite(
+                        db_path,
+                        args.name,
+                        input_json=Path(args.input_json) if args.input_json else None,
+                        from_feedback=args.from_feedback,
+                        from_query_log=args.from_query_log,
+                        doc_ids=args.doc_id or None,
+                        limit=args.limit,
+                        min_rating=args.min_rating,
+                    )
+                )
+            )
+        elif args.suite_command == "list":
+            _print_json(list_eval_suites())
+        elif args.suite_command == "show":
+            _print_json(get_eval_suite(args.name))
+    elif args.command == "benchmark":
+        _print_json(
+            _benchmark_cli_summary(
+                run_benchmark(
+                    db_path,
+                    args.suite_name,
+                    compare_modes=_comma_list(args.compare_modes),
+                    top_k=args.top_k,
+                )
+            )
+        )
+    elif args.command == "analyze-failures":
+        _print_json(_failure_cli_summary(analyze_failures(db_path, args.benchmark_id)))
+    elif args.command == "case-study":
+        _print_json(
+            _case_cli_summary(
+                generate_case_study(
+                    db_path,
+                    args.query,
+                    doc_ids=args.doc_id or None,
+                    compare_modes=_comma_list(args.compare_modes),
+                    top_k=args.top_k,
+                )
+            )
+        )
     elif args.command == "classify-query":
         _print_json(classify_query(args.query, use_llm=not args.no_llm, require_llm=args.require_llm))
     elif args.command == "tree-search":
@@ -848,6 +929,62 @@ def _fact_eval_summary(result: dict) -> dict:
         "duplicate_rate": result.get("duplicate_rate", 0.0),
         "table_backed_fact_count": result.get("table_backed_fact_count", 0),
         "table_backed_fact_rate": result.get("table_backed_fact_rate", 0.0),
+        "warnings": result.get("warnings") or [],
+    }
+
+
+def _suite_summary(result: dict) -> dict:
+    return {
+        "schema": result.get("schema"),
+        "path": result.get("path"),
+        "suite_id": result.get("suite_id"),
+        "name": result.get("name"),
+        "query_count": result.get("query_count", 0),
+        "sources": result.get("sources") or [],
+        "warnings": result.get("warnings") or [],
+    }
+
+
+def _benchmark_cli_summary(result: dict) -> dict:
+    return {
+        "schema": result.get("schema"),
+        "path": result.get("path"),
+        "md_path": result.get("md_path"),
+        "benchmark_id": result.get("benchmark_id"),
+        "suite_name": result.get("suite_name"),
+        "compare_modes": result.get("compare_modes") or [],
+        "query_count": result.get("query_count", 0),
+        "best_mode_by_score": result.get("best_mode_by_score"),
+        "best_mode_by_node_recall": result.get("best_mode_by_node_recall"),
+        "summary": result.get("summary") or {},
+        "warnings": result.get("warnings") or [],
+    }
+
+
+def _failure_cli_summary(result: dict) -> dict:
+    return {
+        "schema": result.get("schema"),
+        "path": result.get("path"),
+        "next_actions_path": result.get("next_actions_path"),
+        "benchmark_id": result.get("benchmark_id"),
+        "status": result.get("status"),
+        "failure_count": result.get("failure_count", 0),
+        "reason_counts": result.get("reason_counts") or {},
+        "next_actions": result.get("next_actions") or [],
+    }
+
+
+def _case_cli_summary(result: dict) -> dict:
+    return {
+        "schema": result.get("schema"),
+        "path": result.get("path"),
+        "md_path": result.get("md_path"),
+        "case_id": result.get("case_id"),
+        "query": result.get("query"),
+        "compare_modes": result.get("compare_modes") or [],
+        "intent": (result.get("query_profile") or {}).get("intent"),
+        "evidence_count": (result.get("evidence_summary") or {}).get("count", 0),
+        "fact_match_count": (result.get("fact_matches") or {}).get("count", 0),
         "warnings": result.get("warnings") or [],
     }
 
