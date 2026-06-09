@@ -30,6 +30,7 @@ from kb_agent.artifacts import (
 from kb_agent.cli import main as cli_main
 from kb_agent.embeddings import HashEmbeddingProvider, build_semantic_index, semantic_index_status
 from kb_agent.eval import eval_memory, eval_review, eval_search
+from kb_agent.facts import extract_facts, fact_search, get_claims, get_entities, get_fact_graph, get_relations
 from kb_agent.feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from kb_agent.ingest import sync_directory
 from kb_agent.insights import extract_doc_insights
@@ -292,6 +293,147 @@ class IngestSearchTest(unittest.TestCase):
             with contextlib.redirect_stdout(stdout):
                 cli_main(["--db", str(db_path), "extract", doc_id, "--force", "--no-llm"])
             self.assertIn("innovation.v1", stdout.getvalue())
+
+    def test_rule_based_fact_extraction_writes_artifacts_db_and_search(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_id = _sync_insight_sample(Path(tmp))
+            extract_doc_insights(db_path, doc_id, use_llm=False)
+
+            result = extract_facts(db_path, doc_id, use_llm=False)
+
+            self.assertEqual(result["schema"], "fact_extraction_result.v1")
+            report = result["fact_report"]
+            self.assertEqual(report["schema"], "fact_report.v1")
+            self.assertEqual(report["status"], "partial")
+            self.assertGreaterEqual(report["claim_count"], 3)
+            self.assertGreaterEqual(report["entity_count"], 3)
+            self.assertGreaterEqual(report["relation_count"], 3)
+
+            claims = get_claims(db_path, doc_id)
+            entities = get_entities(db_path, doc_id)
+            relations = get_relations(db_path, doc_id)
+            graph = get_fact_graph(db_path, doc_id)
+            self.assertEqual(claims["schema"], "claims.v1")
+            self.assertEqual(entities["schema"], "entities.v1")
+            self.assertEqual(relations["schema"], "relations.v1")
+            self.assertEqual(graph["schema"], "fact_graph.v1")
+
+            claim_types = {item["type"] for item in claims["claims"]}
+            self.assertIn("method", claim_types)
+            self.assertIn("limitation", claim_types)
+            entity_names = {item["name"] for item in entities["entities"]}
+            self.assertIn("动态角色", entity_names)
+            self.assertTrue(any("任务完成率" in name or "负载均衡" in name for name in entity_names))
+            relation_types = {item["type"] for item in relations["relations"]}
+            self.assertIn("cites", relation_types)
+            self.assertIn("supports", relation_types)
+
+            for collection in (claims["claims"], entities["entities"], relations["relations"]):
+                for item in collection:
+                    self.assertEqual(item["doc_id"], doc_id)
+                    self.assertTrue(item["version_id"])
+                    self.assertTrue(item["node_id"])
+                    self.assertIn("page_range", item)
+                    self.assertGreaterEqual(item["confidence"], 0)
+                    self.assertTrue(item["source"])
+
+            search = fact_search(db_path, "动态角色任务规划", doc_ids=[doc_id], top_k=5)
+            self.assertEqual(search["schema"], "fact_search.v1")
+            self.assertGreaterEqual(search["count"], 1)
+            self.assertTrue(any(item["fact_type"] in {"claim", "entity"} for item in search["items"]))
+
+            search_report = build_search_report(db_path, "动态角色任务规划", doc_id=doc_id, top_k=3)
+            self.assertIn("fact_matches", search_report)
+            self.assertGreaterEqual(search_report["fact_matches"]["count"], 1)
+
+            dashboard = eval_dashboard(db_path)
+            self.assertIn("fact_coverage", dashboard)
+            self.assertGreaterEqual(dashboard["fact_coverage"]["claim_count"], 3)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "extract-facts", doc_id, "--force", "--no-llm"])
+            self.assertIn("fact_extraction_result.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "claims", doc_id])
+            self.assertIn("claims.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "entities", doc_id])
+            self.assertIn("entities.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "relations", doc_id])
+            self.assertIn("relations.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "fact-graph", doc_id])
+            self.assertIn("fact_graph.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "fact-search", "动态角色", "--doc-id", doc_id, "--type", "claim"])
+            self.assertIn("fact_search.v1", stdout.getvalue())
+
+    def test_llm_fact_extraction_and_require_llm_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_id = _sync_insight_sample(Path(tmp))
+            node_id = get_artifact(db_path, doc_id, "node_index.jsonl")["content"][2]["node_id"]
+            payload = {
+                "claims": [
+                    {
+                        "type": "method",
+                        "text": "提出动态角色发现机制以提升任务分解效率。",
+                        "evidence": [node_id],
+                        "confidence": 0.84,
+                    }
+                ],
+                "entities": [
+                    {
+                        "type": "method",
+                        "name": "动态角色发现机制",
+                        "aliases": ["动态角色"],
+                        "evidence": [node_id],
+                        "confidence": 0.82,
+                    }
+                ],
+                "relations": [
+                    {
+                        "type": "uses",
+                        "subject": "动态角色发现机制",
+                        "object": "任务分解",
+                        "evidence": [node_id],
+                        "confidence": 0.78,
+                    }
+                ],
+                "warnings": [],
+            }
+
+            with mock.patch("kb_agent.facts.generate_json_object", return_value=payload):
+                result = extract_facts(db_path, doc_id, force=True, use_llm=True)
+
+            self.assertEqual(result["fact_report"]["status"], "extracted")
+            self.assertEqual(result["fact_report"]["source"], "llm")
+            self.assertEqual(result["claims"]["claims"][0]["confidence"], 0.84)
+            self.assertEqual(result["entities"]["entities"][0]["aliases"], ["动态角色"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_id = _sync_insight_sample(Path(tmp))
+            with mock.patch("kb_agent.facts.generate_json_object", side_effect=LLMError("boom")):
+                with self.assertRaises(LLMError):
+                    extract_facts(db_path, doc_id, force=True, use_llm=True, require_llm=True)
+            with self.assertRaises(FileNotFoundError):
+                get_claims(db_path, doc_id)
+
+            with mock.patch("kb_agent.facts.generate_json_object", side_effect=LLMError("boom")):
+                fallback = extract_facts(db_path, doc_id, force=True, use_llm=True)
+            self.assertEqual(fallback["fact_report"]["status"], "partial")
+            self.assertTrue(any("llm_unavailable:boom" in item for item in fallback["fact_report"]["warnings"]))
 
     def test_compare_writes_grounded_task_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1654,7 +1796,7 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(parse_report["status"], "failed")
             self.assertIn("Cannot read DOCX", parse_report["error"])
 
-    def test_v1_database_migrates_to_v5(self) -> None:
+    def test_v1_database_migrates_to_v6(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "v1.sqlite"
             conn = sqlite3.connect(db_path)
@@ -1716,7 +1858,10 @@ class IngestSearchTest(unittest.TestCase):
                 self.assertIn("operation", query_log_columns)
                 self.assertIn("metrics_json", query_log_columns)
                 self.assertIn("feedback_items", tables)
-                self.assertEqual(conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()["value"], "5")
+                self.assertIn("paper_claims", tables)
+                self.assertIn("paper_entities", tables)
+                self.assertIn("paper_relations", tables)
+                self.assertEqual(conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()["value"], "6")
             finally:
                 conn.close()
 

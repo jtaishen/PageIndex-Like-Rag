@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from .artifacts import get_citation_map, get_doc_card, get_innovations, get_parse_quality
 from .config import DEFAULT_DB_PATH, PROJECT_ROOT
+from .facts import fact_summary_for_doc
 from .insights import extract_doc_insights
 from .llm import LLMError, generate_json_object
 from .query_log import write_query_log
@@ -329,6 +330,7 @@ def _prepare_paper_contexts(db_path: Path, selected: List[Dict[str, Any]]) -> tu
             quality = get_parse_quality(db_path, doc_id)
             innovation, insight_warnings = _read_or_extract_insights(db_path, doc_id)
             citation_map = get_citation_map(db_path, doc_id)
+            facts = fact_summary_for_doc(db_path, doc_id)
         except (FileNotFoundError, KeyError, ValueError) as exc:
             warnings.append(f"paper_prepare_failed:{doc_id}:{exc}")
             continue
@@ -344,6 +346,7 @@ def _prepare_paper_contexts(db_path: Path, selected: List[Dict[str, Any]]) -> tu
                 "quality": quality,
                 "innovation": innovation,
                 "citation_map": citation_map,
+                "facts": facts,
                 "route_score": item.get("score"),
                 "node_matches": item.get("node_matches"),
             }
@@ -673,6 +676,7 @@ def _format_contexts_for_prompt(
         lines.append(f"description: {_excerpt(context.get('description', ''), 600)}")
         lines.append(f"keywords: {context.get('keywords', [])}")
         lines.append(f"innovation_items: {_format_innovations(context.get('innovation', {}))}")
+        lines.append(f"facts: {_format_fact_summary(context.get('facts', {}))}")
         for dimension in COMPARE_DIMENSIONS:
             dimension_id = str(dimension["id"])
             lines.append(f"dimension: {dimension_id}")
@@ -689,6 +693,7 @@ def _format_papers_for_prompt(contexts: List[Dict[str, Any]]) -> List[str]:
         lines.append(f"  title: {context['title']}")
         lines.append(f"  description: {_excerpt(context.get('description', ''), 500)}")
         lines.append(f"  innovations: {_format_innovations(context.get('innovation', {}), limit=4)}")
+        lines.append(f"  facts: {_format_fact_summary(context.get('facts', {}), limit=4)}")
     return lines
 
 
@@ -725,7 +730,21 @@ def _format_innovations(innovation: Dict[str, Any], limit: int = 5) -> List[Dict
     return items
 
 
+def _format_fact_summary(facts: Dict[str, Any], limit: int = 5) -> Dict[str, Any]:
+    if not facts or not facts.get("available"):
+        return {"available": False}
+    return {
+        "available": True,
+        "claim_count": facts.get("claim_count", 0),
+        "entity_count": facts.get("entity_count", 0),
+        "relation_count": facts.get("relation_count", 0),
+        "top_claims": facts.get("top_claims", [])[:limit],
+        "top_entities": facts.get("top_entities", [])[:limit],
+    }
+
+
 def _dimension_claim(context: Dict[str, Any], dimension_id: str, evidence: List[Dict[str, Any]]) -> str:
+    facts = context.get("facts") or {}
     if dimension_id == "innovation_overlap":
         claims = [
             _excerpt(str(item.get("claim") or item.get("title") or ""), 180)
@@ -734,6 +753,9 @@ def _dimension_claim(context: Dict[str, Any], dimension_id: str, evidence: List[
         ]
         if claims:
             return "；".join(claims[:2])
+        fact_claims = [str(item.get("text") or "") for item in facts.get("top_claims", []) if isinstance(item, dict)]
+        if fact_claims:
+            return "；".join(_excerpt(item, 180) for item in fact_claims[:2])
     if dimension_id == "limitations":
         limitations = context.get("innovation", {}).get("limitations") or []
         if limitations:
@@ -870,6 +892,7 @@ def _selected_papers_artifact(
     for context in contexts:
         citation_map = context.get("citation_map") or {}
         innovation = context.get("innovation") or {}
+        facts = context.get("facts") or {}
         papers.append(
             {
                 "doc_id": context["doc_id"],
@@ -882,6 +905,10 @@ def _selected_papers_artifact(
                 "innovation_status": innovation.get("status") or "",
                 "innovation_count": len(innovation.get("items") or []),
                 "citation_count": len(citation_map.get("references") or []),
+                "fact_available": bool(facts.get("available")),
+                "claim_count": facts.get("claim_count", 0),
+                "entity_count": facts.get("entity_count", 0),
+                "relation_count": facts.get("relation_count", 0),
                 "route_score": context.get("route_score"),
                 "node_matches": context.get("node_matches"),
             }

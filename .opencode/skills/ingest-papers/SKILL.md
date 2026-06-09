@@ -11,7 +11,8 @@ description: 将本地论文或文章目录同步到 PageIndex-like 知识库。
 4. 同步后调用 `kb_get_parse_quality`、`kb_get_parse_report` 和 `kb_get_layout_blocks` 查看解析质量、解析链、fallback 原因和版面块数量。
 5. 如果 PDF 出现 `page_only_tree`、`weak_layout_blocks`、`low_section_count` 或章节/图表识别弱，优先建议重新运行 `kb_sync(..., force=True, pdf_parser="docling")`；Docling 不可用时再回退 `pypdf` 并明确说明质量限制。
 6. 如果后续要做问答、比较或综述，调用 `kb_build_semantic_index` 构建默认 hash embedding。
-7. 最后可调用 `kb_search_docs` 做一次简单验证；需要复现旧检索行为时传入 `search_mode="fts"`。
+7. 如果后续需要结构化事实层，先调用 `kb_extract_doc_insights`，再调用 `kb_extract_facts` 生成 claims/entities/relations。
+8. 最后可调用 `kb_search_docs` 做一次简单验证；需要复现旧检索行为时传入 `search_mode="fts"`。
 
 注意：
 

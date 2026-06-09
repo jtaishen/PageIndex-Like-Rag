@@ -16,7 +16,7 @@ parse -> normalize -> tree -> artifacts -> indexes -> evidence packet -> CLI / M
 - 将文档保存为 `documents` 和 `doc_nodes`。
 - 使用 SQLite FTS5 做全文检索，并支持本地 embedding + hybrid rerank。
 - 返回带 `doc_id`、`node_id`、`node_path`、页码和 excerpt 的 evidence packet。
-- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`parse-report`、`embed`、`search-report`、`eval-search`、`eval-review`、`eval-memory`、`query-log`、`query-stats`、`feedback-put`、`feedback-to-eval`、`eval-dashboard`、`tune-search`、`search-profile`、`extract`、`innovations`、`citations`。
+- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`parse-report`、`embed`、`search-report`、`eval-search`、`eval-review`、`eval-memory`、`query-log`、`query-stats`、`feedback-put`、`feedback-to-eval`、`eval-dashboard`、`tune-search`、`search-profile`、`extract`、`innovations`、`citations`、`extract-facts`、`claims`、`entities`、`relations`、`fact-search`。
 - 支持跨论文比较和综述规划任务工件，生成比较矩阵、综述大纲、章节证据表和下一步行动。
 - 支持长期 memory 写入门控、任务进度记忆、任务恢复和任务进度压缩。
 - 支持人工反馈闭环，可将用户评分、期望 doc/node/keyword 转为搜索评测集。
@@ -439,6 +439,34 @@ uv run --extra pdf --extra docling python -m kb_agent.cli sync articles --force 
 
 本轮不做 OCR。扫描版 PDF 会给出 `scanned_pdf_or_empty_text` 或弱解析 warning，需要后续接入 OCR/版面模型。
 
+## v0.15 Claims / Entities / Relations 事实层
+
+v0.15 将单篇论文的 evidence nodes、创新点、引用关系和版面工件进一步抽取为可查询事实层。事实层会写入 SQLite schema v6 的 `paper_claims`、`paper_entities`、`paper_relations`，同时生成 `claims.json`、`entities.json`、`relations.json`、`fact_graph.json`、`fact_report.json`。
+
+抽取事实层：
+
+```bash
+uv run python -m kb_agent.cli extract-facts <doc_id> --no-llm --force
+```
+
+查看事实工件：
+
+```bash
+uv run python -m kb_agent.cli claims <doc_id>
+uv run python -m kb_agent.cli entities <doc_id>
+uv run python -m kb_agent.cli relations <doc_id>
+uv run python -m kb_agent.cli fact-graph <doc_id>
+```
+
+搜索 claims / entities / relations：
+
+```bash
+uv run python -m kb_agent.cli fact-search "动态角色任务规划" --type claim
+uv run python -m kb_agent.cli fact-search "任务完成率" --type entity
+```
+
+`search-report` 会附带 `fact_matches` 摘要，`eval-dashboard` 会展示事实层覆盖率。事实表和日志只保存短 claim、实体名、关系摘要和 evidence ID，不保存长 excerpt 或论文正文。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
@@ -516,7 +544,7 @@ DeepSeek 官方 OpenCode 接入方式：
 推荐工具调用顺序：
 
 ```text
-kb_sync -> kb_build_semantic_index -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_get_layout_blocks -> kb_get_figures -> kb_get_tables -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_classify_query -> kb_tree_search -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> kb_eval_search -> kb_eval_review -> kb_eval_memory -> kb_get_query_stats -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
+kb_sync -> kb_build_semantic_index -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_get_layout_blocks -> kb_get_figures -> kb_get_tables -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_extract_facts -> kb_get_claims -> kb_get_entities -> kb_get_relations -> kb_get_fact_graph -> kb_fact_search -> kb_classify_query -> kb_tree_search -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> kb_eval_search -> kb_eval_review -> kb_eval_memory -> kb_get_query_stats -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
 ```
 
 当用户明确指出某次结果好坏时，推荐追加：
@@ -539,4 +567,4 @@ uv run python -m unittest discover -s tests
 
 ## 后续阶段
 
-- 继续增强 claims/entities/relations 数据层、扫描版 OCR、表格内容抽取和更完整的 OpenCode 多智能体工作流。
+- 继续增强扫描版 OCR、表格内容深度抽取、事实层评测和更完整的 OpenCode 多智能体工作流。

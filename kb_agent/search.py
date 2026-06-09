@@ -136,6 +136,7 @@ def build_search_report(
             "documents": trace.get("routed_documents", []) or _docs_from_tree_results(trace.get("results", [])),
             "results": trace.get("results", []),
             "tree_search_trace": trace,
+            "fact_matches": _fact_matches(db_path, query, doc_id, top_k=5),
         }
     conn = db.connect(db_path)
     db.init_db(conn)
@@ -158,6 +159,7 @@ def build_search_report(
         "embedding_status": _safe_embedding_status(db_path),
         "documents": docs,
         "results": [result.__dict__ for result in results],
+        "fact_matches": _fact_matches(db_path, query, doc_id, top_k=5),
     }
 
 
@@ -669,6 +671,28 @@ def _search_report_warnings(results: List[SearchResult], mode: str, db_path: Pat
     if not results:
         warnings.append("no_search_results")
     return _unique_strings(warnings)
+
+
+def _fact_matches(db_path: Path, query: str, doc_id: Optional[str], top_k: int) -> Dict[str, object]:
+    try:
+        from .facts import fact_search
+
+        result = fact_search(db_path, query, doc_ids=[doc_id] if doc_id else None, top_k=top_k)
+    except Exception as exc:
+        return {
+            "schema": "fact_search_summary.v1",
+            "available": False,
+            "count": 0,
+            "items": [],
+            "warnings": [f"fact_search_unavailable:{exc}"],
+        }
+    return {
+        "schema": "fact_search_summary.v1",
+        "available": True,
+        "count": result.get("count", 0),
+        "items": result.get("items", [])[:top_k],
+        "warnings": [],
+    }
 
 
 def _safe_embedding_status(db_path: Path) -> Dict[str, object]:

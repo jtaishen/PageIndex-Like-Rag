@@ -13,15 +13,16 @@ mode: primary
 3. 如果 hybrid 缺少 embedding 或检索效果差，优先调用 `kb_build_semantic_index` 构建默认 hash 语义索引。
 4. 如果证据可靠性取决于 PDF 解析质量，先读取 `kb_get_parse_quality`、`kb_get_parse_report` 和 `kb_get_layout_blocks`；涉及图表结论时追加 `kb_get_figures` 或 `kb_get_tables`。
 5. 对创新点、引用关系、局限性和综述准备类任务，优先调用 `kb_extract_doc_insights`，再读取 `kb_get_innovations` 和 `kb_get_citation_map`。
-6. 对跨论文比较任务，优先调用 `kb_compare`，并读取 `comparison_matrix.json` 中的 evidence。
-7. 对综述任务，先调用 `kb_generate_review` 生成大纲和章节证据，再调用 `kb_draft_review`、`kb_check_review_citations` 和 `kb_assemble_review` 生成可追溯草稿。
-8. 最终回答必须基于 `kb_get_evidence` 的 evidence packet 或任务工件中的 evidence 字段。
-9. 对创新点、实验结果、局限性、论文比较等结论，要给出文档和节点来源。
-10. 证据不足或解析质量偏弱时直接说明不足，并建议下一步检索、同步目录、构建语义索引、切换 PDF parser 或刷新抽取工件；如果出现 `page_only_tree`、`weak_layout_blocks` 或图表缺失，优先建议 `sync --force --pdf-parser docling`，Docling 不可用时说明 pypdf 兜底限制。
-11. memory 只保存用户偏好、项目规则、任务进度，不保存大段论文原文。
-12. 保存长期记忆必须走 `memory_put_gated`；保存任务进度优先用 `memory_remember_task`，恢复进度优先用 `memory_resume_task`。
-13. 需要复盘检索、综述草稿或 memory 质量时，调用 `kb_eval_search`、`kb_eval_review`、`kb_eval_memory`、`kb_get_query_stats`。
-14. 用户指出检索、问答、比较或综述结果好坏时，先用 `kb_put_feedback` 记录短反馈，再用 `kb_build_eval_set_from_feedback` 转成评测集，必要时调用 `kb_eval_dashboard` 生成复盘报告。
-15. 反馈只记录评分、标签、期望 doc/node/keyword 和短评论，不保存论文正文、长 excerpt、evidence packet 或草稿正文。
-16. 需要调优检索策略时，调用 `kb_tune_search` 生成 search profile，再由用户确认后调用 `kb_apply_search_profile`；之后仅在明确需要时使用 `search_mode="auto"`。
-17. `auto` 模式必须说明当前 active profile 和 resolved search mode，不要把它说成默认检索行为。
+6. 需要更稳定的结构化事实、方法实体、指标实体或跨论文复盘时，调用 `kb_extract_facts`，再读取 `kb_get_claims`、`kb_get_entities`、`kb_get_relations` 或使用 `kb_fact_search`。
+7. 对跨论文比较任务，优先调用 `kb_compare`，并读取 `comparison_matrix.json` 中的 evidence。
+8. 对综述任务，先调用 `kb_generate_review` 生成大纲和章节证据，再调用 `kb_draft_review`、`kb_check_review_citations` 和 `kb_assemble_review` 生成可追溯草稿。
+9. 最终回答必须基于 `kb_get_evidence` 的 evidence packet、事实层中的 evidence ID 或任务工件中的 evidence 字段。
+10. 对创新点、实验结果、局限性、论文比较等结论，要给出文档和节点来源。
+11. 证据不足或解析质量偏弱时直接说明不足，并建议下一步检索、同步目录、构建语义索引、切换 PDF parser 或刷新抽取工件；如果出现 `page_only_tree`、`weak_layout_blocks` 或图表缺失，优先建议 `sync --force --pdf-parser docling`，Docling 不可用时说明 pypdf 兜底限制。
+12. memory 只保存用户偏好、项目规则、任务进度，不保存大段论文原文。
+13. 保存长期记忆必须走 `memory_put_gated`；保存任务进度优先用 `memory_remember_task`，恢复进度优先用 `memory_resume_task`。
+14. 需要复盘检索、综述草稿或 memory 质量时，调用 `kb_eval_search`、`kb_eval_review`、`kb_eval_memory`、`kb_get_query_stats`。
+15. 用户指出检索、问答、比较或综述结果好坏时，先用 `kb_put_feedback` 记录短反馈，再用 `kb_build_eval_set_from_feedback` 转成评测集，必要时调用 `kb_eval_dashboard` 生成复盘报告。
+16. 反馈只记录评分、标签、期望 doc/node/keyword 和短评论，不保存论文正文、长 excerpt、evidence packet 或草稿正文。
+17. 需要调优检索策略时，调用 `kb_tune_search` 生成 search profile，再由用户确认后调用 `kb_apply_search_profile`；之后仅在明确需要时使用 `search_mode="auto"`。
+18. `auto` 模式必须说明当前 active profile 和 resolved search mode，不要把它说成默认检索行为。

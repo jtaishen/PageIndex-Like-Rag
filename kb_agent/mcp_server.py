@@ -18,6 +18,7 @@ from .artifacts import (
 from .config import resolve_db_path
 from .embeddings import build_semantic_index, semantic_index_status
 from .eval import eval_memory, eval_review, eval_search
+from .facts import extract_facts, fact_search, get_claims, get_entities, get_fact_graph, get_relations
 from .feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from .ingest import sync_directory
 from .insights import extract_doc_insights
@@ -361,6 +362,54 @@ if FastMCP is not None:
     def kb_get_citation_map(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
         """Return the extracted citation map artifact for one document."""
         return get_citation_map(resolve_db_path(db_path), doc_id)
+
+    @mcp.tool()
+    def kb_extract_facts(
+        doc_id: str,
+        force: bool = False,
+        use_llm: bool = True,
+        require_llm: bool = False,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Extract grounded claims, entities, relations, and fact graph artifacts for one document."""
+        return extract_facts(
+            resolve_db_path(db_path),
+            doc_id,
+            force=force,
+            use_llm=use_llm,
+            require_llm=require_llm,
+        )
+
+    @mcp.tool()
+    def kb_get_claims(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return the extracted claims artifact for one document."""
+        return get_claims(resolve_db_path(db_path), doc_id)
+
+    @mcp.tool()
+    def kb_get_entities(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return the extracted entities artifact for one document."""
+        return get_entities(resolve_db_path(db_path), doc_id)
+
+    @mcp.tool()
+    def kb_get_relations(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return the extracted relations artifact for one document."""
+        return get_relations(resolve_db_path(db_path), doc_id)
+
+    @mcp.tool()
+    def kb_get_fact_graph(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return the extracted fact graph artifact for one document."""
+        return get_fact_graph(resolve_db_path(db_path), doc_id)
+
+    @mcp.tool()
+    def kb_fact_search(
+        query: str,
+        doc_ids: Optional[List[str]] = None,
+        type: Optional[str] = None,
+        top_k: int = 20,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Search grounded claims, entities, and relations without returning long excerpts."""
+        return fact_search(resolve_db_path(db_path), query, doc_ids=doc_ids, fact_type=type, top_k=top_k)
 
     @mcp.tool()
     def kb_compare(

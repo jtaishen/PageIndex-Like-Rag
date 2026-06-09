@@ -22,6 +22,7 @@ from .artifacts import (
 from .config import resolve_db_path
 from .embeddings import build_semantic_index, semantic_index_status
 from .eval import eval_memory, eval_review, eval_search
+from .facts import extract_facts, fact_search, get_claims, get_entities, get_fact_graph, get_relations
 from .feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from .ingest import sync_directory
 from .insights import extract_doc_insights
@@ -141,6 +142,30 @@ def main(argv: Any = None) -> None:
 
     citations_parser = subparsers.add_parser("citations", help="Show extracted citation map artifact")
     citations_parser.add_argument("doc_id")
+
+    facts_parser = subparsers.add_parser("extract-facts", help="Extract grounded claims, entities, and relations")
+    facts_parser.add_argument("doc_id")
+    facts_parser.add_argument("--force", action="store_true")
+    facts_parser.add_argument("--no-llm", action="store_true", help="Use rule-based fact extraction only")
+    facts_parser.add_argument("--require-llm", action="store_true", help="Fail if DeepSeek cannot be called")
+
+    claims_parser = subparsers.add_parser("claims", help="Show extracted claims artifact")
+    claims_parser.add_argument("doc_id")
+
+    entities_parser = subparsers.add_parser("entities", help="Show extracted entities artifact")
+    entities_parser.add_argument("doc_id")
+
+    relations_parser = subparsers.add_parser("relations", help="Show extracted relations artifact")
+    relations_parser.add_argument("doc_id")
+
+    fact_graph_parser = subparsers.add_parser("fact-graph", help="Show extracted fact graph artifact")
+    fact_graph_parser.add_argument("doc_id")
+
+    fact_search_parser = subparsers.add_parser("fact-search", help="Search extracted claims/entities/relations")
+    fact_search_parser.add_argument("query")
+    fact_search_parser.add_argument("--doc-id", action="append", default=[], help="Limit to one document id; repeatable")
+    fact_search_parser.add_argument("--type", choices=["claim", "entity", "relation"], default=None)
+    fact_search_parser.add_argument("--top-k", type=int, default=20)
 
     compare_parser = subparsers.add_parser("compare", help="Compare papers with grounded task artifacts")
     compare_parser.add_argument("query")
@@ -359,6 +384,25 @@ def main(argv: Any = None) -> None:
         _print_json(get_innovations(db_path, args.doc_id))
     elif args.command == "citations":
         _print_json(get_citation_map(db_path, args.doc_id))
+    elif args.command == "extract-facts":
+        result = extract_facts(
+            db_path,
+            args.doc_id,
+            force=args.force,
+            use_llm=not args.no_llm,
+            require_llm=args.require_llm,
+        )
+        _print_json(_fact_summary(result))
+    elif args.command == "claims":
+        _print_json(get_claims(db_path, args.doc_id))
+    elif args.command == "entities":
+        _print_json(get_entities(db_path, args.doc_id))
+    elif args.command == "relations":
+        _print_json(get_relations(db_path, args.doc_id))
+    elif args.command == "fact-graph":
+        _print_json(get_fact_graph(db_path, args.doc_id))
+    elif args.command == "fact-search":
+        _print_json(fact_search(db_path, args.query, doc_ids=args.doc_id or None, fact_type=args.type, top_k=args.top_k))
     elif args.command == "compare":
         result = compare_papers(
             db_path,
@@ -635,6 +679,33 @@ def _extract_summary(result: dict) -> dict:
             "relation_count": len(citation_map.get("relations") or []),
             "warning_count": len(citation_map.get("warnings") or []),
         },
+        "llm_error": result.get("llm_error", ""),
+    }
+
+
+def _fact_summary(result: dict) -> dict:
+    report = result.get("fact_report") or {}
+    claims = result.get("claims") or {}
+    entities = result.get("entities") or {}
+    relations = result.get("relations") or {}
+    return {
+        "schema": result.get("schema"),
+        "doc_id": result.get("doc_id"),
+        "version_id": result.get("version_id"),
+        "artifact_dir": result.get("artifact_dir"),
+        "skipped": result.get("skipped", False),
+        "claims_path": result.get("claims_path"),
+        "entities_path": result.get("entities_path"),
+        "relations_path": result.get("relations_path"),
+        "fact_graph_path": result.get("fact_graph_path"),
+        "fact_report_path": result.get("fact_report_path"),
+        "status": report.get("status") or claims.get("status"),
+        "claim_count": report.get("claim_count", claims.get("count")),
+        "entity_count": report.get("entity_count", entities.get("count")),
+        "relation_count": report.get("relation_count", relations.get("count")),
+        "low_confidence_count": report.get("low_confidence_count"),
+        "no_evidence_count": report.get("no_evidence_count"),
+        "warnings": report.get("warnings") or [],
         "llm_error": result.get("llm_error", ""),
     }
 

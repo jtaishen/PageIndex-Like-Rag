@@ -9,7 +9,7 @@ import json
 from .models import DocumentRecord, EvidencePacket, NodeRecord
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -172,6 +172,55 @@ def init_db(conn: sqlite3.Connection) -> None:
             PRIMARY KEY(doc_id, provider, model)
         );
 
+        CREATE TABLE IF NOT EXISTS paper_claims (
+            claim_id TEXT PRIMARY KEY,
+            doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+            version_id TEXT NOT NULL,
+            node_id TEXT NOT NULL DEFAULT '',
+            claim_type TEXT NOT NULL DEFAULT '',
+            text TEXT NOT NULL,
+            normalized_text TEXT NOT NULL DEFAULT '',
+            page_range TEXT NOT NULL DEFAULT '[]',
+            confidence REAL NOT NULL DEFAULT 0.0,
+            source TEXT NOT NULL DEFAULT '',
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS paper_entities (
+            entity_id TEXT PRIMARY KEY,
+            doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+            version_id TEXT NOT NULL,
+            node_id TEXT NOT NULL DEFAULT '',
+            entity_type TEXT NOT NULL DEFAULT '',
+            name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL DEFAULT '',
+            aliases TEXT NOT NULL DEFAULT '[]',
+            page_range TEXT NOT NULL DEFAULT '[]',
+            confidence REAL NOT NULL DEFAULT 0.0,
+            source TEXT NOT NULL DEFAULT '',
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS paper_relations (
+            relation_id TEXT PRIMARY KEY,
+            doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+            version_id TEXT NOT NULL,
+            node_id TEXT NOT NULL DEFAULT '',
+            relation_type TEXT NOT NULL DEFAULT '',
+            subject_id TEXT NOT NULL DEFAULT '',
+            subject_name TEXT NOT NULL DEFAULT '',
+            object_id TEXT NOT NULL DEFAULT '',
+            object_name TEXT NOT NULL DEFAULT '',
+            text TEXT NOT NULL DEFAULT '',
+            page_range TEXT NOT NULL DEFAULT '[]',
+            confidence REAL NOT NULL DEFAULT 0.0,
+            source TEXT NOT NULL DEFAULT '',
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_doc_nodes_doc_id ON doc_nodes(doc_id);
         CREATE INDEX IF NOT EXISTS idx_doc_nodes_parent_id ON doc_nodes(parent_id);
         CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path);
@@ -179,6 +228,14 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_node_embeddings_doc_id ON node_embeddings(doc_id);
         CREATE INDEX IF NOT EXISTS idx_node_embeddings_provider_model ON node_embeddings(provider, model);
         CREATE INDEX IF NOT EXISTS idx_document_embeddings_provider_model ON document_embeddings(provider, model);
+        CREATE INDEX IF NOT EXISTS idx_paper_claims_doc_id ON paper_claims(doc_id);
+        CREATE INDEX IF NOT EXISTS idx_paper_claims_node_id ON paper_claims(node_id);
+        CREATE INDEX IF NOT EXISTS idx_paper_claims_type ON paper_claims(claim_type);
+        CREATE INDEX IF NOT EXISTS idx_paper_entities_doc_id ON paper_entities(doc_id);
+        CREATE INDEX IF NOT EXISTS idx_paper_entities_name ON paper_entities(normalized_name);
+        CREATE INDEX IF NOT EXISTS idx_paper_entities_type ON paper_entities(entity_type);
+        CREATE INDEX IF NOT EXISTS idx_paper_relations_doc_id ON paper_relations(doc_id);
+        CREATE INDEX IF NOT EXISTS idx_paper_relations_type ON paper_relations(relation_type);
         CREATE INDEX IF NOT EXISTS idx_feedback_items_created_at ON feedback_items(created_at);
         CREATE INDEX IF NOT EXISTS idx_feedback_items_query_id ON feedback_items(query_id);
         CREATE INDEX IF NOT EXISTS idx_feedback_items_operation ON feedback_items(operation);
@@ -663,6 +720,143 @@ def embedding_counts(conn: sqlite3.Connection, provider: str, model: str) -> Dic
         (provider, model),
     ).fetchone()["count"]
     return {"node_count": int(node_count or 0), "document_count": int(doc_count or 0)}
+
+
+def delete_paper_facts(conn: sqlite3.Connection, doc_id: str, version_id: Optional[str] = None) -> None:
+    params: List[object] = [doc_id]
+    version_filter = ""
+    if version_id:
+        version_filter = " AND version_id = ?"
+        params.append(version_id)
+    for table in ("paper_claims", "paper_entities", "paper_relations"):
+        conn.execute(f"DELETE FROM {table} WHERE doc_id = ?{version_filter}", params)
+
+
+def insert_paper_claims(conn: sqlite3.Connection, claims: Iterable[Dict[str, object]]) -> None:
+    rows = []
+    now = time.time()
+    for item in claims:
+        rows.append(
+            (
+                item.get("claim_id"),
+                item.get("doc_id"),
+                item.get("version_id"),
+                item.get("node_id") or "",
+                item.get("claim_type") or item.get("type") or "",
+                item.get("text") or item.get("claim") or "",
+                item.get("normalized_text") or "",
+                json.dumps(item.get("page_range") or [], ensure_ascii=False),
+                float(item.get("confidence") or 0.0),
+                item.get("source") or "",
+                json.dumps(item.get("evidence") or {}, ensure_ascii=False),
+                float(item.get("created_at") or now),
+            )
+        )
+    conn.executemany(
+        """
+        INSERT OR REPLACE INTO paper_claims(
+            claim_id, doc_id, version_id, node_id, claim_type, text, normalized_text,
+            page_range, confidence, source, evidence_json, created_at
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+
+
+def insert_paper_entities(conn: sqlite3.Connection, entities: Iterable[Dict[str, object]]) -> None:
+    rows = []
+    now = time.time()
+    for item in entities:
+        rows.append(
+            (
+                item.get("entity_id"),
+                item.get("doc_id"),
+                item.get("version_id"),
+                item.get("node_id") or "",
+                item.get("entity_type") or item.get("type") or "",
+                item.get("name") or "",
+                item.get("normalized_name") or "",
+                json.dumps(item.get("aliases") or [], ensure_ascii=False),
+                json.dumps(item.get("page_range") or [], ensure_ascii=False),
+                float(item.get("confidence") or 0.0),
+                item.get("source") or "",
+                json.dumps(item.get("evidence") or {}, ensure_ascii=False),
+                float(item.get("created_at") or now),
+            )
+        )
+    conn.executemany(
+        """
+        INSERT OR REPLACE INTO paper_entities(
+            entity_id, doc_id, version_id, node_id, entity_type, name, normalized_name,
+            aliases, page_range, confidence, source, evidence_json, created_at
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+
+
+def insert_paper_relations(conn: sqlite3.Connection, relations: Iterable[Dict[str, object]]) -> None:
+    rows = []
+    now = time.time()
+    for item in relations:
+        rows.append(
+            (
+                item.get("relation_id"),
+                item.get("doc_id"),
+                item.get("version_id"),
+                item.get("node_id") or "",
+                item.get("relation_type") or item.get("type") or "",
+                item.get("subject_id") or "",
+                item.get("subject_name") or "",
+                item.get("object_id") or "",
+                item.get("object_name") or "",
+                item.get("text") or "",
+                json.dumps(item.get("page_range") or [], ensure_ascii=False),
+                float(item.get("confidence") or 0.0),
+                item.get("source") or "",
+                json.dumps(item.get("evidence") or {}, ensure_ascii=False),
+                float(item.get("created_at") or now),
+            )
+        )
+    conn.executemany(
+        """
+        INSERT OR REPLACE INTO paper_relations(
+            relation_id, doc_id, version_id, node_id, relation_type, subject_id,
+            subject_name, object_id, object_name, text, page_range, confidence,
+            source, evidence_json, created_at
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+
+
+def paper_fact_counts(conn: sqlite3.Connection, doc_id: Optional[str] = None) -> Dict[str, int]:
+    params: List[object] = []
+    where = ""
+    if doc_id:
+        where = " WHERE doc_id = ?"
+        params.append(doc_id)
+    result = {}
+    for key, table in (
+        ("claim_count", "paper_claims"),
+        ("entity_count", "paper_entities"),
+        ("relation_count", "paper_relations"),
+    ):
+        row = conn.execute(f"SELECT COUNT(*) AS count FROM {table}{where}", params).fetchone()
+        result[key] = int(row["count"] or 0)
+    low_conf = 0
+    no_evidence = 0
+    for table in ("paper_claims", "paper_entities", "paper_relations"):
+        row = conn.execute(f"SELECT COUNT(*) AS count FROM {table}{where} AND confidence < 0.5" if where else f"SELECT COUNT(*) AS count FROM {table} WHERE confidence < 0.5", params).fetchone()
+        low_conf += int(row["count"] or 0)
+        row = conn.execute(f"SELECT COUNT(*) AS count FROM {table}{where} AND node_id = ''" if where else f"SELECT COUNT(*) AS count FROM {table} WHERE node_id = ''", params).fetchone()
+        no_evidence += int(row["count"] or 0)
+    result["low_confidence_count"] = low_conf
+    result["no_evidence_count"] = no_evidence
+    return result
 
 
 def get_evidence_packets(

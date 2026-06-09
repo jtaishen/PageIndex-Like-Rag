@@ -237,21 +237,24 @@ def build_eval_set_from_feedback(
 
 
 def eval_dashboard(db_path: Path, *, since_days: Optional[float] = None, output_format: str = "json") -> Dict[str, Any]:
+    from .facts import fact_coverage_summary
     from .search_profile import latest_search_tuning_reports, list_search_profiles
 
     created_at = time.time()
     stats = query_stats(db_path, since_days=since_days)
     feedback = feedback_summary(db_path, since_days=since_days)
+    fact_coverage = fact_coverage_summary(db_path)
     latest_reports = _latest_eval_reports(limit=8)
     tuning_reports = latest_search_tuning_reports(limit=5)
     profiles = list_search_profiles()
-    recommendations = _dashboard_recommendations(stats, feedback)
+    recommendations = _dashboard_recommendations(stats, feedback, fact_coverage)
     dashboard = {
         "schema": "eval_dashboard.v1",
         "since_days": since_days,
         "created_at": created_at,
         "query_stats": stats,
         "feedback_summary": feedback,
+        "fact_coverage": fact_coverage,
         "latest_eval_reports": latest_reports,
         "latest_search_tuning": tuning_reports,
         "search_profiles": profiles,
@@ -375,7 +378,7 @@ def _latest_eval_reports(limit: int = 8) -> List[Dict[str, Any]]:
     return reports
 
 
-def _dashboard_recommendations(stats: Dict[str, Any], feedback: Dict[str, Any]) -> List[str]:
+def _dashboard_recommendations(stats: Dict[str, Any], feedback: Dict[str, Any], fact_coverage: Optional[Dict[str, Any]] = None) -> List[str]:
     recommendations = []
     if stats.get("no_evidence_rate", 0) > 0:
         recommendations.append("复盘无证据查询，补充 expected_doc_ids 或 expected_node_ids 后生成评测集。")
@@ -385,12 +388,17 @@ def _dashboard_recommendations(stats: Dict[str, Any], feedback: Dict[str, Any]) 
         recommendations.append("将低评分反馈转成评测用例，并比较 hybrid/tree/fts 的召回差异。")
     if not feedback.get("feedback_count"):
         recommendations.append("尚无人工反馈；建议从最近 query-log 中挑选代表性失败案例记录反馈。")
+    if fact_coverage is not None and not fact_coverage.get("total_fact_count"):
+        recommendations.append("尚未抽取事实层；建议对核心论文运行 extract-facts 后再复盘 compare/review。")
+    if fact_coverage is not None and fact_coverage.get("low_confidence_count", 0) > 0:
+        recommendations.append("复核低置信事实，必要时用 DeepSeek 重新抽取或回到证据节点人工确认。")
     return recommendations
 
 
 def _dashboard_markdown(dashboard: Dict[str, Any]) -> str:
     stats = dashboard.get("query_stats") or {}
     feedback = dashboard.get("feedback_summary") or {}
+    facts = dashboard.get("fact_coverage") or {}
     reports = dashboard.get("latest_eval_reports") or []
     lines = [
         "# KB Eval Dashboard",
@@ -399,6 +407,10 @@ def _dashboard_markdown(dashboard: Dict[str, Any]) -> str:
         f"- since_days: `{dashboard.get('since_days')}`",
         f"- query_count: `{stats.get('query_count', 0)}`",
         f"- feedback_count: `{feedback.get('feedback_count', 0)}`",
+        f"- fact_count: `{facts.get('total_fact_count', 0)}`",
+        f"- claim_count: `{facts.get('claim_count', 0)}`",
+        f"- entity_count: `{facts.get('entity_count', 0)}`",
+        f"- relation_count: `{facts.get('relation_count', 0)}`",
         f"- avg_feedback_rating: `{feedback.get('avg_rating', 0.0)}`",
         f"- fallback_rate: `{stats.get('fallback_rate', 0.0)}`",
         f"- no_evidence_rate: `{stats.get('no_evidence_rate', 0.0)}`",
@@ -425,6 +437,7 @@ def _dashboard_markdown(dashboard: Dict[str, Any]) -> str:
 def _dashboard_html(dashboard: Dict[str, Any]) -> str:
     stats = dashboard.get("query_stats") or {}
     feedback = dashboard.get("feedback_summary") or {}
+    facts = dashboard.get("fact_coverage") or {}
     profiles = dashboard.get("search_profiles") or {}
     active = profiles.get("active") or {}
     cards = [
@@ -434,6 +447,11 @@ def _dashboard_html(dashboard: Dict[str, Any]) -> str:
         ("Feedback", feedback.get("feedback_count", 0)),
         ("Avg Rating", feedback.get("avg_rating", 0.0)),
         ("Low Ratings", feedback.get("low_rating_count", 0)),
+        ("Facts", facts.get("total_fact_count", 0)),
+        ("Claims", facts.get("claim_count", 0)),
+        ("Entities", facts.get("entity_count", 0)),
+        ("Relations", facts.get("relation_count", 0)),
+        ("Low Conf Facts", facts.get("low_confidence_count", 0)),
     ]
     card_html = "\n".join(
         f"<section class='card'><div class='label'>{escape(str(label))}</div><div class='value'>{escape(str(value))}</div></section>"

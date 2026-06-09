@@ -23,6 +23,11 @@ ARTIFACT_WHITELIST = {
     "doc_card.json",
     "innovation.json",
     "citation_map.json",
+    "claims.json",
+    "entities.json",
+    "relations.json",
+    "fact_graph.json",
+    "fact_report.json",
 }
 
 
