@@ -8,16 +8,17 @@ import urllib.error
 import urllib.request
 import zipfile
 from abc import ABC, abstractmethod
+from collections import Counter
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from xml.etree import ElementTree
 
 from .models import ParsedBlock, ParsedDocument
 from .utils import compact_whitespace, read_text_lossy, split_paragraphs
 
 
-PARSER_VERSION = "0.8.0"
+PARSER_VERSION = "0.14.0"
 PDF_PARSER_CHOICES = {"auto", "pypdf", "docling", "grobid"}
 DEFAULT_PDF_PARSER = "auto"
 
@@ -92,21 +93,42 @@ class ParserAdapter(ABC):
         parser_version: Optional[str] = None,
     ) -> ParsedDocument:
         normalized_blocks, normalize_warnings = normalize_blocks(blocks)
+        source_parser = parser_name or self.name
+        _ensure_layout_metadata(normalized_blocks, source_parser)
         enriched = _enrich_metadata(title, raw_text, metadata or {})
         if not enriched.get("abstract"):
             enriched["abstract"] = _extract_abstract_from_blocks(normalized_blocks)
         if not enriched.get("keywords"):
             enriched["keywords"] = _extract_keywords_from_blocks(normalized_blocks)
-        structured_payload = structured or {
+        references_payload = references or extract_references(raw_text)
+        layout_blocks = build_layout_blocks(normalized_blocks, source_parser)
+        table_items = build_visual_items(layout_blocks, "table")
+        figure_items = build_visual_items(layout_blocks, "figure")
+        reference_sections = build_reference_sections(layout_blocks, references_payload)
+        structured_payload = dict(structured or {
             "schema": "structured.v0",
             "blocks": [_block_to_dict(block, index) for index, block in enumerate(normalized_blocks)],
             "tables": [],
             "figures": [],
             "formulas": [],
-        }
-        structured_payload.setdefault("blocks", [_block_to_dict(block, index) for index, block in enumerate(normalized_blocks)])
-        structured_payload.setdefault("tables", [])
-        structured_payload.setdefault("figures", [])
+        })
+        if "blocks" not in structured_payload:
+            structured_payload["blocks"] = [_block_to_dict(block, index) for index, block in enumerate(normalized_blocks)]
+        structured_payload["layout_schema"] = "layout_blocks.v1"
+        structured_payload["layout_blocks"] = layout_blocks
+        structured_payload["layout_blocks_count"] = len(layout_blocks)
+        structured_payload["table_count"] = len(table_items)
+        structured_payload["figure_count"] = len(figure_items)
+        structured_payload["reference_section_count"] = len(reference_sections)
+        if table_items:
+            structured_payload["tables"] = table_items
+        else:
+            structured_payload.setdefault("tables", [])
+        if figure_items:
+            structured_payload["figures"] = figure_items
+        else:
+            structured_payload.setdefault("figures", [])
+        structured_payload["reference_sections"] = reference_sections
         structured_payload.setdefault("formulas", [])
         return ParsedDocument(
             title=enriched.get("title") or title or path.stem,
@@ -116,11 +138,119 @@ class ParserAdapter(ABC):
             metadata=enriched,
             body_md=body_md or blocks_to_markdown(normalized_blocks, title),
             structured=structured_payload,
-            references=references or extract_references(raw_text),
-            parser_name=parser_name or self.name,
+            references=references_payload,
+            parser_name=source_parser,
             parser_version=parser_version or self.version,
             parse_warnings=[*(warnings or []), *normalize_warnings],
         )
+
+
+def _ensure_layout_metadata(blocks: List[ParsedBlock], source_parser: str) -> None:
+    counters = Counter()
+    for index, block in enumerate(blocks, start=1):
+        if not block.source_parser:
+            block.source_parser = source_parser
+        if not block.layout_block_id:
+            block.layout_block_id = f"layout_{index:04d}"
+        if block.kind in {"figure", "table"} and not block.caption_id:
+            counters[block.kind] += 1
+            prefix = "fig" if block.kind == "figure" else "table"
+            block.caption_id = f"{prefix}_{counters[block.kind]:03d}"
+
+
+def build_layout_blocks(blocks: List[ParsedBlock], source_parser: str = "") -> List[Dict[str, Any]]:
+    current_section: List[str] = []
+    layout_blocks: List[Dict[str, Any]] = []
+    _ensure_layout_metadata(blocks, source_parser or "unknown")
+    for block in blocks:
+        text = compact_whitespace(block.heading or block.text)
+        if block.kind == "heading" and text:
+            level = max(1, block.level or 1)
+            current_section = current_section[: level - 1]
+            current_section.append(text)
+        if not text:
+            continue
+        layout_blocks.append(
+            {
+                "schema": "layout_block.v1",
+                "block_id": block.layout_block_id,
+                "type": block.kind,
+                "text": text,
+                "page": block.page,
+                "bbox": block.bbox,
+                "section_path": list(current_section),
+                "caption_id": block.caption_id,
+                "confidence": round(float(block.confidence), 3),
+                "source_parser": block.source_parser or source_parser or "unknown",
+            }
+        )
+    return layout_blocks
+
+
+def build_visual_items(layout_blocks: List[Dict[str, Any]], kind: str) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for index, block in enumerate((item for item in layout_blocks if item.get("type") == kind), start=1):
+        caption = compact_whitespace(str(block.get("text") or ""))
+        item_id = str(block.get("caption_id") or f"{kind}_{index:03d}")
+        items.append(
+            {
+                "schema": f"{kind}.v1",
+                "id": item_id,
+                "caption_id": item_id,
+                "layout_block_id": block.get("block_id"),
+                "caption": caption,
+                "text": caption,
+                "page": block.get("page"),
+                "bbox": block.get("bbox"),
+                "section_path": block.get("section_path") or [],
+                "confidence": block.get("confidence", 1.0),
+                "source_parser": block.get("source_parser") or "",
+            }
+        )
+    return items
+
+
+def build_reference_sections(
+    layout_blocks: List[Dict[str, Any]],
+    references: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    reference_blocks = [block for block in layout_blocks if block.get("type") == "reference"]
+    pages = [int(block["page"]) for block in reference_blocks if isinstance(block.get("page"), int)]
+    if reference_blocks:
+        return [
+            {
+                "schema": "reference_section.v1",
+                "section_id": "references",
+                "source": _dominant_source(reference_blocks),
+                "page_start": min(pages) if pages else None,
+                "page_end": max(pages) if pages else None,
+                "block_ids": [str(block.get("block_id") or "") for block in reference_blocks if block.get("block_id")],
+                "item_count": len(reference_blocks),
+                "references_count": len((references or {}).get("references") or []),
+            }
+        ]
+    ref_items = (references or {}).get("references") or []
+    if ref_items:
+        return [
+            {
+                "schema": "reference_section.v1",
+                "section_id": "references",
+                "source": str((references or {}).get("source") or "references"),
+                "page_start": None,
+                "page_end": None,
+                "block_ids": [],
+                "item_count": len(ref_items),
+                "references_count": len(ref_items),
+            }
+        ]
+    return []
+
+
+def _dominant_source(blocks: List[Dict[str, Any]]) -> str:
+    sources = [str(block.get("source_parser") or "") for block in blocks if block.get("source_parser")]
+    if not sources:
+        return ""
+    return Counter(sources).most_common(1)[0][0]
 
 
 class MarkdownParser(ParserAdapter):
@@ -346,26 +476,32 @@ def _parse_pypdf_pdf(path: Path) -> ParsedDocument:
     except Exception as exc:
         raise ParseError(f"Cannot read PDF: {exc}") from exc
 
-    blocks: List[ParsedBlock] = []
-    page_texts: List[str] = []
+    page_lines: List[Tuple[int, List[str]]] = []
+    extract_errors: List[str] = []
     for page_number, page in enumerate(reader.pages, start=1):
         try:
             text = page.extract_text() or ""
         except Exception as exc:
             text = ""
-            blocks.append(ParsedBlock(kind="paragraph", text=f"[page_extract_error:{exc}]", page=page_number))
-        text = text.strip()
-        if not text:
-            continue
-        page_texts.append(text)
-        blocks.append(ParsedBlock(kind="paragraph", text=text, page=page_number))
+            extract_errors.append(f"page_{page_number}:{exc}")
+        page_lines.append((page_number, text.splitlines()))
 
+    cleaned_pages, noise_removed_count = _clean_pdf_page_lines(page_lines)
+    blocks = []
+    page_texts: List[str] = []
+    for page_number, lines in cleaned_pages:
+        if lines:
+            page_texts.append("\n".join(lines))
+            blocks.extend(_pypdf_blocks_from_lines(lines, page_number))
     raw_text = "\n\n".join(page_texts)
     metadata = {
         "source_format": "pdf",
         "pages": len(reader.pages),
         "pdf_parser": "pypdf",
+        "noise_removed_count": noise_removed_count,
     }
+    if extract_errors:
+        metadata["page_extract_errors"] = extract_errors
     pdf_metadata = getattr(reader, "metadata", None)
     title = path.stem
     if pdf_metadata:
@@ -376,15 +512,190 @@ def _parse_pypdf_pdf(path: Path) -> ParsedDocument:
         if author:
             metadata["authors"] = _split_authors(str(author))
 
+    warnings = []
+    if extract_errors:
+        warnings.append(f"page_extract_errors:{len(extract_errors)}")
+    if not raw_text.strip():
+        warnings.append("scanned_pdf_or_empty_text")
+
     return PdfParser().finish(
         path,
         title=title or path.stem,
         raw_text=raw_text,
         blocks=blocks,
         metadata=metadata,
+        warnings=warnings,
         parser_name="pdf_pypdf",
         parser_version=PARSER_VERSION,
     )
+
+
+def _clean_pdf_page_lines(page_lines: List[Tuple[int, List[str]]]) -> Tuple[List[Tuple[int, List[str]]], int]:
+    normalized_pages: List[Tuple[int, List[str]]] = []
+    line_counts: Counter[str] = Counter()
+    for page_number, lines in page_lines:
+        cleaned = [compact_whitespace(line) for line in lines]
+        cleaned = [line for line in cleaned if line]
+        normalized_pages.append((page_number, cleaned))
+        for line in cleaned:
+            key = _noise_key(line)
+            if key:
+                line_counts[key] += 1
+
+    repeated_noise = {
+        line
+        for line, count in line_counts.items()
+        if count >= 2 and len(line) <= 120 and not _classify_heading_line(line) and not _classify_semantic_line(line, False)
+    }
+    result: List[Tuple[int, List[str]]] = []
+    removed = 0
+    for page_number, lines in normalized_pages:
+        kept: List[str] = []
+        for line in lines:
+            key = _noise_key(line)
+            if _is_pdf_noise_line(line) or key in repeated_noise:
+                removed += 1
+                continue
+            kept.append(line)
+        result.append((page_number, kept))
+    return result, removed
+
+
+def _noise_key(line: str) -> str:
+    text = compact_whitespace(line)
+    text = re.sub(r"\d+", "#", text)
+    return text.lower()
+
+
+def _is_pdf_noise_line(line: str) -> bool:
+    text = compact_whitespace(line)
+    if not text:
+        return True
+    if re.match(r"^[-—–]?\s*\d+\s*[-—–]?$", text):
+        return True
+    if re.match(r"^第\s*\d+\s*页(?:\s*/\s*共\s*\d+\s*页)?$", text):
+        return True
+    if re.search(r"\.{5,}\s*\d+$", text):
+        return True
+    if re.search(r"\b(?:doi|issn|cn)\b\s*[:：]", text, re.IGNORECASE):
+        return True
+    if re.search(r"(收稿日期|基金项目|作者简介|版权|©|Copyright|All rights reserved)", text, re.IGNORECASE):
+        return True
+    return False
+
+
+def _pypdf_blocks_from_lines(lines: List[str], page_number: int) -> List[ParsedBlock]:
+    blocks: List[ParsedBlock] = []
+    paragraph: List[str] = []
+    in_references = False
+
+    def flush_paragraph() -> None:
+        nonlocal paragraph
+        text = compact_whitespace(" ".join(paragraph))
+        if text:
+            blocks.append(
+                ParsedBlock(
+                    kind="paragraph",
+                    text=text,
+                    page=page_number,
+                    source_parser="pypdf",
+                    confidence=0.72,
+                )
+            )
+        paragraph = []
+
+    for line in lines:
+        text = compact_whitespace(line)
+        if not text:
+            flush_paragraph()
+            continue
+
+        special = _split_special_line(text)
+        if special:
+            flush_paragraph()
+            heading, level, body_kind, body = special
+            blocks.append(
+                ParsedBlock(
+                    kind="heading",
+                    text="",
+                    heading=heading,
+                    level=level,
+                    page=page_number,
+                    source_parser="pypdf",
+                    confidence=0.88,
+                )
+            )
+            in_references = _is_reference_heading(heading)
+            if body:
+                blocks.append(
+                    ParsedBlock(
+                        kind=body_kind,
+                        text=body,
+                        page=page_number,
+                        source_parser="pypdf",
+                        confidence=0.82,
+                    )
+                )
+            continue
+
+        heading = _classify_heading_line(text)
+        if heading:
+            flush_paragraph()
+            blocks.append(
+                ParsedBlock(
+                    kind="heading",
+                    text="",
+                    heading=heading[0],
+                    level=heading[1],
+                    page=page_number,
+                    source_parser="pypdf",
+                    confidence=0.86,
+                )
+            )
+            in_references = _is_reference_heading(heading[0])
+            continue
+
+        semantic_kind = _classify_semantic_line(text, in_references)
+        if semantic_kind:
+            flush_paragraph()
+            confidence = 0.86 if semantic_kind in {"figure", "table", "reference"} else 0.78
+            blocks.append(
+                ParsedBlock(
+                    kind=semantic_kind,
+                    text=text,
+                    page=page_number,
+                    source_parser="pypdf",
+                    confidence=confidence,
+                )
+            )
+            continue
+
+        if _is_formula_line(text):
+            flush_paragraph()
+            blocks.append(
+                ParsedBlock(
+                    kind="formula",
+                    text=text,
+                    page=page_number,
+                    source_parser="pypdf",
+                    confidence=0.68,
+                )
+            )
+            continue
+
+        paragraph.append(text)
+
+    flush_paragraph()
+    return blocks
+
+
+def _is_formula_line(line: str) -> bool:
+    text = compact_whitespace(line)
+    if len(text) > 120:
+        return False
+    if re.search(r"[=≈≤≥∑∏√∫]", text) and re.search(r"[A-Za-zα-ωΑ-Ω]", text):
+        return True
+    return bool(re.match(r"^\(?\d+\)?\s*[A-Za-z]\s*=", text))
 
 
 def _metadata_get(metadata: Any, key: str) -> Any:
@@ -501,14 +812,24 @@ def _block_from_payload(payload: Dict[str, Any]) -> ParsedBlock:
     if kind == "heading" and not heading:
         heading = text
         text = ""
+    raw_level = payload.get("level")
+    try:
+        level = int(raw_level) if raw_level is not None else (1 if kind == "heading" else 0)
+    except (TypeError, ValueError):
+        level = 1 if kind == "heading" else 0
     return ParsedBlock(
         kind=kind,
         text=text,
         heading=heading,
-        level=int(payload.get("level") or 1 if kind == "heading" else 0),
+        level=level,
         page=_page_from_payload(payload),
         char_start=payload.get("char_start"),
         char_end=payload.get("char_end"),
+        bbox=_bbox_from_payload(payload),
+        layout_block_id=str(payload.get("block_id") or payload.get("layout_block_id") or payload.get("self_ref") or ""),
+        caption_id=str(payload.get("caption_id") or payload.get("caption_ref") or ""),
+        confidence=_confidence_from_payload(payload),
+        source_parser=str(payload.get("source_parser") or payload.get("source") or "docling"),
     )
 
 
@@ -536,16 +857,42 @@ def _blocks_from_docling_structured(structured: Dict[str, Any], markdown: str) -
                     heading=text if kind == "heading" else "",
                     level=1 if label == "title" else 2 if kind == "heading" else 0,
                     page=_page_from_payload(item),
+                    bbox=_bbox_from_payload(item),
+                    layout_block_id=str(item.get("block_id") or item.get("self_ref") or ""),
+                    confidence=_confidence_from_payload(item),
+                    source_parser="docling",
                 )
             )
     for item in structured.get("tables") or []:
         if isinstance(item, dict):
             text = str(item.get("text") or item.get("caption") or item.get("name") or "table").strip()
-            blocks.append(ParsedBlock(kind="table", text=text, page=_page_from_payload(item)))
+            blocks.append(
+                ParsedBlock(
+                    kind="table",
+                    text=text,
+                    page=_page_from_payload(item),
+                    bbox=_bbox_from_payload(item),
+                    layout_block_id=str(item.get("block_id") or item.get("self_ref") or ""),
+                    caption_id=str(item.get("caption_id") or ""),
+                    confidence=_confidence_from_payload(item),
+                    source_parser="docling",
+                )
+            )
     for item in structured.get("figures") or structured.get("pictures") or []:
         if isinstance(item, dict):
             text = str(item.get("text") or item.get("caption") or item.get("name") or "figure").strip()
-            blocks.append(ParsedBlock(kind="figure", text=text, page=_page_from_payload(item)))
+            blocks.append(
+                ParsedBlock(
+                    kind="figure",
+                    text=text,
+                    page=_page_from_payload(item),
+                    bbox=_bbox_from_payload(item),
+                    layout_block_id=str(item.get("block_id") or item.get("self_ref") or ""),
+                    caption_id=str(item.get("caption_id") or ""),
+                    confidence=_confidence_from_payload(item),
+                    source_parser="docling",
+                )
+            )
     if not blocks and markdown:
         blocks = [ParsedBlock(kind="paragraph", text=part) for part in split_paragraphs(markdown)]
     return blocks
@@ -562,6 +909,57 @@ def _page_from_payload(payload: Dict[str, Any]) -> Optional[int]:
     if isinstance(prov, list) and prov and isinstance(prov[0], dict):
         return _page_from_payload(prov[0])
     return None
+
+
+def _bbox_from_payload(payload: Dict[str, Any]) -> Optional[List[float]]:
+    for key in ("bbox", "box", "bounding_box"):
+        bbox = payload.get(key)
+        parsed = _parse_bbox(bbox)
+        if parsed:
+            return parsed
+    prov = payload.get("prov")
+    if isinstance(prov, list) and prov and isinstance(prov[0], dict):
+        return _bbox_from_payload(prov[0])
+    return None
+
+
+def _parse_bbox(value: Any) -> Optional[List[float]]:
+    if isinstance(value, (list, tuple)) and len(value) >= 4:
+        try:
+            return [float(item) for item in value[:4]]
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, dict):
+        keys = ("x0", "y0", "x1", "y1")
+        if all(key in value for key in keys):
+            try:
+                return [float(value[key]) for key in keys]
+            except (TypeError, ValueError):
+                return None
+        keys = ("l", "t", "r", "b")
+        if all(key in value for key in keys):
+            try:
+                return [float(value[key]) for key in keys]
+            except (TypeError, ValueError):
+                return None
+        if all(key in value for key in ("left", "top", "right", "bottom")):
+            try:
+                return [float(value[key]) for key in ("left", "top", "right", "bottom")]
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _confidence_from_payload(payload: Dict[str, Any]) -> float:
+    for key in ("confidence", "score", "probability"):
+        value = payload.get(key)
+        if value is None:
+            continue
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            continue
+    return 0.95
 
 
 def _page_count_from_structured(structured: Dict[str, Any]) -> Optional[int]:
@@ -641,6 +1039,11 @@ def _merge_grobid_enrichment(doc: ParsedDocument, enrichment: Dict[str, Any]) ->
             "references": references,
             "citation_contexts": doc.references.get("citation_contexts", []),
         }
+        doc.structured["reference_sections"] = build_reference_sections(
+            doc.structured.get("layout_blocks") or [],
+            doc.references,
+        )
+        doc.structured["reference_section_count"] = len(doc.structured.get("reference_sections") or [])
     doc.metadata["grobid_enriched"] = bool(metadata or references)
 
 
@@ -766,7 +1169,7 @@ def _authors_from_element(element: Optional[ElementTree.Element]) -> List[str]:
     return authors
 
 
-SEMANTIC_BLOCK_KINDS = {"abstract", "keywords", "figure", "table", "reference"}
+SEMANTIC_BLOCK_KINDS = {"abstract", "keywords", "figure", "table", "reference", "formula"}
 _CHAPTER_RE = re.compile(r"^第[一二三四五六七八九十百千万0-9]+章\s*[\w\u4e00-\u9fff（）()《》:：、，,\- ]{0,80}$")
 _NUMBERED_HEADING_RE = re.compile(r"^(\d+(?:\.\d+){0,3})[\s、.．]+(.{1,80})$")
 _CHINESE_ORDER_HEADING_RE = re.compile(r"^[一二三四五六七八九十]+[、.．]\s*.{1,80}$")
@@ -941,6 +1344,11 @@ def _copy_block(
         page=block.page,
         char_start=block.char_start,
         char_end=block.char_end,
+        bbox=block.bbox,
+        layout_block_id=block.layout_block_id,
+        caption_id=block.caption_id,
+        confidence=block.confidence,
+        source_parser=block.source_parser,
     )
 
 
@@ -1046,6 +1454,11 @@ def _block_to_dict(block: ParsedBlock, index: int) -> Dict[str, Any]:
         "page": block.page,
         "char_start": block.char_start,
         "char_end": block.char_end,
+        "bbox": block.bbox,
+        "layout_block_id": block.layout_block_id,
+        "caption_id": block.caption_id,
+        "confidence": block.confidence,
+        "source_parser": block.source_parser,
     }
 
 

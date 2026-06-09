@@ -3,12 +3,12 @@ from __future__ import annotations
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from . import db
 from .config import DATA_DIR, SUPPORTED_EXTENSIONS, ensure_data_dirs
 from .models import DocumentRecord
-from .parsers import parser_identity_for_path, parse_document
+from .parsers import build_layout_blocks, build_reference_sections, build_visual_items, parser_identity_for_path, parse_document
 from .tree import build_document_tree, tree_to_dict
 from .utils import first_words, sha256_file, stable_id, write_json, write_jsonl
 
@@ -71,6 +71,7 @@ def _sync_file(conn, file_path: Path, force: bool = False, pdf_parser: Optional[
 
     try:
         parsed = parse_document(file_path, pdf_parser=pdf_parser)
+        build_layout_blocks(parsed.blocks, parsed.parser_name or parsed.file_type)
         nodes = build_document_tree(doc_id, parsed, doc_hash=file_hash)
         summary = _doc_description(parsed)
         record = DocumentRecord(
@@ -144,9 +145,28 @@ def _write_artifacts(doc_id: str, version_id: str, base: Path, source_path: Path
     base.mkdir(parents=True, exist_ok=True)
     (base / "raw_text.txt").write_text(parsed.raw_text, encoding="utf-8")
     (base / "body.md").write_text(parsed.body_md, encoding="utf-8")
-    write_json(base / "structured.json", parsed.structured)
+    layout_blocks = _layout_blocks_from(parsed)
+    tables = _tables_from(parsed)
+    figures = _figures_from(parsed)
+    reference_sections = _reference_sections_from(parsed)
+    structured_payload = dict(parsed.structured or {})
+    structured_payload.setdefault("schema", "structured.v0")
+    structured_payload["layout_schema"] = "layout_blocks.v1"
+    structured_payload["layout_blocks"] = layout_blocks
+    structured_payload["layout_blocks_count"] = len(layout_blocks)
+    structured_payload["tables"] = tables
+    structured_payload["figures"] = figures
+    structured_payload["table_count"] = len(tables)
+    structured_payload["figure_count"] = len(figures)
+    structured_payload["reference_sections"] = reference_sections
+    structured_payload["reference_section_count"] = len(reference_sections)
+    write_json(base / "structured.json", structured_payload)
     write_json(base / "metadata.json", parsed.metadata)
     write_json(base / "references.json", parsed.references)
+    write_json(base / "layout_blocks.json", _layout_artifact(doc_id, version_id, layout_blocks))
+    write_json(base / "tables.json", _visual_artifact("tables", doc_id, version_id, tables))
+    write_json(base / "figures.json", _visual_artifact("figures", doc_id, version_id, figures))
+    write_json(base / "reference_sections.json", _reference_sections_artifact(doc_id, version_id, reference_sections))
     write_json(
         base / "parse_report.json",
         {
@@ -169,6 +189,11 @@ def _write_artifacts(doc_id: str, version_id: str, base: Path, source_path: Path
             "warnings": parsed.parse_warnings,
             "metadata": parsed.metadata,
             "block_count": len(parsed.blocks),
+            "layout_block_count": len(layout_blocks),
+            "table_count": len(tables),
+            "figure_count": len(figures),
+            "reference_section_count": len(reference_sections),
+            "noise_removed_count": int(parsed.metadata.get("noise_removed_count") or 0),
             "node_count": len(nodes),
             "artifact_dir": str(base),
             "created_at": time.time(),
@@ -219,6 +244,11 @@ def _write_failure_report(
             "warnings": [],
             "metadata": {},
             "block_count": 0,
+            "layout_block_count": 0,
+            "table_count": 0,
+            "figure_count": 0,
+            "reference_section_count": 0,
+            "noise_removed_count": 0,
             "node_count": 0,
             "artifact_dir": str(base),
             "created_at": time.time(),
@@ -227,6 +257,9 @@ def _write_failure_report(
 
 
 def _build_doc_card(doc_id: str, version_id: str, base: Path, source_path: Path, file_hash: str, parsed, nodes) -> Dict[str, object]:  # type: ignore[no-untyped-def]
+    layout_blocks = _layout_blocks_from(parsed)
+    tables = _tables_from(parsed)
+    figures = _figures_from(parsed)
     section_nodes = [node for node in nodes if node.kind == "section"]
     section_count = len(section_nodes)
     page_values = [node.page_start for node in nodes if node.page_start]
@@ -242,6 +275,13 @@ def _build_doc_card(doc_id: str, version_id: str, base: Path, source_path: Path,
     metadata_score = _metadata_score(parsed)
     structure_score = _structure_score(section_count, paragraph_count, page_only_tree)
     reference_score = _reference_score(reference_count, parsed)
+    layout_score = _layout_score(layout_blocks, parsed)
+    caption_score = _caption_score(figures, tables)
+    caption_link_rate = _caption_link_rate(figures, tables)
+    if parsed.file_type == "pdf" and layout_score < 0.45:
+        quality_warnings.append("weak_layout_blocks")
+    if (figures or tables) and caption_link_rate < 0.5:
+        quality_warnings.append("low_caption_link_rate")
     quality_level = _quality_level(metadata_score, structure_score, reference_score, quality_warnings)
     parse_quality = {
         "schema": "parse_quality.v0",
@@ -259,6 +299,11 @@ def _build_doc_card(doc_id: str, version_id: str, base: Path, source_path: Path,
         "metadata_score": metadata_score,
         "structure_score": structure_score,
         "reference_score": reference_score,
+        "layout_score": layout_score,
+        "caption_score": caption_score,
+        "noise_removed_count": int(parsed.metadata.get("noise_removed_count") or 0),
+        "layout_block_count": len(layout_blocks),
+        "caption_link_rate": caption_link_rate,
         "warning_count": len(quality_warnings),
         "missing_abstract": missing_abstract,
         "page_only_tree": page_only_tree,
@@ -308,6 +353,10 @@ def _build_doc_card(doc_id: str, version_id: str, base: Path, source_path: Path,
             "structured.json",
             "metadata.json",
             "references.json",
+            "layout_blocks.json",
+            "tables.json",
+            "figures.json",
+            "reference_sections.json",
             "parse_report.json",
             "tree.json",
             "node_index.jsonl",
@@ -316,6 +365,87 @@ def _build_doc_card(doc_id: str, version_id: str, base: Path, source_path: Path,
             "citation_map.json",
         ],
         "created_at": time.time(),
+    }
+
+
+def _layout_blocks_from(parsed) -> List[Dict[str, Any]]:  # type: ignore[no-untyped-def]
+    blocks = parsed.structured.get("layout_blocks") if isinstance(parsed.structured, dict) else []
+    if isinstance(blocks, list):
+        cleaned = [item for item in blocks if isinstance(item, dict)]
+        if cleaned:
+            return cleaned
+    return build_layout_blocks(parsed.blocks, parsed.parser_name or parsed.file_type)
+
+
+def _tables_from(parsed) -> List[Dict[str, Any]]:  # type: ignore[no-untyped-def]
+    tables = parsed.structured.get("tables") if isinstance(parsed.structured, dict) else []
+    if isinstance(tables, list):
+        cleaned = [item for item in tables if isinstance(item, dict)]
+        if cleaned and all(item.get("schema") == "table.v1" for item in cleaned):
+            return cleaned
+    return build_visual_items(_layout_blocks_from(parsed), "table")
+
+
+def _figures_from(parsed) -> List[Dict[str, Any]]:  # type: ignore[no-untyped-def]
+    figures = parsed.structured.get("figures") if isinstance(parsed.structured, dict) else []
+    if isinstance(figures, list):
+        cleaned = [item for item in figures if isinstance(item, dict)]
+        if cleaned and all(item.get("schema") == "figure.v1" for item in cleaned):
+            return cleaned
+    return build_visual_items(_layout_blocks_from(parsed), "figure")
+
+
+def _reference_sections_from(parsed) -> List[Dict[str, Any]]:  # type: ignore[no-untyped-def]
+    sections = parsed.structured.get("reference_sections") if isinstance(parsed.structured, dict) else []
+    if isinstance(sections, list):
+        cleaned = [item for item in sections if isinstance(item, dict)]
+        if cleaned:
+            return cleaned
+    return build_reference_sections(_layout_blocks_from(parsed), parsed.references)
+
+
+def _layout_artifact(doc_id: str, version_id: str, layout_blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    type_counts: Dict[str, int] = {}
+    pages = set()
+    for block in layout_blocks:
+        block_type = str(block.get("type") or "")
+        if block_type:
+            type_counts[block_type] = type_counts.get(block_type, 0) + 1
+        page = block.get("page")
+        if isinstance(page, int):
+            pages.add(page)
+    return {
+        "schema": "layout_blocks.v1",
+        "doc_id": doc_id,
+        "version_id": version_id,
+        "count": len(layout_blocks),
+        "type_counts": type_counts,
+        "page_count": len(pages),
+        "blocks": layout_blocks,
+    }
+
+
+def _visual_artifact(kind: str, doc_id: str, version_id: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "schema": f"{kind}.v1",
+        "doc_id": doc_id,
+        "version_id": version_id,
+        "count": len(items),
+        kind: items,
+    }
+
+
+def _reference_sections_artifact(
+    doc_id: str,
+    version_id: str,
+    sections: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    return {
+        "schema": "reference_sections.v1",
+        "doc_id": doc_id,
+        "version_id": version_id,
+        "count": len(sections),
+        "reference_sections": sections,
     }
 
 
@@ -369,6 +499,47 @@ def _reference_score(reference_count: int, parsed) -> float:  # type: ignore[no-
     if (parsed.references or {}).get("status") == "extracted":
         return 0.45
     return 0.0
+
+
+def _layout_score(layout_blocks: List[Dict[str, Any]], parsed) -> float:  # type: ignore[no-untyped-def]
+    if not layout_blocks:
+        return 0.0 if parsed.file_type == "pdf" else 0.45
+    types = {str(block.get("type") or "") for block in layout_blocks}
+    score = 0.35
+    if "heading" in types or "abstract" in types:
+        score += 0.2
+    if "paragraph" in types:
+        score += 0.15
+    if "reference" in types:
+        score += 0.1
+    if "figure" in types or "table" in types:
+        score += 0.1
+    if any(block.get("bbox") for block in layout_blocks):
+        score += 0.1
+    return round(min(score, 1.0), 2)
+
+
+def _caption_score(figures: List[Dict[str, Any]], tables: List[Dict[str, Any]]) -> float:
+    items = [*figures, *tables]
+    if not items:
+        return 1.0
+    return round(sum(1 for item in items if _has_caption(item)) / len(items), 2)
+
+
+def _caption_link_rate(figures: List[Dict[str, Any]], tables: List[Dict[str, Any]]) -> float:
+    items = [*figures, *tables]
+    if not items:
+        return 1.0
+    linked = [
+        item
+        for item in items
+        if (item.get("caption_id") or item.get("layout_block_id")) and _has_caption(item)
+    ]
+    return round(len(linked) / len(items), 2)
+
+
+def _has_caption(item: Dict[str, Any]) -> bool:
+    return bool(str(item.get("caption") or item.get("text") or "").strip())
 
 
 def _quality_level(

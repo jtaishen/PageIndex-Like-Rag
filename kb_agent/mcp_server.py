@@ -4,7 +4,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .answer import answer_query, route_documents
-from .artifacts import get_artifact, get_citation_map, get_doc_card, get_innovations, get_parse_quality, get_parse_report
+from .artifacts import (
+    get_artifact,
+    get_citation_map,
+    get_doc_card,
+    get_figures,
+    get_innovations,
+    get_layout_blocks,
+    get_parse_quality,
+    get_parse_report,
+    get_tables,
+)
 from .config import resolve_db_path
 from .embeddings import build_semantic_index, semantic_index_status
 from .eval import eval_memory, eval_review, eval_search
@@ -308,6 +318,21 @@ if FastMCP is not None:
     def kb_get_parse_report(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
         """Return parser diagnostics and fallback details for one indexed document."""
         return get_parse_report(resolve_db_path(db_path), doc_id)
+
+    @mcp.tool()
+    def kb_get_layout_blocks(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return normalized layout blocks for one indexed document."""
+        return get_layout_blocks(resolve_db_path(db_path), doc_id)
+
+    @mcp.tool()
+    def kb_get_figures(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return parsed figure captions and layout links for one indexed document."""
+        return get_figures(resolve_db_path(db_path), doc_id)
+
+    @mcp.tool()
+    def kb_get_tables(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return parsed table captions and layout links for one indexed document."""
+        return get_tables(resolve_db_path(db_path), doc_id)
 
     @mcp.tool()
     def kb_extract_doc_insights(

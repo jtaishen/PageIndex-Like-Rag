@@ -8,7 +8,17 @@ from typing import Any, Dict, Iterable, List
 
 from . import db
 from .answer import answer_query, route_documents
-from .artifacts import get_citation_map, get_doc_card, get_innovations, get_parse_quality, get_parse_report, list_artifacts
+from .artifacts import (
+    get_citation_map,
+    get_doc_card,
+    get_figures,
+    get_innovations,
+    get_layout_blocks,
+    get_parse_quality,
+    get_parse_report,
+    get_tables,
+    list_artifacts,
+)
 from .config import resolve_db_path
 from .embeddings import build_semantic_index, semantic_index_status
 from .eval import eval_memory, eval_review, eval_search
@@ -107,6 +117,18 @@ def main(argv: Any = None) -> None:
     parse_report_parser = subparsers.add_parser("parse-report", help="Show parser diagnostics for a document")
     parse_report_parser.add_argument("doc_id")
     parse_report_parser.add_argument("--version-id", default=None)
+
+    layout_parser = subparsers.add_parser("layout", help="Show PDF layout block artifact summary")
+    layout_parser.add_argument("doc_id")
+    layout_parser.add_argument("--version-id", default=None)
+
+    figures_parser = subparsers.add_parser("figures", help="Show parsed figure caption artifacts")
+    figures_parser.add_argument("doc_id")
+    figures_parser.add_argument("--version-id", default=None)
+
+    tables_parser = subparsers.add_parser("tables", help="Show parsed table caption artifacts")
+    tables_parser.add_argument("doc_id")
+    tables_parser.add_argument("--version-id", default=None)
 
     extract_parser = subparsers.add_parser("extract", help="Extract paper insight artifacts")
     extract_parser.add_argument("doc_id")
@@ -318,6 +340,12 @@ def main(argv: Any = None) -> None:
         _print_json(get_parse_quality(db_path, args.doc_id))
     elif args.command == "parse-report":
         _print_json(_parse_report_summary(get_parse_report(db_path, args.doc_id, args.version_id)))
+    elif args.command == "layout":
+        _print_json(_layout_summary(get_layout_blocks(db_path, args.doc_id, args.version_id)))
+    elif args.command == "figures":
+        _print_json(get_figures(db_path, args.doc_id, args.version_id))
+    elif args.command == "tables":
+        _print_json(get_tables(db_path, args.doc_id, args.version_id))
     elif args.command == "extract":
         result = extract_doc_insights(
             db_path,
@@ -723,8 +751,26 @@ def _parse_report_summary(report: dict) -> dict:
         "warning_count": len(report.get("warnings") or []),
         "warnings": report.get("warnings") or [],
         "block_count": report.get("block_count"),
+        "layout_block_count": report.get("layout_block_count"),
+        "table_count": report.get("table_count"),
+        "figure_count": report.get("figure_count"),
+        "reference_section_count": report.get("reference_section_count"),
+        "noise_removed_count": report.get("noise_removed_count"),
         "node_count": report.get("node_count"),
         "artifact_dir": report.get("artifact_dir"),
+    }
+
+
+def _layout_summary(layout: dict) -> dict:
+    blocks = layout.get("blocks") or []
+    return {
+        "schema": layout.get("schema"),
+        "doc_id": layout.get("doc_id"),
+        "version_id": layout.get("version_id"),
+        "count": layout.get("count"),
+        "type_counts": layout.get("type_counts") or {},
+        "page_count": layout.get("page_count"),
+        "sample": blocks[:10] if isinstance(blocks, list) else [],
     }
 
 

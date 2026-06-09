@@ -13,6 +13,10 @@ ARTIFACT_WHITELIST = {
     "structured.json",
     "metadata.json",
     "references.json",
+    "layout_blocks.json",
+    "tables.json",
+    "figures.json",
+    "reference_sections.json",
     "parse_report.json",
     "tree.json",
     "node_index.jsonl",
@@ -54,6 +58,11 @@ def get_parse_quality(db_path: Path, doc_id: str) -> Dict[str, Any]:
         "metadata_score": None,
         "structure_score": None,
         "reference_score": None,
+        "layout_score": None,
+        "caption_score": None,
+        "noise_removed_count": 0,
+        "layout_block_count": 0,
+        "caption_link_rate": None,
         "quality_level": "usable" if card.get("section_count", 0) else "weak",
         "warning_count": len(card.get("quality_warnings", [])),
         "missing_abstract": not bool(card.get("abstract")),
@@ -64,6 +73,18 @@ def get_parse_quality(db_path: Path, doc_id: str) -> Dict[str, Any]:
 
 def get_parse_report(db_path: Path, doc_id: str, version_id: Optional[str] = None) -> Dict[str, Any]:
     return get_artifact(db_path, doc_id, "parse_report.json", version_id=version_id)["content"]
+
+
+def get_layout_blocks(db_path: Path, doc_id: str, version_id: Optional[str] = None) -> Dict[str, Any]:
+    return get_artifact(db_path, doc_id, "layout_blocks.json", version_id=version_id)["content"]
+
+
+def get_figures(db_path: Path, doc_id: str, version_id: Optional[str] = None) -> Dict[str, Any]:
+    return get_artifact(db_path, doc_id, "figures.json", version_id=version_id)["content"]
+
+
+def get_tables(db_path: Path, doc_id: str, version_id: Optional[str] = None) -> Dict[str, Any]:
+    return get_artifact(db_path, doc_id, "tables.json", version_id=version_id)["content"]
 
 
 def get_innovations(db_path: Path, doc_id: str, version_id: Optional[str] = None) -> Dict[str, Any]:

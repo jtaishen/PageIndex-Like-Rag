@@ -13,6 +13,11 @@ class ParsedBlock:
     page: Optional[int] = None
     char_start: Optional[int] = None
     char_end: Optional[int] = None
+    bbox: Optional[List[float]] = None
+    layout_block_id: str = ""
+    caption_id: str = ""
+    confidence: float = 1.0
+    source_parser: str = ""
 
 
 @dataclass
@@ -69,7 +74,7 @@ class NodeRecord:
     char_start: Optional[int] = None
     char_end: Optional[int] = None
     keywords: List[str] = field(default_factory=list)
-    source_offsets: Dict[str, Optional[int]] = field(default_factory=dict)
+    source_offsets: Dict[str, Any] = field(default_factory=dict)
     doc_hash: str = ""
 
 

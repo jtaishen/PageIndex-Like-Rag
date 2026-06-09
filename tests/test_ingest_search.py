@@ -15,7 +15,18 @@ from pathlib import Path
 
 from kb_agent import db
 from kb_agent.answer import answer_query
-from kb_agent.artifacts import get_artifact, get_citation_map, get_doc_card, get_innovations, get_parse_quality, get_parse_report, list_artifacts
+from kb_agent.artifacts import (
+    get_artifact,
+    get_citation_map,
+    get_doc_card,
+    get_figures,
+    get_innovations,
+    get_layout_blocks,
+    get_parse_quality,
+    get_parse_report,
+    get_tables,
+    list_artifacts,
+)
 from kb_agent.cli import main as cli_main
 from kb_agent.embeddings import HashEmbeddingProvider, build_semantic_index, semantic_index_status
 from kb_agent.eval import eval_memory, eval_review, eval_search
@@ -98,6 +109,10 @@ class IngestSearchTest(unittest.TestCase):
             self.assertIn("structured.json", names)
             self.assertIn("metadata.json", names)
             self.assertIn("references.json", names)
+            self.assertIn("layout_blocks.json", names)
+            self.assertIn("tables.json", names)
+            self.assertIn("figures.json", names)
+            self.assertIn("reference_sections.json", names)
             self.assertIn("parse_report.json", names)
             self.assertIn("tree.json", names)
             self.assertIn("node_index.jsonl", names)
@@ -1376,6 +1391,107 @@ class IngestSearchTest(unittest.TestCase):
             self.assertFalse(quality["fallback_used"])
             self.assertIn(quality["quality_level"], {"good", "usable"})
 
+    def test_pypdf_layout_rules_extract_blocks_and_quality(self) -> None:
+        class FakePage:
+            def __init__(self, text: str) -> None:
+                self._text = text
+
+            def extract_text(self) -> str:
+                return self._text
+
+        class FakeReader:
+            def __init__(self, path: str) -> None:
+                del path
+                self.pages = [
+                    FakePage(
+                        "期刊页眉\n"
+                        "复杂 PDF 论文\n"
+                        "摘要：本文研究复杂 PDF 版面解析，重点识别图题、表题和参考文献区域，"
+                        "并清理页眉页脚以提升证据质量。\n"
+                        "关键词：版面解析；图题；表题\n"
+                        "1 引言\n"
+                        "本文第一段介绍复杂论文版面的研究背景。\n"
+                        "图 1 复杂 PDF 解析流程\n"
+                        "表 1 版面块识别结果\n"
+                        "DOI: 10.1234/noise\n"
+                        "1\n"
+                    ),
+                    FakePage(
+                        "期刊页眉\n"
+                        "2 方法\n"
+                        "本文提出基于 layout_block 的规则化解析方法。\n"
+                        "参考文献\n"
+                        "[1] 张三. PDF 解析研究. 2025.\n"
+                        "2\n"
+                    ),
+                ]
+                self.metadata = types.SimpleNamespace(title="复杂 PDF 论文", author="张三;李四")
+
+        fake_module = types.SimpleNamespace(PdfReader=FakeReader)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(sys.modules, {"pypdf": fake_module}):
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "layout.pdf").write_bytes(b"%PDF fake")
+
+            report = sync_directory(papers, db_path, force=True, pdf_parser="pypdf")
+
+            self.assertEqual(report["indexed"], 1)
+            doc_id = str(search_documents(db_path, "复杂 PDF 版面解析", top_k=1)[0]["doc_id"])
+            layout = get_layout_blocks(db_path, doc_id)
+            self.assertEqual(layout["schema"], "layout_blocks.v1")
+            self.assertGreaterEqual(layout["count"], 8)
+            self.assertGreaterEqual(layout["type_counts"]["heading"], 3)
+            self.assertEqual(layout["type_counts"]["figure"], 1)
+            self.assertEqual(layout["type_counts"]["table"], 1)
+            self.assertGreaterEqual(layout["type_counts"]["reference"], 1)
+
+            figures = get_figures(db_path, doc_id)
+            tables = get_tables(db_path, doc_id)
+            self.assertEqual(figures["count"], 1)
+            self.assertIn("图 1", figures["figures"][0]["caption"])
+            self.assertEqual(tables["count"], 1)
+            self.assertIn("表 1", tables["tables"][0]["caption"])
+
+            references = get_artifact(db_path, doc_id, "reference_sections.json")["content"]
+            self.assertEqual(references["count"], 1)
+            self.assertGreaterEqual(references["reference_sections"][0]["item_count"], 1)
+
+            quality = get_parse_quality(db_path, doc_id)
+            self.assertGreaterEqual(quality["layout_score"], 0.8)
+            self.assertEqual(quality["caption_score"], 1.0)
+            self.assertGreaterEqual(quality["noise_removed_count"], 3)
+            self.assertEqual(quality["layout_block_count"], layout["count"])
+
+            parse_report = get_parse_report(db_path, doc_id)
+            self.assertEqual(parse_report["layout_block_count"], layout["count"])
+            self.assertEqual(parse_report["figure_count"], 1)
+            self.assertEqual(parse_report["table_count"], 1)
+            self.assertGreaterEqual(parse_report["noise_removed_count"], 3)
+
+            node_index = get_artifact(db_path, doc_id, "node_index.jsonl")["content"]
+            visual_nodes = [node for node in node_index if node["kind"] in {"figure", "table"}]
+            self.assertEqual(len(visual_nodes), 2)
+            for node in visual_nodes:
+                self.assertIn("layout_block_id", node["source_offsets"])
+                self.assertIn("caption_id", node["source_offsets"])
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "layout", doc_id])
+            self.assertIn("layout_blocks.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "figures", doc_id])
+            self.assertIn("图 1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "tables", doc_id])
+            self.assertIn("表 1", stdout.getvalue())
+
     def test_docling_adapter_enhances_structured_tree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1399,8 +1515,17 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(report["indexed"], 1)
             doc_id = str(search_documents(db_path, "解析质量", top_k=1)[0]["doc_id"])
             structured = get_artifact(db_path, doc_id, "structured.json")["content"]
+            self.assertEqual(structured["layout_schema"], "layout_blocks.v1")
+            self.assertGreaterEqual(structured["layout_blocks_count"], 1)
             self.assertGreaterEqual(len(structured["tables"]), 1)
             self.assertGreaterEqual(len(structured["figures"]), 1)
+            layout = get_layout_blocks(db_path, doc_id)
+            self.assertGreaterEqual(layout["type_counts"]["table"], 1)
+            self.assertGreaterEqual(layout["type_counts"]["figure"], 1)
+            node_index = get_artifact(db_path, doc_id, "node_index.jsonl")["content"]
+            table_node = next(node for node in node_index if node["kind"] == "table")
+            self.assertIn("layout_block_id", table_node["source_offsets"])
+            self.assertIn("caption_id", table_node["source_offsets"])
             tree = get_artifact(db_path, doc_id, "tree.json")["content"]
             types = _collect_tree_types(tree)
             self.assertIn("section", types)
@@ -1446,6 +1571,10 @@ class IngestSearchTest(unittest.TestCase):
             references = get_artifact(db_path, doc_id, "references.json")["content"]
             self.assertEqual(references["source"], "grobid")
             self.assertEqual(len(references["references"]), 1)
+            reference_sections = get_artifact(db_path, doc_id, "reference_sections.json")["content"]
+            self.assertEqual(reference_sections["schema"], "reference_sections.v1")
+            self.assertEqual(reference_sections["count"], 1)
+            self.assertGreaterEqual(reference_sections["reference_sections"][0]["references_count"], 1)
             parse_report = get_parse_report(db_path, doc_id)
             self.assertEqual(parse_report["parser_chain"], ["pypdf", "grobid"])
 

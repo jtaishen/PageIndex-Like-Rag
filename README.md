@@ -11,7 +11,7 @@ parse -> normalize -> tree -> artifacts -> indexes -> evidence packet -> CLI / M
 - 递归扫描目录，支持增量同步。
 - 支持 Markdown、TXT、DOCX、HTML 基础解析。
 - PDF 解析通过可选依赖 `pypdf` 支持，并可用 `KB_PDF_PARSER` 或 `--pdf-parser` 选择 `auto`、`pypdf`、`docling`、`grobid`。
-- 解析后生成 `raw_text.txt`、`body.md`、`structured.json`、`metadata.json`、`references.json`、`parse_report.json`、`tree.json`、`node_index.jsonl`、`doc_card.json` 等工件。
+- 解析后生成 `raw_text.txt`、`body.md`、`structured.json`、`metadata.json`、`references.json`、`layout_blocks.json`、`tables.json`、`figures.json`、`reference_sections.json`、`parse_report.json`、`tree.json`、`node_index.jsonl`、`doc_card.json` 等工件。
 - 对中文论文常见结构做规则识别，包括摘要、关键词、第 X 章、`1.1`/`1.1.1` 小节、结论、参考文献、图和表。
 - 将文档保存为 `documents` 和 `doc_nodes`。
 - 使用 SQLite FTS5 做全文检索，并支持本地 embedding + hybrid rerank。
@@ -409,6 +409,36 @@ uv run python -m kb_agent.cli eval-dashboard --format html --since-days 7
 
 dashboard 会展示 query log、feedback、eval report、search tuning 和 active profile 摘要，但不会展示论文正文、长 excerpt、evidence packet 或综述草稿正文。
 
+## v0.14 复杂 PDF 版面解析与图表结构增强
+
+v0.14 将 PDF 解析结果统一为 `layout_block.v1`，并新增图表、表格和参考文献区域工件。`pypdf` 仍是稳定兜底，但会先做页眉页脚、页码、DOI/版权等噪声清理，再按摘要、关键词、章节、图题、表题、公式样式、参考文献条目拆分版面块。Docling 可用时会优先融合其结构块、bbox、表格、图片和 caption；GROBID 可用时继续增强元数据和参考文献结构。
+
+重建真实 PDF 工件：
+
+```bash
+uv run --extra pdf python -m kb_agent.cli sync articles --force --pdf-parser pypdf
+```
+
+查看版面、图表、树和质量：
+
+```bash
+uv run python -m kb_agent.cli parse-report <doc_id>
+uv run python -m kb_agent.cli layout <doc_id>
+uv run python -m kb_agent.cli figures <doc_id>
+uv run python -m kb_agent.cli tables <doc_id>
+uv run python -m kb_agent.cli tree <doc_id>
+uv run python -m kb_agent.cli quality <doc_id>
+```
+
+如果 `quality` 显示 `page_only_tree`、`weak_layout_blocks` 或章节数量过少，优先尝试 Docling：
+
+```bash
+uv sync --extra pdf --extra docling
+uv run --extra pdf --extra docling python -m kb_agent.cli sync articles --force --pdf-parser docling
+```
+
+本轮不做 OCR。扫描版 PDF 会给出 `scanned_pdf_or_empty_text` 或弱解析 warning，需要后续接入 OCR/版面模型。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
@@ -486,7 +516,7 @@ DeepSeek 官方 OpenCode 接入方式：
 推荐工具调用顺序：
 
 ```text
-kb_sync -> kb_build_semantic_index -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_classify_query -> kb_tree_search -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> kb_eval_search -> kb_eval_review -> kb_eval_memory -> kb_get_query_stats -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
+kb_sync -> kb_build_semantic_index -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_get_layout_blocks -> kb_get_figures -> kb_get_tables -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_classify_query -> kb_tree_search -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> kb_eval_search -> kb_eval_review -> kb_eval_memory -> kb_get_query_stats -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
 ```
 
 当用户明确指出某次结果好坏时，推荐追加：
@@ -509,4 +539,4 @@ uv run python -m unittest discover -s tests
 
 ## 后续阶段
 
-- 继续增强复杂 PDF 版面解析、表格/图注结构化、claims/entities/relations 数据层和更完整的 OpenCode 多智能体工作流。
+- 继续增强 claims/entities/relations 数据层、扫描版 OCR、表格内容抽取和更完整的 OpenCode 多智能体工作流。

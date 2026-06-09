@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .models import NodeRecord, ParsedBlock, ParsedDocument
 from .utils import chunk_text, first_words, stable_id
@@ -214,13 +214,24 @@ def _fill_section_summaries(nodes: List[NodeRecord]) -> None:
                 node.keywords = _keywords(node.heading, child_text)
 
 
-def _source_offsets(block: ParsedBlock) -> Dict[str, Optional[int]]:
-    return {
+def _source_offsets(block: ParsedBlock) -> Dict[str, Any]:
+    offsets: Dict[str, Any] = {
         "char_start": block.char_start,
         "char_end": block.char_end,
         "page_start": block.page,
         "page_end": block.page,
     }
+    if block.layout_block_id:
+        offsets["layout_block_id"] = block.layout_block_id
+    if block.caption_id:
+        offsets["caption_id"] = block.caption_id
+    if block.bbox is not None:
+        offsets["bbox"] = block.bbox
+    if block.source_parser:
+        offsets["source_parser"] = block.source_parser
+    if block.confidence != 1.0:
+        offsets["confidence"] = round(block.confidence, 3)
+    return offsets
 
 
 def _keywords(*values: str, limit: int = 10) -> List[str]:
