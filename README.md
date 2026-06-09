@@ -16,10 +16,11 @@ parse -> normalize -> tree -> artifacts -> indexes -> evidence packet -> CLI / M
 - 将文档保存为 `documents` 和 `doc_nodes`。
 - 使用 SQLite FTS5 做全文检索，并支持本地 embedding + hybrid rerank。
 - 返回带 `doc_id`、`node_id`、`node_path`、页码和 excerpt 的 evidence packet。
-- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`parse-report`、`embed`、`search-report`、`eval-search`、`eval-review`、`eval-memory`、`query-log`、`query-stats`、`feedback-put`、`feedback-to-eval`、`eval-dashboard`、`extract`、`innovations`、`citations`。
+- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`parse-report`、`embed`、`search-report`、`eval-search`、`eval-review`、`eval-memory`、`query-log`、`query-stats`、`feedback-put`、`feedback-to-eval`、`eval-dashboard`、`tune-search`、`search-profile`、`extract`、`innovations`、`citations`。
 - 支持跨论文比较和综述规划任务工件，生成比较矩阵、综述大纲、章节证据表和下一步行动。
 - 支持长期 memory 写入门控、任务进度记忆、任务恢复和任务进度压缩。
 - 支持人工反馈闭环，可将用户评分、期望 doc/node/keyword 转为搜索评测集。
+- 支持基于评测集生成 search profile，并通过显式 `--search-mode auto` 使用调优策略。
 - 提供可选 MCP server，供 OpenCode 调用。
 
 ## 快速开始
@@ -365,6 +366,49 @@ uv run python -m kb_agent.cli eval-dashboard --since-days 7
 
 `query-stats` 现在也会汇总反馈数量、平均评分、低评分数量、反馈标签分布和各 search mode 的反馈分布。OpenCode observer 会在证据不足、fallback 或综述引用覆盖低时提示使用 `kb_put_feedback -> kb_build_eval_set_from_feedback -> kb_eval_search` 做复盘。
 
+## v0.13 真实 Embedding 与评测驱动检索调优
+
+v0.13 增强 `sentence-transformers` provider，并用评测集生成本地 search profile。默认检索模式仍是 `hybrid`；只有显式传入 `--search-mode auto` 时，系统才会读取 active profile，根据查询意图选择 `hybrid`、`tree` 或 `fts`。
+
+查看 embedding 状态：
+
+```bash
+uv run python -m kb_agent.cli embed --status --provider hash
+uv run python -m kb_agent.cli embed --status --provider sentence-transformers --model sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+```
+
+构建真实 embedding：
+
+```bash
+uv sync --extra embeddings
+uv run python -m kb_agent.cli embed --provider sentence-transformers --model sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 --batch-size 16 --force
+```
+
+基于评测集调优检索策略并保存 profile：
+
+```bash
+uv run python -m kb_agent.cli tune-search data/eval_sets/<feedback_eval>.json --compare-modes hybrid,tree,fts --save-profile paper-v1
+uv run python -m kb_agent.cli search-profile list
+uv run python -m kb_agent.cli search-profile apply paper-v1
+```
+
+显式使用 auto 策略：
+
+```bash
+uv run python -m kb_agent.cli search "动态角色任务规划" --search-mode auto
+uv run python -m kb_agent.cli ask "这篇论文的方法设计是什么？" --no-llm --search-mode auto
+uv run python -m kb_agent.cli compare "服务机器人与多智能体任务规划方法对比" --no-llm --search-mode auto
+uv run python -m kb_agent.cli generate-review "任务规划方法研究综述" --no-llm --search-mode auto
+```
+
+生成 HTML 仪表盘：
+
+```bash
+uv run python -m kb_agent.cli eval-dashboard --format html --since-days 7
+```
+
+dashboard 会展示 query log、feedback、eval report、search tuning 和 active profile 摘要，但不会展示论文正文、长 excerpt、evidence packet 或综述草稿正文。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
@@ -451,6 +495,12 @@ kb_sync -> kb_build_semantic_index -> kb_search_docs -> kb_get_doc_card -> kb_ge
 kb_get_query_log -> kb_put_feedback -> kb_build_eval_set_from_feedback -> kb_eval_search -> kb_eval_dashboard
 ```
 
+调优检索策略时，推荐追加：
+
+```text
+kb_build_eval_set_from_feedback -> kb_eval_search -> kb_tune_search -> kb_apply_search_profile -> search_mode="auto"
+```
+
 ## 测试
 
 ```bash
@@ -459,4 +509,4 @@ uv run python -m unittest discover -s tests
 
 ## 后续阶段
 
-- 增加反馈驱动的查询日志可视化 UI、更完整的 OpenCode 工作流自动化，以及基于评测集的检索策略调参。
+- 继续增强复杂 PDF 版面解析、表格/图注结构化、claims/entities/relations 数据层和更完整的 OpenCode 多智能体工作流。

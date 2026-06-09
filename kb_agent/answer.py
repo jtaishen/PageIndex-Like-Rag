@@ -8,6 +8,7 @@ from .llm import LLMError, generate_grounded_answer
 from .query import classify_query
 from .query_log import write_query_log
 from .search import get_evidence, search_documents, search_nodes
+from .search_profile import resolve_auto_search_mode
 from .tree_search import tree_search_for_query
 from .utils import compact_whitespace, first_words
 
@@ -22,11 +23,20 @@ def answer_query(
 ) -> Dict[str, object]:
     started = time.time()
     tree_trace = None
-    if search_mode == "tree":
+    requested_search_mode = search_mode
+    auto_resolution: Dict[str, object] = {}
+    effective_search_mode = search_mode
+    if search_mode == "auto":
+        auto_resolution = resolve_auto_search_mode(db_path, query)
+        effective_search_mode = str(auto_resolution.get("resolved_search_mode") or "hybrid")
+    if effective_search_mode == "tree":
         tree_trace = tree_search_for_query(db_path, query, top_k=top_k, use_llm=False, search_mode="hybrid")
+        if auto_resolution:
+            tree_trace["auto_resolution"] = auto_resolution
+            tree_trace["resolved_search_mode"] = effective_search_mode
         evidence = list(tree_trace.get("evidence") or [])
     else:
-        results = search_nodes(db_path, query, top_k=top_k, search_mode=search_mode)
+        results = search_nodes(db_path, query, top_k=top_k, search_mode=requested_search_mode)
         evidence = []
         for result in results:
             packets = get_evidence(db_path, result.doc_id, [result.node_id])
@@ -50,6 +60,7 @@ def answer_query(
     docs_used = _unique_values(str(item.get("doc_id") or "") for item in evidence)
     nodes_used = _unique_values(str(item.get("node_id") or "") for item in evidence)
     warnings = list((tree_trace or {}).get("warnings") or [])
+    warnings.extend(str(item) for item in auto_resolution.get("warnings", []))
     if llm_error:
         warnings.append(f"llm_unavailable:{llm_error}")
     if not evidence:
@@ -64,7 +75,7 @@ def answer_query(
         operation="ask",
         query=query,
         intent=intent,
-        search_mode=search_mode,
+        search_mode=requested_search_mode,
         status="ok" if evidence else "empty",
         docs_used=docs_used,
         nodes_used=nodes_used,
@@ -76,12 +87,16 @@ def answer_query(
             "doc_count": len(docs_used),
             "use_llm": use_llm,
             "llm_error": bool(llm_error),
+            "resolved_search_mode": effective_search_mode,
+            "profile_name": auto_resolution.get("profile_name", ""),
         },
     )
 
     return {
         "query": query,
-        "search_mode": search_mode,
+        "search_mode": requested_search_mode,
+        "resolved_search_mode": effective_search_mode,
+        "auto_resolution": auto_resolution,
         "answer": "\n".join(lines),
         "evidence": evidence,
         "tree_search_trace": tree_trace,

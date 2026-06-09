@@ -23,3 +23,5 @@ mode: primary
 13. 需要复盘检索、综述草稿或 memory 质量时，调用 `kb_eval_search`、`kb_eval_review`、`kb_eval_memory`、`kb_get_query_stats`。
 14. 用户指出检索、问答、比较或综述结果好坏时，先用 `kb_put_feedback` 记录短反馈，再用 `kb_build_eval_set_from_feedback` 转成评测集，必要时调用 `kb_eval_dashboard` 生成复盘报告。
 15. 反馈只记录评分、标签、期望 doc/node/keyword 和短评论，不保存论文正文、长 excerpt、evidence packet 或草稿正文。
+16. 需要调优检索策略时，调用 `kb_tune_search` 生成 search profile，再由用户确认后调用 `kb_apply_search_profile`；之后仅在明确需要时使用 `search_mode="auto"`。
+17. `auto` 模式必须说明当前 active profile 和 resolved search mode，不要把它说成默认检索行为。

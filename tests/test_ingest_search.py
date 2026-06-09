@@ -6,7 +6,9 @@ import json
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -15,7 +17,7 @@ from kb_agent import db
 from kb_agent.answer import answer_query
 from kb_agent.artifacts import get_artifact, get_citation_map, get_doc_card, get_innovations, get_parse_quality, get_parse_report, list_artifacts
 from kb_agent.cli import main as cli_main
-from kb_agent.embeddings import HashEmbeddingProvider, build_semantic_index
+from kb_agent.embeddings import HashEmbeddingProvider, build_semantic_index, semantic_index_status
 from kb_agent.eval import eval_memory, eval_review, eval_search
 from kb_agent.feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from kb_agent.ingest import sync_directory
@@ -27,6 +29,7 @@ from kb_agent.query import classify_query
 from kb_agent.query_log import list_query_logs, query_stats
 from kb_agent.review import assemble_review, check_review_citations, draft_review
 from kb_agent.search import build_search_report, get_evidence, search_documents, search_nodes
+from kb_agent.search_profile import apply_search_profile, get_search_profile, list_search_profiles, tune_search
 from kb_agent.tasks import compare_papers, generate_review_plan, get_task_artifact
 from kb_agent.tree_search import tree_search
 
@@ -669,11 +672,69 @@ class IngestSearchTest(unittest.TestCase):
             second = build_semantic_index(db_path, provider="hash")
             self.assertEqual(second["indexed_nodes"], 0)
             self.assertGreater(second["skipped_nodes"], 0)
+            status = semantic_index_status(db_path, provider="hash")
+            self.assertEqual(status["schema"], "semantic_index_status.v1")
+            self.assertTrue(status["ready"])
+            self.assertEqual(status["missing_node_embeddings"], 0)
 
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
-                cli_main(["--db", str(db_path), "embed", "--provider", "hash"])
-            self.assertIn("semantic_index.v1", stdout.getvalue())
+                cli_main(["--db", str(db_path), "embed", "--provider", "hash", "--status"])
+            self.assertIn("semantic_index_status.v1", stdout.getvalue())
+
+    def test_sentence_transformers_model_option_and_incremental_status(self) -> None:
+        class FakeSentenceTransformer:
+            def __init__(self, model_name: str) -> None:
+                self.model_name = model_name
+
+            def get_sentence_embedding_dimension(self) -> int:
+                return 3
+
+            def encode(self, texts, normalize_embeddings=True, batch_size=16):  # type: ignore[no-untyped-def]
+                del normalize_embeddings, batch_size
+                return [[1.0, 0.0, 0.0] if "动态角色" in text else [0.0, 1.0, 0.0] for text in texts]
+
+        fake_module = types.SimpleNamespace(SentenceTransformer=FakeSentenceTransformer)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(sys.modules, {"sentence_transformers": fake_module}):
+            db_path, _ = _sync_insight_sample(Path(tmp))
+            first = build_semantic_index(
+                db_path,
+                provider="sentence-transformers",
+                model="fake-model-v1",
+                batch_size=2,
+                force=True,
+            )
+            self.assertEqual(first["provider"], "sentence-transformers")
+            self.assertEqual(first["model"], "fake-model-v1")
+            self.assertEqual(first["dim"], 3)
+            self.assertGreater(first["indexed_nodes"], 0)
+
+            second = build_semantic_index(
+                db_path,
+                provider="sentence-transformers",
+                model="fake-model-v1",
+                batch_size=2,
+            )
+            self.assertEqual(second["indexed_nodes"], 0)
+            self.assertGreater(second["skipped_nodes"], 0)
+
+            status = semantic_index_status(db_path, provider="sentence-transformers", model="fake-model-v1")
+            self.assertTrue(status["ready"])
+            self.assertEqual(status["model"], "fake-model-v1")
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main([
+                    "--db",
+                    str(db_path),
+                    "embed",
+                    "--provider",
+                    "sentence-transformers",
+                    "--model",
+                    "fake-model-v1",
+                    "--status",
+                ])
+            self.assertIn("fake-model-v1", stdout.getvalue())
 
     def test_hybrid_search_falls_back_without_embedding_index(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1170,6 +1231,115 @@ class IngestSearchTest(unittest.TestCase):
                 cli_main(["--db", str(db_path), "eval-dashboard"])
             self.assertIn("eval_dashboard.v1", stdout.getvalue())
 
+    def test_tune_search_profile_and_auto_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile_dir = root / "profiles"
+            active_profile_path = profile_dir / "active.json"
+            db_path, doc_id = _sync_insight_sample(root)
+            build_semantic_index(db_path, force=True, provider="hash")
+            node_index = get_artifact(db_path, doc_id, "node_index.jsonl")["content"]
+            target_node = next(node for node in node_index if "动态角色发现机制" in node.get("text", ""))
+            queries_path = root / "queries.json"
+            queries_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "query": "动态角色任务规划",
+                            "intent": "method",
+                            "expected_doc_ids": [doc_id],
+                            "expected_node_ids": [target_node["node_id"]],
+                            "expected_node_keywords": ["动态角色"],
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch("kb_agent.search_profile.PROFILE_DIR", profile_dir), \
+                mock.patch("kb_agent.search_profile.ACTIVE_PROFILE_PATH", active_profile_path):
+                tuning = tune_search(
+                    db_path,
+                    queries_path,
+                    compare_modes=["hybrid", "tree", "fts"],
+                    top_k=3,
+                    save_profile="paper-v1",
+                )
+                self.assertEqual(tuning["schema"], "search_tuning.v1")
+                self.assertTrue(tuning["mode_rankings"])
+                self.assertIn("method", tuning["intent_modes"])
+                self.assertIn("saved_profile", tuning)
+
+                applied = apply_search_profile("paper-v1")
+                self.assertEqual(applied["schema"], "search_profile_apply.v1")
+                self.assertEqual(get_search_profile("active")["name"], "paper-v1")
+                profiles = list_search_profiles()
+                self.assertGreaterEqual(profiles["count"], 1)
+
+                report = build_search_report(db_path, "动态角色任务规划", top_k=3, search_mode="auto")
+                self.assertEqual(report["requested_search_mode"], "auto")
+                self.assertIn(report["resolved_search_mode"], {"hybrid", "tree", "fts"})
+                self.assertEqual(report["auto_resolution"]["profile_name"], "paper-v1")
+
+                results = search_nodes(db_path, "动态角色任务规划", top_k=3, search_mode="auto")
+                self.assertTrue(results)
+                self.assertIn("auto:paper-v1", results[0].rank_reason)
+
+                answer = answer_query(db_path, "动态角色任务规划", top_k=3, use_llm=False, search_mode="auto")
+                self.assertEqual(answer["search_mode"], "auto")
+                self.assertIn(answer["resolved_search_mode"], {"hybrid", "tree", "fts"})
+
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    cli_main([
+                        "--db",
+                        str(db_path),
+                        "tune-search",
+                        str(queries_path),
+                        "--compare-modes",
+                        "hybrid,tree,fts",
+                        "--save-profile",
+                        "paper-cli",
+                    ])
+                self.assertIn("search_tuning.v1", stdout.getvalue())
+
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    cli_main(["search-profile", "apply", "paper-cli"])
+                self.assertIn("search_profile_apply.v1", stdout.getvalue())
+
+    def test_auto_mode_falls_back_without_active_profile_and_dashboard_html_is_sanitized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile_dir = root / "profiles"
+            active_profile_path = profile_dir / "active.json"
+            db_path, doc_id = _sync_insight_sample(root)
+            with mock.patch("kb_agent.search_profile.PROFILE_DIR", profile_dir), \
+                mock.patch("kb_agent.search_profile.ACTIVE_PROFILE_PATH", active_profile_path):
+                report = build_search_report(db_path, "动态角色任务规划", top_k=2, search_mode="auto")
+                self.assertEqual(report["requested_search_mode"], "auto")
+                self.assertEqual(report["resolved_search_mode"], "hybrid")
+                self.assertIn("auto_profile_missing", report["warnings"])
+
+                put_feedback(
+                    db_path,
+                    query="动态角色任务规划",
+                    operation="ask",
+                    rating=2,
+                    label="missing_evidence",
+                    comment="node_id=node_x page_range=[1,2] excerpt=这是一段论文正文，不能进入 dashboard。",
+                    expected_doc_ids=[doc_id],
+                    expected_keywords=["动态角色"],
+                )
+                dashboard = eval_dashboard(db_path, output_format="html")
+                self.assertTrue(Path(dashboard["html_path"]).exists())
+                html = Path(dashboard["html_path"]).read_text(encoding="utf-8")
+                self.assertIn("KB Eval Dashboard", html)
+                self.assertIn("missing_evidence", html)
+                self.assertNotIn("这是一段论文正文", html)
+                self.assertNotIn("excerpt=", html)
+
     def test_opencode_observer_plugin_is_static_valid_and_sanitizes_sensitive_keys(self) -> None:
         plugin_path = Path(".opencode/plugins/kb-observer/index.mjs")
         self.assertTrue(plugin_path.exists())
@@ -1178,6 +1348,8 @@ class IngestSearchTest(unittest.TestCase):
         self.assertIn("experimental.session.compacting", content)
         self.assertIn("SENSITIVE_KEYS", content)
         self.assertIn("kb_put_feedback", content)
+        self.assertIn("kb_tune_search", content)
+        self.assertIn("kb_apply_search_profile", content)
         self.assertIn("feedback_hint", content)
         node = shutil.which("node")
         if node:

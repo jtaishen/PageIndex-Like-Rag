@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from html import escape
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -235,11 +236,15 @@ def build_eval_set_from_feedback(
     return {**payload, "path": str(path)}
 
 
-def eval_dashboard(db_path: Path, *, since_days: Optional[float] = None) -> Dict[str, Any]:
+def eval_dashboard(db_path: Path, *, since_days: Optional[float] = None, output_format: str = "json") -> Dict[str, Any]:
+    from .search_profile import latest_search_tuning_reports, list_search_profiles
+
     created_at = time.time()
     stats = query_stats(db_path, since_days=since_days)
     feedback = feedback_summary(db_path, since_days=since_days)
     latest_reports = _latest_eval_reports(limit=8)
+    tuning_reports = latest_search_tuning_reports(limit=5)
+    profiles = list_search_profiles()
     recommendations = _dashboard_recommendations(stats, feedback)
     dashboard = {
         "schema": "eval_dashboard.v1",
@@ -248,6 +253,8 @@ def eval_dashboard(db_path: Path, *, since_days: Optional[float] = None) -> Dict
         "query_stats": stats,
         "feedback_summary": feedback,
         "latest_eval_reports": latest_reports,
+        "latest_search_tuning": tuning_reports,
+        "search_profiles": profiles,
         "recommendations": recommendations,
     }
     out_dir = DATA_DIR / "eval"
@@ -255,9 +262,16 @@ def eval_dashboard(db_path: Path, *, since_days: Optional[float] = None) -> Dict
     stem = f"eval_dashboard_{int(created_at)}"
     json_path = out_dir / f"{stem}.json"
     md_path = out_dir / f"{stem}.md"
+    html_path = out_dir / f"{stem}.html"
     write_json(json_path, dashboard)
     md_path.write_text(_dashboard_markdown(dashboard), encoding="utf-8")
-    return {**dashboard, "path": str(md_path), "json_path": str(json_path)}
+    html_path.write_text(_dashboard_html(dashboard), encoding="utf-8")
+    format_path = {
+        "json": json_path,
+        "md": md_path,
+        "html": html_path,
+    }.get((output_format or "json").strip().lower(), json_path)
+    return {**dashboard, "path": str(format_path), "json_path": str(json_path), "md_path": str(md_path), "html_path": str(html_path)}
 
 
 def feedback_summary(db_path: Path, *, since_days: Optional[float] = None) -> Dict[str, Any]:
@@ -396,10 +410,113 @@ def _dashboard_markdown(dashboard: Dict[str, Any]) -> str:
     lines.extend(["", "## Latest Eval Reports"])
     for report in reports:
         lines.append(f"- `{report.get('schema')}` status=`{report.get('status')}` path=`{report.get('path')}`")
+    lines.extend(["", "## Search Tuning"])
+    for report in dashboard.get("latest_search_tuning") or []:
+        lines.append(f"- default=`{report.get('default_mode')}` path=`{report.get('path')}`")
+    active = ((dashboard.get("search_profiles") or {}).get("active") or {})
+    if active:
+        lines.extend(["", "## Active Search Profile", f"- `{active.get('name')}` path=`{active.get('path')}`"])
     lines.extend(["", "## Recommendations"])
     for item in dashboard.get("recommendations") or []:
         lines.append(f"- {item}")
     return "\n".join(lines) + "\n"
+
+
+def _dashboard_html(dashboard: Dict[str, Any]) -> str:
+    stats = dashboard.get("query_stats") or {}
+    feedback = dashboard.get("feedback_summary") or {}
+    profiles = dashboard.get("search_profiles") or {}
+    active = profiles.get("active") or {}
+    cards = [
+        ("Queries", stats.get("query_count", 0)),
+        ("Fallback Rate", stats.get("fallback_rate", 0.0)),
+        ("No Evidence Rate", stats.get("no_evidence_rate", 0.0)),
+        ("Feedback", feedback.get("feedback_count", 0)),
+        ("Avg Rating", feedback.get("avg_rating", 0.0)),
+        ("Low Ratings", feedback.get("low_rating_count", 0)),
+    ]
+    card_html = "\n".join(
+        f"<section class='card'><div class='label'>{escape(str(label))}</div><div class='value'>{escape(str(value))}</div></section>"
+        for label, value in cards
+    )
+    labels_html = _count_table(feedback.get("label_counts") or {}, "Feedback Labels")
+    modes_html = _count_table(stats.get("search_mode_counts") or {}, "Search Modes")
+    tuning_html = _list_section(
+        "Search Tuning",
+        [
+            f"default={item.get('default_mode', '')} path={item.get('path', '')}"
+            for item in dashboard.get("latest_search_tuning") or []
+        ],
+    )
+    reports_html = _list_section(
+        "Latest Eval Reports",
+        [
+            f"{item.get('schema', '')} status={item.get('status', '')} path={item.get('path', '')}"
+            for item in dashboard.get("latest_eval_reports") or []
+        ],
+    )
+    recommendations_html = _list_section("Recommendations", dashboard.get("recommendations") or [])
+    active_html = ""
+    if active:
+        active_html = (
+            "<section class='panel'><h2>Active Search Profile</h2>"
+            f"<p><strong>{escape(str(active.get('name') or ''))}</strong></p>"
+            f"<p>{escape(str(active.get('path') or ''))}</p></section>"
+        )
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>KB Eval Dashboard</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; color: #1f2933; background: #f7f8fa; }}
+    header {{ padding: 28px 32px 16px; background: #ffffff; border-bottom: 1px solid #d9dee7; }}
+    h1 {{ margin: 0; font-size: 26px; letter-spacing: 0; }}
+    main {{ padding: 24px 32px 40px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }}
+    .card, .panel {{ background: #ffffff; border: 1px solid #d9dee7; border-radius: 8px; padding: 14px; }}
+    .label {{ font-size: 12px; color: #64748b; }}
+    .value {{ font-size: 24px; font-weight: 700; margin-top: 4px; }}
+    .panels {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }}
+    h2 {{ font-size: 16px; margin: 0 0 10px; }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    td {{ border-top: 1px solid #edf1f5; padding: 7px 0; font-size: 13px; }}
+    ul {{ padding-left: 18px; margin: 0; }}
+    li {{ margin: 6px 0; font-size: 13px; overflow-wrap: anywhere; }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>KB Eval Dashboard</h1>
+    <p>Generated at {escape(str(dashboard.get('created_at') or ''))}</p>
+  </header>
+  <main>
+    <div class="grid">{card_html}</div>
+    <div class="panels">
+      {labels_html}
+      {modes_html}
+      {active_html}
+      {tuning_html}
+      {reports_html}
+      {recommendations_html}
+    </div>
+  </main>
+</body>
+</html>
+"""
+
+
+def _count_table(counts: Dict[str, Any], title: str) -> str:
+    rows = "\n".join(
+        f"<tr><td>{escape(str(key))}</td><td>{escape(str(value))}</td></tr>"
+        for key, value in sorted(counts.items())
+    )
+    return f"<section class='panel'><h2>{escape(title)}</h2><table>{rows}</table></section>"
+
+
+def _list_section(title: str, items: List[Any]) -> str:
+    rows = "\n".join(f"<li>{escape(str(item))}</li>" for item in items)
+    return f"<section class='panel'><h2>{escape(title)}</h2><ul>{rows}</ul></section>"
 
 
 def _json_list(value: Any) -> List[str]:

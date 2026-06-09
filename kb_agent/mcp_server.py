@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 from .answer import answer_query, route_documents
 from .artifacts import get_artifact, get_citation_map, get_doc_card, get_innovations, get_parse_quality, get_parse_report
 from .config import resolve_db_path
-from .embeddings import build_semantic_index
+from .embeddings import build_semantic_index, semantic_index_status
 from .eval import eval_memory, eval_review, eval_search
 from .feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from .ingest import sync_directory
@@ -16,6 +16,7 @@ from .query import classify_query
 from .query_log import list_query_logs, query_stats
 from .review import assemble_review, check_review_citations, draft_review
 from .search import get_evidence, search_nodes
+from .search_profile import apply_search_profile, get_search_profile, list_search_profiles, tune_search
 from .tasks import compare_papers, generate_review_plan, get_task_artifact
 from .tree_search import tree_search
 
@@ -56,10 +57,22 @@ if FastMCP is not None:
         doc_ids: Optional[List[str]] = None,
         force: bool = False,
         provider: Optional[str] = None,
+        model: Optional[str] = None,
+        batch_size: int = 16,
+        status: bool = False,
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Build or refresh semantic embeddings for ready documents."""
-        return build_semantic_index(resolve_db_path(db_path), doc_ids=doc_ids, force=force, provider=provider)
+        if status:
+            return semantic_index_status(resolve_db_path(db_path), provider=provider, model=model)
+        return build_semantic_index(
+            resolve_db_path(db_path),
+            doc_ids=doc_ids,
+            force=force,
+            provider=provider,
+            model=model,
+            batch_size=batch_size,
+        )
 
     @mcp.tool()
     def kb_eval_search(
@@ -178,9 +191,42 @@ if FastMCP is not None:
         )
 
     @mcp.tool()
-    def kb_eval_dashboard(since_days: Optional[float] = None, db_path: Optional[str] = None) -> Dict[str, Any]:
+    def kb_eval_dashboard(
+        since_days: Optional[float] = None,
+        format: str = "html",
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Write a static dashboard that summarizes query logs, eval reports, and feedback."""
-        return eval_dashboard(resolve_db_path(db_path), since_days=since_days)
+        return eval_dashboard(resolve_db_path(db_path), since_days=since_days, output_format=format)
+
+    @mcp.tool()
+    def kb_tune_search(
+        queries_json: str,
+        compare_modes: Optional[List[str]] = None,
+        top_k: int = 5,
+        save_profile: Optional[str] = None,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Tune search mode preferences from a search evaluation set."""
+        return tune_search(
+            resolve_db_path(db_path),
+            Path(queries_json),
+            compare_modes=compare_modes,
+            top_k=top_k,
+            save_profile=save_profile,
+        )
+
+    @mcp.tool()
+    def kb_get_search_profile(name: str = "active") -> Dict[str, Any]:
+        """Return a saved or active local search profile."""
+        if name == "list":
+            return list_search_profiles()
+        return get_search_profile(name)
+
+    @mcp.tool()
+    def kb_apply_search_profile(name: str) -> Dict[str, Any]:
+        """Apply a saved search profile for explicit auto search mode."""
+        return apply_search_profile(name)
 
     @mcp.tool()
     def kb_search_tree(

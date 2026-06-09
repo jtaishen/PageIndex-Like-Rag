@@ -18,7 +18,7 @@ from .models import EvidencePacket, SearchResult
 from .utils import compact_whitespace
 
 
-SEARCH_MODES = {"hybrid", "fts", "tree"}
+SEARCH_MODES = {"hybrid", "fts", "tree", "auto"}
 
 
 def resolve_search_mode(search_mode: str = "hybrid") -> str:
@@ -56,14 +56,24 @@ def search_nodes(
     search_mode: str = "hybrid",
 ) -> List[SearchResult]:
     mode = resolve_search_mode(search_mode)
+    auto_resolution = None
+    if mode == "auto":
+        auto_resolution = _auto_resolution(db_path, query)
+        mode = str(auto_resolution.get("resolved_search_mode") or "hybrid")
     if mode == "tree":
         from .tree_search import tree_search_results
 
-        return tree_search_results(db_path, query, doc_id=doc_id, top_k=top_k, search_mode="hybrid")
+        return _tag_auto_results(
+            tree_search_results(db_path, query, doc_id=doc_id, top_k=top_k, search_mode="hybrid"),
+            auto_resolution,
+        )
     conn = db.connect(db_path)
     db.init_db(conn)
     try:
-        return _search_nodes_conn(conn, query, doc_id=doc_id, top_k=top_k, search_mode=mode)
+        return _tag_auto_results(
+            _search_nodes_conn(conn, query, doc_id=doc_id, top_k=top_k, search_mode=mode),
+            auto_resolution,
+        )
     finally:
         conn.close()
 
@@ -78,13 +88,17 @@ def search_documents(
     db.init_db(conn)
     try:
         mode = resolve_search_mode(search_mode)
+        auto_resolution = None
+        if mode == "auto":
+            auto_resolution = _auto_resolution(db_path, query)
+            mode = str(auto_resolution.get("resolved_search_mode") or "hybrid")
         if mode == "tree":
             mode = "hybrid"
         if mode == "hybrid":
             rows = _search_documents_hybrid_conn(conn, query, top_k)
             if rows:
-                return rows
-        return [dict(row) for row in _search_documents_fts_conn(conn, query, top_k)]
+                return _tag_auto_docs(rows, auto_resolution)
+        return _tag_auto_docs([dict(row) for row in _search_documents_fts_conn(conn, query, top_k)], auto_resolution)
     finally:
         conn.close()
 
@@ -97,18 +111,27 @@ def build_search_report(
     search_mode: str = "hybrid",
 ) -> Dict[str, object]:
     mode = resolve_search_mode(search_mode)
+    auto_resolution = None
+    requested_mode = mode
+    if mode == "auto":
+        auto_resolution = _auto_resolution(db_path, query)
+        mode = str(auto_resolution.get("resolved_search_mode") or "hybrid")
     if mode == "tree":
         from .tree_search import tree_search_for_query
 
         trace = tree_search_for_query(db_path, query, doc_id=doc_id, top_k=top_k, use_llm=False, search_mode="hybrid")
+        trace["auto_resolution"] = auto_resolution or {}
+        trace["resolved_search_mode"] = mode
         return {
             "schema": "search_report.v1",
             "query": query,
             "doc_id": doc_id,
-            "requested_search_mode": mode,
+            "requested_search_mode": requested_mode,
+            "resolved_search_mode": mode,
             "effective_search_mode": "tree",
             "top_k": top_k,
-            "warnings": trace.get("warnings", []),
+            "warnings": _unique_strings([*trace.get("warnings", []), *((auto_resolution or {}).get("warnings") or [])]),
+            "auto_resolution": auto_resolution or {},
             "embedding_status": _safe_embedding_status(db_path),
             "documents": trace.get("routed_documents", []) or _docs_from_tree_results(trace.get("results", [])),
             "results": trace.get("results", []),
@@ -126,10 +149,12 @@ def build_search_report(
         "schema": "search_report.v1",
         "query": query,
         "doc_id": doc_id,
-        "requested_search_mode": mode,
+        "requested_search_mode": requested_mode,
+        "resolved_search_mode": mode,
         "effective_search_mode": "fts" if any("fts_fallback" in item.rank_reason for item in results) else mode,
         "top_k": top_k,
-        "warnings": warnings,
+        "warnings": _unique_strings([*warnings, *((auto_resolution or {}).get("warnings") or [])]),
+        "auto_resolution": auto_resolution or {},
         "embedding_status": _safe_embedding_status(db_path),
         "documents": docs,
         "results": [result.__dict__ for result in results],
@@ -655,6 +680,34 @@ def _safe_embedding_status(db_path: Path) -> Dict[str, object]:
             "ready": False,
             "error": str(exc),
         }
+
+
+def _auto_resolution(db_path: Path, query: str) -> Dict[str, object]:
+    from .search_profile import resolve_auto_search_mode
+
+    return resolve_auto_search_mode(db_path, query)
+
+
+def _tag_auto_results(results: List[SearchResult], auto_resolution: Optional[Dict[str, object]]) -> List[SearchResult]:
+    if not auto_resolution:
+        return results
+    profile = str(auto_resolution.get("profile_name") or "none")
+    resolved = str(auto_resolution.get("resolved_search_mode") or "hybrid")
+    for result in results:
+        result.rank_reason = f"auto:{profile}:{resolved},{result.rank_reason}"
+    return results
+
+
+def _tag_auto_docs(docs: List[Dict[str, object]], auto_resolution: Optional[Dict[str, object]]) -> List[Dict[str, object]]:
+    if not auto_resolution:
+        return docs
+    profile = str(auto_resolution.get("profile_name") or "none")
+    resolved = str(auto_resolution.get("resolved_search_mode") or "hybrid")
+    for doc in docs:
+        reason = str(doc.get("rank_reason") or resolved)
+        doc["rank_reason"] = f"auto:{profile}:{resolved},{reason}"
+        doc["auto_resolution"] = auto_resolution
+    return docs
 
 
 def _row_dict(row) -> Dict[str, object]:  # type: ignore[no-untyped-def]

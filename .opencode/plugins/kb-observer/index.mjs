@@ -12,6 +12,9 @@ const OBSERVED_TOOLS = new Set([
   "kb_put_feedback",
   "kb_build_eval_set_from_feedback",
   "kb_eval_dashboard",
+  "kb_tune_search",
+  "kb_apply_search_profile",
+  "kb_get_search_profile",
 ]);
 
 const SENSITIVE_KEYS = new Set([
@@ -128,6 +131,7 @@ function summarizeToolEvent(tool, input, payload) {
     warning_count: warnings.length,
     warnings: warnings.slice(0, 8),
     metrics: summarizeMetrics(tool, payload || {}, coverage),
+    profile: profileSummary(tool, safe),
     feedback_hint: feedbackHint(tool, safe, warnings, coverage),
   };
 }
@@ -160,7 +164,26 @@ function summarizeMetrics(tool, safe, coverage) {
     suspected_pollution_count: numberValue(safe.suspected_pollution_count),
     feedback_count: numberValue(safe.feedback_count || safe?.feedback_summary?.feedback_count),
     low_rating_count: numberValue(safe.low_rating_count || safe?.feedback_summary?.low_rating_count),
+    mode_count: numberValue(safe.compare_modes?.length || safe.mode_rankings?.length),
   };
+}
+
+function profileSummary(tool, safe) {
+  if (tool === "kb_tune_search") {
+    return {
+      default_mode: stringValue(safe.default_mode),
+      profile_name: stringValue(safe?.saved_profile?.name),
+      path: stringValue(safe?.saved_profile?.path || safe.path),
+    };
+  }
+  if (tool === "kb_apply_search_profile" || tool === "kb_get_search_profile") {
+    return {
+      default_mode: stringValue(safe.default_mode || safe?.profile?.default_mode),
+      profile_name: stringValue(safe.name || safe?.profile?.name || safe?.active?.name),
+      path: stringValue(safe.path || safe?.profile?.path || safe?.active?.path),
+    };
+  }
+  return {};
 }
 
 function feedbackHint(tool, safe, warnings, coverage) {
@@ -195,6 +218,7 @@ function formatCompactionContext(events) {
       event.task_id ? `task_id=${event.task_id}` : "",
       event.status ? `status=${event.status}` : "",
       event.warning_count ? `warnings=${event.warnings.join(";")}` : "",
+      event.profile?.profile_name ? `profile=${event.profile.profile_name}:${event.profile.default_mode}` : "",
       event.feedback_hint ? `feedback_hint=${event.feedback_hint}` : "",
     ].filter(Boolean);
     lines.push(`- ${parts.join(" ")}`);

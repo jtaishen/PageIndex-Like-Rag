@@ -34,6 +34,9 @@ class EmbeddingProvider:
     def embed(self, text: str) -> List[float]:
         raise NotImplementedError
 
+    def embed_batch(self, texts: List[str], batch_size: int = 16) -> List[List[float]]:
+        return [self.embed(text) for text in texts]
+
 
 class HashEmbeddingProvider(EmbeddingProvider):
     def __init__(self, dim: int = DEFAULT_HASH_DIM) -> None:
@@ -72,6 +75,13 @@ class SentenceTransformersProvider(EmbeddingProvider):
             self.dim = len(values)
         return values
 
+    def embed_batch(self, texts: List[str], batch_size: int = 16) -> List[List[float]]:  # pragma: no cover - optional dependency
+        vectors = self._model.encode(texts, normalize_embeddings=True, batch_size=max(1, batch_size))
+        values = [[float(item) for item in vector] for vector in vectors]
+        if self.dim <= 0 and values:
+            self.dim = len(values[0])
+        return values
+
 
 def resolve_embedding_provider(provider: Optional[str] = None) -> str:
     load_env_file()
@@ -82,11 +92,18 @@ def resolve_embedding_provider(provider: Optional[str] = None) -> str:
     return requested
 
 
-def get_embedding_provider(provider: Optional[str] = None) -> EmbeddingProvider:
+def resolve_embedding_model(provider: str, model: Optional[str] = None) -> str:
+    load_env_file()
+    if provider == "hash":
+        return DEFAULT_HASH_MODEL
+    return model or os.environ.get("KB_EMBEDDING_MODEL") or DEFAULT_SENTENCE_TRANSFORMERS_MODEL
+
+
+def get_embedding_provider(provider: Optional[str] = None, model: Optional[str] = None) -> EmbeddingProvider:
     resolved = resolve_embedding_provider(provider)
     if resolved == "hash":
         return HashEmbeddingProvider()
-    return SentenceTransformersProvider()
+    return SentenceTransformersProvider(resolve_embedding_model(resolved, model))
 
 
 def content_hash(text: str) -> str:
@@ -114,8 +131,10 @@ def build_semantic_index(
     doc_ids: Optional[List[str]] = None,
     force: bool = False,
     provider: Optional[str] = None,
+    model: Optional[str] = None,
+    batch_size: int = 16,
 ) -> Dict[str, object]:
-    resolved = get_embedding_provider(provider)
+    resolved = get_embedding_provider(provider, model)
     conn = db.connect(db_path)
     db.init_db(conn)
     indexed_nodes = 0
@@ -124,6 +143,7 @@ def build_semantic_index(
     skipped_documents = 0
     try:
         documents = db.get_ready_document_rows(conn, doc_ids=doc_ids)
+        document_jobs = []
         for row in documents:
             text = document_embedding_text(row)
             digest = content_hash(text)
@@ -131,19 +151,23 @@ def build_semantic_index(
             if existing and existing["content_hash"] == digest and not force:
                 skipped_documents += 1
                 continue
-            vector = resolved.embed(text)
-            db.upsert_document_embedding(
-                conn,
-                doc_id=row["doc_id"],
-                content_hash=digest,
-                provider=resolved.name,
-                model=resolved.model,
-                dim=len(vector),
-                vector=vector,
-            )
-            indexed_documents += 1
+            document_jobs.append((row, text, digest))
+        for batch in _batched(document_jobs, batch_size):
+            vectors = _embed_batch(resolved, [text for _row, text, _digest in batch], batch_size=batch_size)
+            for (row, _text, digest), vector in zip(batch, vectors):
+                db.upsert_document_embedding(
+                    conn,
+                    doc_id=row["doc_id"],
+                    content_hash=digest,
+                    provider=resolved.name,
+                    model=resolved.model,
+                    dim=len(vector),
+                    vector=vector,
+                )
+                indexed_documents += 1
 
         nodes = db.get_indexable_node_rows(conn, doc_ids=doc_ids)
+        node_jobs = []
         for row in nodes:
             text = node_embedding_text(row)
             digest = content_hash(text)
@@ -151,18 +175,21 @@ def build_semantic_index(
             if existing and existing["content_hash"] == digest and not force:
                 skipped_nodes += 1
                 continue
-            vector = resolved.embed(text)
-            db.upsert_node_embedding(
-                conn,
-                node_id=row["node_id"],
-                doc_id=row["doc_id"],
-                content_hash=digest,
-                provider=resolved.name,
-                model=resolved.model,
-                dim=len(vector),
-                vector=vector,
-            )
-            indexed_nodes += 1
+            node_jobs.append((row, text, digest))
+        for batch in _batched(node_jobs, batch_size):
+            vectors = _embed_batch(resolved, [text for _row, text, _digest in batch], batch_size=batch_size)
+            for (row, _text, digest), vector in zip(batch, vectors):
+                db.upsert_node_embedding(
+                    conn,
+                    node_id=row["node_id"],
+                    doc_id=row["doc_id"],
+                    content_hash=digest,
+                    provider=resolved.name,
+                    model=resolved.model,
+                    dim=len(vector),
+                    vector=vector,
+                )
+                indexed_nodes += 1
         conn.commit()
         counts = db.embedding_counts(conn, resolved.name, resolved.model)
     finally:
@@ -173,6 +200,7 @@ def build_semantic_index(
         "provider": resolved.name,
         "model": resolved.model,
         "dim": resolved.dim,
+        "batch_size": max(1, batch_size),
         "requested_doc_ids": doc_ids or [],
         "indexed_documents": indexed_documents,
         "skipped_documents": skipped_documents,
@@ -183,20 +211,29 @@ def build_semantic_index(
     }
 
 
-def semantic_index_status(db_path: Path, provider: Optional[str] = None) -> Dict[str, object]:
-    resolved = get_embedding_provider(provider)
+def semantic_index_status(db_path: Path, provider: Optional[str] = None, model: Optional[str] = None) -> Dict[str, object]:
+    provider_name = resolve_embedding_provider(provider)
+    model_name = resolve_embedding_model(provider_name, model)
     conn = db.connect(db_path)
     db.init_db(conn)
     try:
-        counts = db.embedding_counts(conn, resolved.name, resolved.model)
+        counts = db.embedding_counts(conn, provider_name, model_name)
+        document_total = len(db.get_ready_document_rows(conn))
+        node_total = len(db.get_indexable_node_rows(conn))
     finally:
         conn.close()
+    dim = DEFAULT_HASH_DIM if provider_name == "hash" else 0
     return {
         "schema": "semantic_index_status.v1",
-        "provider": resolved.name,
-        "model": resolved.model,
-        "dim": resolved.dim,
+        "provider": provider_name,
+        "model": model_name,
+        "dim": dim,
         "ready": counts["node_count"] > 0,
+        "document_total": document_total,
+        "node_total": node_total,
+        "missing_document_embeddings": max(0, document_total - counts["document_count"]),
+        "missing_node_embeddings": max(0, node_total - counts["node_count"]),
+        "needs_rebuild": counts["node_count"] < node_total,
         **counts,
     }
 
@@ -255,3 +292,16 @@ def _normalize_vector(vector: Iterable[float]) -> List[float]:
     if norm <= 0:
         return values
     return [round(item / norm, 8) for item in values]
+
+
+def _batched(values: List[object], batch_size: int) -> Iterable[List[object]]:
+    size = max(1, int(batch_size or 1))
+    for index in range(0, len(values), size):
+        yield values[index : index + size]
+
+
+def _embed_batch(provider: EmbeddingProvider, texts: List[str], batch_size: int) -> List[List[float]]:
+    embed_batch = getattr(provider, "embed_batch", None)
+    if callable(embed_batch):
+        return embed_batch(texts, batch_size=batch_size)
+    return [provider.embed(text) for text in texts]

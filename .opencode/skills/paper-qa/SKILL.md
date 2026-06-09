@@ -19,6 +19,7 @@ description: 在候选论文中执行树搜索、证据抽取与可追溯问答�
 12. 如果用户指出某次结果正确、错误、证据不足或检索遗漏，调用 `kb_put_feedback` 记录评分、标签、期望 doc/node/keyword 和短评论。
 13. 需要沉淀评测集时，调用 `kb_build_eval_set_from_feedback`，再用 `kb_eval_search` 比较 `hybrid/tree/fts`。
 14. 需要复盘趋势时，调用 `kb_eval_dashboard`，只使用其中的统计、warning 和建议动作。
+15. 需要调优检索策略时，调用 `kb_tune_search`，保存 profile 后再调用 `kb_apply_search_profile`；只有用户要求或任务明确需要时，才传入 `search_mode="auto"`。
 
 输出要求：
 
@@ -29,3 +30,4 @@ description: 在候选论文中执行树搜索、证据抽取与可追溯问答�
 - 若解析质量是 `weak` 或 `fallback_used` 为 true，说明证据可能受解析质量影响。
 - 若使用综述草稿，说明 `citation_check.json` 中是否存在 missing refs 或 unsupported paragraphs。
 - 不把论文正文、长 excerpt、evidence packet 或草稿正文写入反馈、日志或 memory。
+- 若使用 `auto` 检索，说明 active profile 名称和实际 resolved search mode。

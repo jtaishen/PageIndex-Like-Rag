@@ -37,6 +37,7 @@ def eval_search(
         for mode in modes
     }
     primary = mode_results[modes[0]]
+    mode_rankings = _mode_rankings(mode_results)
     report = {
         "schema": "search_eval.v2",
         "queries_path": str(queries_path),
@@ -55,6 +56,8 @@ def eval_search(
         "weak_parse_quality_count": primary["weak_parse_quality_count"],
         "mode_results": mode_results,
         "best_mode_by_node_recall": _best_mode(mode_results, "node_recall_at_k"),
+        "mode_rankings": mode_rankings,
+        "per_intent_metrics": _per_intent_metrics(mode_results),
         "created_at": time.time(),
     }
     path = _write_eval_report("search_eval", report)
@@ -320,6 +323,105 @@ def _best_mode(mode_results: Dict[str, Dict[str, Any]], metric: str) -> str:
     if not mode_results:
         return ""
     return max(mode_results.items(), key=lambda item: float(item[1].get(metric) or 0.0))[0]
+
+
+def _mode_rankings(mode_results: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rankings = []
+    for mode, result in mode_results.items():
+        query_count = max(1, int(result.get("query_count") or 0))
+        fallback_rate = float(result.get("fallback_count") or 0) / query_count
+        weak_rate = float(result.get("weak_parse_quality_count") or 0) / query_count
+        score = _mode_score(
+            float(result.get("doc_recall_at_k") or 0.0),
+            float(result.get("node_recall_at_k") or 0.0),
+            float(result.get("evidence_precision") or 0.0),
+            float(result.get("mrr") or 0.0),
+            float(result.get("node_keyword_hit_rate") or 0.0),
+            fallback_rate,
+            weak_rate,
+        )
+        rankings.append(
+            {
+                "search_mode": mode,
+                "score": score,
+                "doc_recall_at_k": result.get("doc_recall_at_k") or 0.0,
+                "node_recall_at_k": result.get("node_recall_at_k") or 0.0,
+                "evidence_precision": result.get("evidence_precision") or 0.0,
+                "mrr": result.get("mrr") or 0.0,
+                "fallback_rate": round(fallback_rate, 4),
+                "weak_parse_quality_rate": round(weak_rate, 4),
+            }
+        )
+    return sorted(rankings, key=lambda item: (-float(item["score"]), str(item["search_mode"])))
+
+
+def _per_intent_metrics(mode_results: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    grouped: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    for mode, result in mode_results.items():
+        for item in result.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            intent = str(item.get("intent") or "unknown")
+            grouped.setdefault(intent, {}).setdefault(mode, []).append(item)
+    metrics: Dict[str, Dict[str, Any]] = {}
+    for intent, by_mode in grouped.items():
+        mode_metrics = {}
+        for mode, items in by_mode.items():
+            count = len(items)
+            fallback_rate = sum(1 for item in items if item.get("fallback_used")) / count if count else 0.0
+            mode_metrics[mode] = {
+                "query_count": count,
+                "doc_recall_at_k": _average([float(item.get("doc_recall_at_k") or 0.0) for item in items]),
+                "node_recall_at_k": _average([float(item.get("node_recall_at_k") or 0.0) for item in items]),
+                "evidence_precision": _average([float(item.get("evidence_precision") or 0.0) for item in items]),
+                "mrr": _average([float(item.get("mrr") or 0.0) for item in items]),
+                "fallback_rate": round(fallback_rate, 4),
+            }
+        metrics[intent] = {
+            "modes": mode_metrics,
+            "recommended_mode": _recommended_intent_mode(mode_metrics),
+        }
+    return metrics
+
+
+def _recommended_intent_mode(mode_metrics: Dict[str, Dict[str, Any]]) -> str:
+    if not mode_metrics:
+        return ""
+    ranked = []
+    for mode, item in mode_metrics.items():
+        score = _mode_score(
+            float(item.get("doc_recall_at_k") or 0.0),
+            float(item.get("node_recall_at_k") or 0.0),
+            float(item.get("evidence_precision") or 0.0),
+            float(item.get("mrr") or 0.0),
+            1.0,
+            float(item.get("fallback_rate") or 0.0),
+            0.0,
+        )
+        ranked.append((mode, score))
+    ranked.sort(key=lambda item: (-item[1], item[0]))
+    return ranked[0][0]
+
+
+def _mode_score(
+    doc_recall: float,
+    node_recall: float,
+    precision: float,
+    mrr: float,
+    keyword_hit: float,
+    fallback_rate: float,
+    weak_rate: float,
+) -> float:
+    return round(
+        doc_recall * 0.3
+        + node_recall * 0.35
+        + precision * 0.15
+        + mrr * 0.15
+        + keyword_hit * 0.05
+        - fallback_rate * 0.05
+        - weak_rate * 0.03,
+        6,
+    )
 
 
 def _unique_strings(values: Iterable[str]) -> List[str]:

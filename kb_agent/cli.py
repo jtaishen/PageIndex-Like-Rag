@@ -10,7 +10,7 @@ from . import db
 from .answer import answer_query, route_documents
 from .artifacts import get_citation_map, get_doc_card, get_innovations, get_parse_quality, get_parse_report, list_artifacts
 from .config import resolve_db_path
-from .embeddings import build_semantic_index
+from .embeddings import build_semantic_index, semantic_index_status
 from .eval import eval_memory, eval_review, eval_search
 from .feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from .ingest import sync_directory
@@ -20,6 +20,7 @@ from .query import classify_query
 from .query_log import list_query_logs, query_stats, write_query_log
 from .review import assemble_review, check_review_citations, draft_review
 from .search import build_search_report, get_evidence, search_nodes
+from .search_profile import apply_search_profile, get_search_profile, list_search_profiles, tune_search
 from .tasks import compare_papers, generate_review_plan, get_task_artifact
 from .tree_search import tree_search
 
@@ -41,23 +42,26 @@ def main(argv: Any = None) -> None:
     search_parser.add_argument("query")
     search_parser.add_argument("--doc-id", default=None)
     search_parser.add_argument("--top-k", type=int, default=8)
-    search_parser.add_argument("--search-mode", choices=["hybrid", "fts", "tree"], default="hybrid")
+    search_parser.add_argument("--search-mode", choices=["hybrid", "fts", "tree", "auto"], default="hybrid")
 
     docs_parser = subparsers.add_parser("docs", help="Search candidate documents")
     docs_parser.add_argument("query")
     docs_parser.add_argument("--top-k", type=int, default=8)
-    docs_parser.add_argument("--search-mode", choices=["hybrid", "fts", "tree"], default="hybrid")
+    docs_parser.add_argument("--search-mode", choices=["hybrid", "fts", "tree", "auto"], default="hybrid")
 
     embed_parser = subparsers.add_parser("embed", help="Build semantic embeddings for ready documents")
     embed_parser.add_argument("--doc-id", action="append", default=[], help="Build only one document id; repeatable")
     embed_parser.add_argument("--force", action="store_true")
     embed_parser.add_argument("--provider", choices=["hash", "sentence-transformers"], default=None)
+    embed_parser.add_argument("--model", default=None)
+    embed_parser.add_argument("--batch-size", type=int, default=16)
+    embed_parser.add_argument("--status", action="store_true", help="Only show semantic index status")
 
     report_parser = subparsers.add_parser("search-report", help="Explain hybrid search candidates and scores")
     report_parser.add_argument("query")
     report_parser.add_argument("--doc-id", default=None)
     report_parser.add_argument("--top-k", type=int, default=8)
-    report_parser.add_argument("--search-mode", choices=["hybrid", "fts", "tree"], default="hybrid")
+    report_parser.add_argument("--search-mode", choices=["hybrid", "fts", "tree", "auto"], default="hybrid")
 
     eval_parser = subparsers.add_parser("eval-search", help="Run a JSON search evaluation set")
     eval_parser.add_argument("queries_json")
@@ -122,7 +126,7 @@ def main(argv: Any = None) -> None:
     compare_parser.add_argument("--top-k-docs", type=int, default=5)
     compare_parser.add_argument("--no-llm", action="store_true", help="Use rule-based comparison only")
     compare_parser.add_argument("--require-llm", action="store_true", help="Fail if DeepSeek cannot be called")
-    compare_parser.add_argument("--search-mode", choices=["hybrid", "fts", "tree"], default="hybrid")
+    compare_parser.add_argument("--search-mode", choices=["hybrid", "fts", "tree", "auto"], default="hybrid")
 
     review_parser = subparsers.add_parser("generate-review", help="Generate review planning task artifacts")
     review_parser.add_argument("topic")
@@ -130,7 +134,7 @@ def main(argv: Any = None) -> None:
     review_parser.add_argument("--top-k-docs", type=int, default=8)
     review_parser.add_argument("--no-llm", action="store_true", help="Use rule-based planning only")
     review_parser.add_argument("--require-llm", action="store_true", help="Fail if DeepSeek cannot be called")
-    review_parser.add_argument("--search-mode", choices=["hybrid", "fts", "tree"], default="hybrid")
+    review_parser.add_argument("--search-mode", choices=["hybrid", "fts", "tree", "auto"], default="hybrid")
 
     task_artifact_parser = subparsers.add_parser("task-artifact", help="Read a task artifact")
     task_artifact_parser.add_argument("task_id")
@@ -158,7 +162,7 @@ def main(argv: Any = None) -> None:
     ask_parser.add_argument("--no-llm", action="store_true", help="Only print evidence; do not call DeepSeek")
     ask_parser.add_argument("--require-llm", action="store_true", help="Fail if DeepSeek cannot be called")
     ask_parser.add_argument("--json", action="store_true", help="Print full JSON result")
-    ask_parser.add_argument("--search-mode", choices=["hybrid", "fts", "tree"], default="hybrid")
+    ask_parser.add_argument("--search-mode", choices=["hybrid", "fts", "tree", "auto"], default="hybrid")
 
     mem_put_parser = subparsers.add_parser("memory-put", help="Store explicit long-term memory")
     mem_put_parser.add_argument("scope")
@@ -221,6 +225,21 @@ def main(argv: Any = None) -> None:
 
     eval_dashboard_parser = subparsers.add_parser("eval-dashboard", help="Write a static query/eval/feedback dashboard")
     eval_dashboard_parser.add_argument("--since-days", type=float, default=None)
+    eval_dashboard_parser.add_argument("--format", choices=["json", "md", "html"], default="json")
+
+    tune_parser = subparsers.add_parser("tune-search", help="Tune search mode preferences from an eval set")
+    tune_parser.add_argument("queries_json")
+    tune_parser.add_argument("--top-k", type=int, default=5)
+    tune_parser.add_argument("--compare-modes", default="hybrid,tree,fts")
+    tune_parser.add_argument("--save-profile", default=None)
+
+    profile_parser = subparsers.add_parser("search-profile", help="Manage local search tuning profiles")
+    profile_subparsers = profile_parser.add_subparsers(dest="profile_command", required=True)
+    profile_subparsers.add_parser("list", help="List saved search profiles")
+    profile_show = profile_subparsers.add_parser("show", help="Show a saved or active search profile")
+    profile_show.add_argument("name", nargs="?", default="active")
+    profile_apply = profile_subparsers.add_parser("apply", help="Apply a saved search profile for auto mode")
+    profile_apply.add_argument("name")
 
     args = parser.parse_args(argv)
     db_path = resolve_db_path(args.db)
@@ -243,7 +262,19 @@ def main(argv: Any = None) -> None:
         _log_doc_results(db_path, args.query, args.search_mode, started, docs)
         _print_json(docs)
     elif args.command == "embed":
-        _print_json(build_semantic_index(db_path, doc_ids=args.doc_id or None, force=args.force, provider=args.provider))
+        if args.status:
+            _print_json(semantic_index_status(db_path, provider=args.provider, model=args.model))
+        else:
+            _print_json(
+                build_semantic_index(
+                    db_path,
+                    doc_ids=args.doc_id or None,
+                    force=args.force,
+                    provider=args.provider,
+                    model=args.model,
+                    batch_size=args.batch_size,
+                )
+            )
     elif args.command == "search-report":
         _print_json(build_search_report(db_path, args.query, doc_id=args.doc_id, top_k=args.top_k, search_mode=args.search_mode))
     elif args.command == "eval-search":
@@ -430,7 +461,24 @@ def main(argv: Any = None) -> None:
             )
         )
     elif args.command == "eval-dashboard":
-        _print_json(eval_dashboard(db_path, since_days=args.since_days))
+        _print_json(eval_dashboard(db_path, since_days=args.since_days, output_format=args.format))
+    elif args.command == "tune-search":
+        _print_json(
+            tune_search(
+                db_path,
+                Path(args.queries_json),
+                compare_modes=_comma_list(args.compare_modes),
+                top_k=args.top_k,
+                save_profile=args.save_profile,
+            )
+        )
+    elif args.command == "search-profile":
+        if args.profile_command == "list":
+            _print_json(list_search_profiles())
+        elif args.profile_command == "show":
+            _print_json(get_search_profile(args.name))
+        elif args.profile_command == "apply":
+            _print_json(apply_search_profile(args.name))
 
 
 def _list_documents(db_path: Path) -> None:
