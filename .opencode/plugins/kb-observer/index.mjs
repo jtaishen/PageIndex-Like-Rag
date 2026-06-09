@@ -9,10 +9,14 @@ const OBSERVED_TOOLS = new Set([
   "kb_eval_search",
   "kb_eval_review",
   "kb_eval_memory",
+  "kb_put_feedback",
+  "kb_build_eval_set_from_feedback",
+  "kb_eval_dashboard",
 ]);
 
 const SENSITIVE_KEYS = new Set([
   "answer",
+  "comment",
   "content",
   "excerpt",
   "evidence",
@@ -124,6 +128,7 @@ function summarizeToolEvent(tool, input, payload) {
     warning_count: warnings.length,
     warnings: warnings.slice(0, 8),
     metrics: summarizeMetrics(tool, payload || {}, coverage),
+    feedback_hint: feedbackHint(tool, safe, warnings, coverage),
   };
 }
 
@@ -153,7 +158,20 @@ function summarizeMetrics(tool, safe, coverage) {
     query_count: numberValue(safe.query_count),
     fallback_count: numberValue(safe.fallback_count),
     suspected_pollution_count: numberValue(safe.suspected_pollution_count),
+    feedback_count: numberValue(safe.feedback_count || safe?.feedback_summary?.feedback_count),
+    low_rating_count: numberValue(safe.low_rating_count || safe?.feedback_summary?.low_rating_count),
   };
+}
+
+function feedbackHint(tool, safe, warnings, coverage) {
+  const evidenceCount = numberValue(safe.evidence?.length || safe.evidence_count || coverage.total_evidence_count);
+  const fallbackCount = numberValue(safe.fallback_count);
+  const unsupported = numberValue(safe.unsupported_paragraph_count);
+  if (tool === "kb_put_feedback" || tool === "kb_build_eval_set_from_feedback") return "";
+  if (warnings.length || fallbackCount || unsupported || evidenceCount === 0) {
+    return "Use kb_put_feedback for representative failures, then kb_build_eval_set_from_feedback and kb_eval_search to compare modes.";
+  }
+  return "";
 }
 
 function sanitize(value) {
@@ -177,6 +195,7 @@ function formatCompactionContext(events) {
       event.task_id ? `task_id=${event.task_id}` : "",
       event.status ? `status=${event.status}` : "",
       event.warning_count ? `warnings=${event.warnings.join(";")}` : "",
+      event.feedback_hint ? `feedback_hint=${event.feedback_hint}` : "",
     ].filter(Boolean);
     lines.push(`- ${parts.join(" ")}`);
   }

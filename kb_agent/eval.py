@@ -21,9 +21,15 @@ def eval_search(
     top_k: int = 5,
     compare_modes: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    queries = json.loads(queries_path.read_text(encoding="utf-8"))
-    if not isinstance(queries, list):
-        raise ValueError("Search eval file must be a JSON list.")
+    raw_queries = json.loads(queries_path.read_text(encoding="utf-8"))
+    if isinstance(raw_queries, list):
+        queries = raw_queries
+        eval_set_schema = "json_list"
+    elif isinstance(raw_queries, dict) and isinstance(raw_queries.get("queries"), list):
+        queries = raw_queries["queries"]
+        eval_set_schema = str(raw_queries.get("schema") or "search_eval_set")
+    else:
+        raise ValueError("Search eval file must be a JSON list or an object with a queries list.")
 
     modes = _unique_strings(compare_modes or [search_mode])
     mode_results = {
@@ -34,6 +40,7 @@ def eval_search(
     report = {
         "schema": "search_eval.v2",
         "queries_path": str(queries_path),
+        "eval_set_schema": eval_set_schema,
         "search_mode": search_mode,
         "compare_modes": modes,
         "top_k": top_k,

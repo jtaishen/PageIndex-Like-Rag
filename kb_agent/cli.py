@@ -12,6 +12,7 @@ from .artifacts import get_citation_map, get_doc_card, get_innovations, get_pars
 from .config import resolve_db_path
 from .embeddings import build_semantic_index
 from .eval import eval_memory, eval_review, eval_search
+from .feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from .ingest import sync_directory
 from .insights import extract_doc_insights
 from .memory import compact_memory, put_memory_gated, remember_task, resume_task, search_memory
@@ -192,6 +193,35 @@ def main(argv: Any = None) -> None:
     query_stats_parser = subparsers.add_parser("query-stats", help="Summarize query log metrics")
     query_stats_parser.add_argument("--since-days", type=float, default=None)
 
+    feedback_put_parser = subparsers.add_parser("feedback-put", help="Record human feedback for a query result")
+    feedback_put_parser.add_argument("query")
+    feedback_put_parser.add_argument("--query-id", default="")
+    feedback_put_parser.add_argument("--operation", default="")
+    feedback_put_parser.add_argument("--rating", type=int, required=True)
+    feedback_put_parser.add_argument("--label", default="")
+    feedback_put_parser.add_argument("--comment", default="")
+    feedback_put_parser.add_argument("--expected-doc-id", action="append", default=[])
+    feedback_put_parser.add_argument("--expected-node-id", action="append", default=[])
+    feedback_put_parser.add_argument("--expected-keyword", action="append", default=[])
+    feedback_put_parser.add_argument("--preferred-search-mode", choices=["hybrid", "tree", "fts"], default="")
+
+    feedback_list_parser = subparsers.add_parser("feedback-list", help="List recorded human feedback")
+    feedback_list_parser.add_argument("--limit", type=int, default=20)
+    feedback_list_parser.add_argument("--operation", default=None)
+    feedback_list_parser.add_argument("--label", default=None)
+    feedback_list_parser.add_argument("--rating", type=int, default=None)
+    feedback_list_parser.add_argument("--min-rating", type=int, default=None)
+
+    feedback_eval_parser = subparsers.add_parser("feedback-to-eval", help="Build a search eval set from feedback")
+    feedback_eval_parser.add_argument("output_json", nargs="?", default=None)
+    feedback_eval_parser.add_argument("--min-rating", type=int, default=4)
+    feedback_eval_parser.add_argument("--label", default=None)
+    feedback_eval_parser.add_argument("--operation", default=None)
+    feedback_eval_parser.add_argument("--limit", type=int, default=200)
+
+    eval_dashboard_parser = subparsers.add_parser("eval-dashboard", help="Write a static query/eval/feedback dashboard")
+    eval_dashboard_parser.add_argument("--since-days", type=float, default=None)
+
     args = parser.parse_args(argv)
     db_path = resolve_db_path(args.db)
 
@@ -361,6 +391,46 @@ def main(argv: Any = None) -> None:
         )
     elif args.command == "query-stats":
         _print_json(query_stats(db_path, since_days=args.since_days))
+    elif args.command == "feedback-put":
+        _print_json(
+            put_feedback(
+                db_path,
+                query=args.query,
+                query_id=args.query_id,
+                operation=args.operation,
+                rating=args.rating,
+                label=args.label,
+                comment=args.comment,
+                expected_doc_ids=args.expected_doc_id,
+                expected_node_ids=args.expected_node_id,
+                expected_keywords=args.expected_keyword,
+                preferred_search_mode=args.preferred_search_mode,
+            )
+        )
+    elif args.command == "feedback-list":
+        _print_json(
+            list_feedback(
+                db_path,
+                limit=args.limit,
+                operation=args.operation,
+                label=args.label,
+                rating=args.rating,
+                min_rating=args.min_rating,
+            )
+        )
+    elif args.command == "feedback-to-eval":
+        _print_json(
+            build_eval_set_from_feedback(
+                db_path,
+                output_path=Path(args.output_json) if args.output_json else None,
+                min_rating=args.min_rating,
+                label=args.label,
+                operation=args.operation,
+                limit=args.limit,
+            )
+        )
+    elif args.command == "eval-dashboard":
+        _print_json(eval_dashboard(db_path, since_days=args.since_days))
 
 
 def _list_documents(db_path: Path) -> None:

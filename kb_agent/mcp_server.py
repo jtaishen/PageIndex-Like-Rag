@@ -8,6 +8,7 @@ from .artifacts import get_artifact, get_citation_map, get_doc_card, get_innovat
 from .config import resolve_db_path
 from .embeddings import build_semantic_index
 from .eval import eval_memory, eval_review, eval_search
+from .feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from .ingest import sync_directory
 from .insights import extract_doc_insights
 from .memory import compact_memory, put_memory_gated as write_memory_gated, remember_task, resume_task, search_memory
@@ -108,6 +109,78 @@ if FastMCP is not None:
     def kb_get_query_stats(since_days: Optional[float] = None, db_path: Optional[str] = None) -> Dict[str, Any]:
         """Return aggregate query log metrics and warning rates."""
         return query_stats(resolve_db_path(db_path), since_days=since_days)
+
+    @mcp.tool()
+    def kb_put_feedback(
+        query: str,
+        rating: int,
+        query_id: str = "",
+        operation: str = "",
+        label: str = "",
+        comment: str = "",
+        expected_doc_ids: Optional[List[str]] = None,
+        expected_node_ids: Optional[List[str]] = None,
+        expected_keywords: Optional[List[str]] = None,
+        preferred_search_mode: str = "",
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Record sanitized human feedback for a query result without evidence text."""
+        return put_feedback(
+            resolve_db_path(db_path),
+            query=query,
+            query_id=query_id,
+            operation=operation,
+            rating=rating,
+            label=label,
+            comment=comment,
+            expected_doc_ids=expected_doc_ids,
+            expected_node_ids=expected_node_ids,
+            expected_keywords=expected_keywords,
+            preferred_search_mode=preferred_search_mode,
+        )
+
+    @mcp.tool()
+    def kb_get_feedback(
+        limit: int = 20,
+        operation: Optional[str] = None,
+        label: Optional[str] = None,
+        rating: Optional[int] = None,
+        min_rating: Optional[int] = None,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return sanitized human feedback items."""
+        return list_feedback(
+            resolve_db_path(db_path),
+            limit=limit,
+            operation=operation,
+            label=label,
+            rating=rating,
+            min_rating=min_rating,
+        )
+
+    @mcp.tool()
+    def kb_build_eval_set_from_feedback(
+        output_json: Optional[str] = None,
+        min_rating: int = 4,
+        label: Optional[str] = None,
+        operation: Optional[str] = None,
+        limit: int = 200,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build a search evaluation set from high-quality feedback."""
+        return build_eval_set_from_feedback(
+            resolve_db_path(db_path),
+            output_path=Path(output_json) if output_json else None,
+            min_rating=min_rating,
+            label=label,
+            operation=operation,
+            limit=limit,
+        )
+
+    @mcp.tool()
+    def kb_eval_dashboard(since_days: Optional[float] = None, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Write a static dashboard that summarizes query logs, eval reports, and feedback."""
+        return eval_dashboard(resolve_db_path(db_path), since_days=since_days)
 
     @mcp.tool()
     def kb_search_tree(

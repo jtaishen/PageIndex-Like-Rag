@@ -16,9 +16,10 @@ parse -> normalize -> tree -> artifacts -> indexes -> evidence packet -> CLI / M
 - 将文档保存为 `documents` 和 `doc_nodes`。
 - 使用 SQLite FTS5 做全文检索，并支持本地 embedding + hybrid rerank。
 - 返回带 `doc_id`、`node_id`、`node_path`、页码和 excerpt 的 evidence packet。
-- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`parse-report`、`embed`、`search-report`、`eval-search`、`eval-review`、`eval-memory`、`query-log`、`query-stats`、`extract`、`innovations`、`citations`。
+- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`parse-report`、`embed`、`search-report`、`eval-search`、`eval-review`、`eval-memory`、`query-log`、`query-stats`、`feedback-put`、`feedback-to-eval`、`eval-dashboard`、`extract`、`innovations`、`citations`。
 - 支持跨论文比较和综述规划任务工件，生成比较矩阵、综述大纲、章节证据表和下一步行动。
 - 支持长期 memory 写入门控、任务进度记忆、任务恢复和任务进度压缩。
+- 支持人工反馈闭环，可将用户评分、期望 doc/node/keyword 转为搜索评测集。
 - 提供可选 MCP server，供 OpenCode 调用。
 
 ## 快速开始
@@ -325,6 +326,45 @@ uv run python -m kb_agent.cli query-stats --since-days 7
 
 OpenCode 已配置 `.opencode/plugins/kb-observer/index.mjs`。它会在 `kb_tree_search`、`kb_compare`、`kb_generate_review`、`kb_check_review_citations` 和评测工具运行后，把任务状态和质量告警摘要写入 `.kb_state/opencode_observer/`，并在会话压缩时注入短上下文；不会写入论文正文或 evidence。
 
+## v0.12 人工反馈闭环与评测集管理
+
+v0.12 将人工判断沉淀为结构化反馈，再转换成可复跑的搜索评测集。反馈只保存 query、评分、标签、期望 doc/node/keyword 和短评论；如果评论包含 `node_id=...`、`page_range=...`、`excerpt=...` 这类论文资产内容，会拒绝保存评论正文并留下 warning。
+
+记录一次反馈：
+
+```bash
+uv run python -m kb_agent.cli feedback-put "动态角色任务规划" \
+  --operation ask \
+  --rating 5 \
+  --label good \
+  --expected-doc-id <doc_id> \
+  --expected-node-id <node_id> \
+  --expected-keyword 动态角色 \
+  --preferred-search-mode tree \
+  --comment "树搜索命中了方法章节"
+```
+
+查看反馈并转成评测集：
+
+```bash
+uv run python -m kb_agent.cli feedback-list --limit 10
+uv run python -m kb_agent.cli feedback-to-eval --min-rating 4
+```
+
+对反馈生成的评测集比较多种检索模式：
+
+```bash
+uv run python -m kb_agent.cli eval-search data/eval_sets/<feedback_eval>.json --compare-modes hybrid,tree,fts
+```
+
+生成静态复盘报告：
+
+```bash
+uv run python -m kb_agent.cli eval-dashboard --since-days 7
+```
+
+`query-stats` 现在也会汇总反馈数量、平均评分、低评分数量、反馈标签分布和各 search mode 的反馈分布。OpenCode observer 会在证据不足、fallback 或综述引用覆盖低时提示使用 `kb_put_feedback -> kb_build_eval_set_from_feedback -> kb_eval_search` 做复盘。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
@@ -405,6 +445,12 @@ DeepSeek 官方 OpenCode 接入方式：
 kb_sync -> kb_build_semantic_index -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_classify_query -> kb_tree_search -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> kb_eval_search -> kb_eval_review -> kb_eval_memory -> kb_get_query_stats -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
 ```
 
+当用户明确指出某次结果好坏时，推荐追加：
+
+```text
+kb_get_query_log -> kb_put_feedback -> kb_build_eval_set_from_feedback -> kb_eval_search -> kb_eval_dashboard
+```
+
 ## 测试
 
 ```bash
@@ -413,4 +459,4 @@ uv run python -m unittest discover -s tests
 
 ## 后续阶段
 
-- 增加人工反馈闭环、评测集管理、查询日志可视化和更完整的 OpenCode 工作流自动化。
+- 增加反馈驱动的查询日志可视化 UI、更完整的 OpenCode 工作流自动化，以及基于评测集的检索策略调参。

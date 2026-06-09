@@ -9,7 +9,7 @@ import json
 from .models import DocumentRecord, EvidencePacket, NodeRecord
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -112,6 +112,23 @@ def init_db(conn: sqlite3.Connection) -> None:
             created_at REAL NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS feedback_items (
+            feedback_id TEXT PRIMARY KEY,
+            query_id TEXT NOT NULL DEFAULT '',
+            operation TEXT NOT NULL DEFAULT '',
+            query TEXT NOT NULL,
+            rating INTEGER NOT NULL,
+            label TEXT NOT NULL DEFAULT '',
+            comment TEXT NOT NULL DEFAULT '',
+            expected_doc_ids TEXT NOT NULL DEFAULT '[]',
+            expected_node_ids TEXT NOT NULL DEFAULT '[]',
+            expected_keywords TEXT NOT NULL DEFAULT '[]',
+            preferred_search_mode TEXT NOT NULL DEFAULT '',
+            warnings TEXT NOT NULL DEFAULT '[]',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS document_versions (
             version_id TEXT PRIMARY KEY,
             doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
@@ -162,6 +179,11 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_node_embeddings_doc_id ON node_embeddings(doc_id);
         CREATE INDEX IF NOT EXISTS idx_node_embeddings_provider_model ON node_embeddings(provider, model);
         CREATE INDEX IF NOT EXISTS idx_document_embeddings_provider_model ON document_embeddings(provider, model);
+        CREATE INDEX IF NOT EXISTS idx_feedback_items_created_at ON feedback_items(created_at);
+        CREATE INDEX IF NOT EXISTS idx_feedback_items_query_id ON feedback_items(query_id);
+        CREATE INDEX IF NOT EXISTS idx_feedback_items_operation ON feedback_items(operation);
+        CREATE INDEX IF NOT EXISTS idx_feedback_items_label ON feedback_items(label);
+        CREATE INDEX IF NOT EXISTS idx_feedback_items_rating ON feedback_items(rating);
         """
     )
     _ensure_columns(

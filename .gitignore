@@ -15,4 +15,5 @@ data/raw/
 data/state/
 data/logs/
 data/eval/
+data/eval_sets/
 .kb_state/

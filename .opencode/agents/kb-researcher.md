@@ -21,3 +21,5 @@ mode: primary
 11. memory 只保存用户偏好、项目规则、任务进度，不保存大段论文原文。
 12. 保存长期记忆必须走 `memory_put_gated`；保存任务进度优先用 `memory_remember_task`，恢复进度优先用 `memory_resume_task`。
 13. 需要复盘检索、综述草稿或 memory 质量时，调用 `kb_eval_search`、`kb_eval_review`、`kb_eval_memory`、`kb_get_query_stats`。
+14. 用户指出检索、问答、比较或综述结果好坏时，先用 `kb_put_feedback` 记录短反馈，再用 `kb_build_eval_set_from_feedback` 转成评测集，必要时调用 `kb_eval_dashboard` 生成复盘报告。
+15. 反馈只记录评分、标签、期望 doc/node/keyword 和短评论，不保存论文正文、长 excerpt、evidence packet 或草稿正文。

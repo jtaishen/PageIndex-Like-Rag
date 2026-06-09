@@ -177,6 +177,10 @@ def query_stats(db_path: Path, *, since_days: Optional[float] = None) -> Dict[st
     try:
         rows = conn.execute(f"SELECT * FROM query_logs {where}", params).fetchall()
         items = [_row_to_log_item(dict(row)) for row in rows]
+        feedback_rows = [
+            dict(row)
+            for row in conn.execute(f"SELECT * FROM feedback_items {where}", params).fetchall()
+        ]
     finally:
         conn.close()
 
@@ -201,6 +205,16 @@ def query_stats(db_path: Path, *, since_days: Optional[float] = None) -> Dict[st
         if metrics.get("evidence_count") == 0 or "no_tree_evidence" in warnings or "no_search_results" in warnings:
             no_evidence_count += 1
 
+    feedback_label_counts: Dict[str, int] = {}
+    feedback_mode_counts: Dict[str, int] = {}
+    feedback_ratings: List[int] = []
+    for row in feedback_rows:
+        rating = int(row.get("rating") or 0)
+        if rating:
+            feedback_ratings.append(rating)
+        _inc(feedback_label_counts, str(row.get("label") or "unlabeled"))
+        _inc(feedback_mode_counts, str(row.get("preferred_search_mode") or "unspecified"))
+
     query_count = len(items)
     return {
         "schema": "query_stats.v1",
@@ -214,6 +228,11 @@ def query_stats(db_path: Path, *, since_days: Optional[float] = None) -> Dict[st
         "fallback_rate": round(fallback_count / query_count, 4) if query_count else 0.0,
         "no_evidence_rate": round(no_evidence_count / query_count, 4) if query_count else 0.0,
         "top_warnings": _top_counts(warning_counts),
+        "feedback_count": len(feedback_rows),
+        "avg_feedback_rating": round(sum(feedback_ratings) / len(feedback_ratings), 3) if feedback_ratings else 0.0,
+        "low_rating_count": sum(1 for value in feedback_ratings if value <= 2),
+        "feedback_label_counts": feedback_label_counts,
+        "feedback_search_mode_counts": feedback_mode_counts,
     }
 
 

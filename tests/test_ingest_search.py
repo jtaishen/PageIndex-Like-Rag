@@ -17,6 +17,7 @@ from kb_agent.artifacts import get_artifact, get_citation_map, get_doc_card, get
 from kb_agent.cli import main as cli_main
 from kb_agent.embeddings import HashEmbeddingProvider, build_semantic_index
 from kb_agent.eval import eval_memory, eval_review, eval_search
+from kb_agent.feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from kb_agent.ingest import sync_directory
 from kb_agent.insights import extract_doc_insights
 from kb_agent.llm import LLMError
@@ -1057,6 +1058,118 @@ class IngestSearchTest(unittest.TestCase):
                 cli_main(["--db", str(db_path), "eval-memory"])
             self.assertIn("memory_eval.v1", stdout.getvalue())
 
+    def test_feedback_records_expected_targets_and_builds_eval_set(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path, doc_id = _sync_insight_sample(root)
+            build_semantic_index(db_path, force=True, provider="hash")
+            node_index = get_artifact(db_path, doc_id, "node_index.jsonl")["content"]
+            target_node = next(node for node in node_index if "动态角色发现机制" in node.get("text", ""))
+
+            result = put_feedback(
+                db_path,
+                query="动态角色任务规划",
+                operation="ask",
+                rating=5,
+                label="good",
+                comment="树搜索命中了方法章节。",
+                expected_doc_ids=[doc_id],
+                expected_node_ids=[target_node["node_id"]],
+                expected_keywords=["动态角色"],
+                preferred_search_mode="tree",
+            )
+            self.assertEqual(result["schema"], "feedback_write.v1")
+            self.assertEqual(result["comment_status"], "accepted")
+
+            feedback = list_feedback(db_path, limit=5, label="good")
+            self.assertEqual(feedback["schema"], "feedback_list.v1")
+            self.assertEqual(feedback["count"], 1)
+            self.assertEqual(feedback["items"][0]["expected_doc_ids"], [doc_id])
+
+            eval_path = root / "feedback_eval.json"
+            eval_set = build_eval_set_from_feedback(db_path, output_path=eval_path, min_rating=4)
+            self.assertEqual(eval_set["schema"], "search_eval_set.v1")
+            self.assertEqual(eval_set["query_count"], 1)
+            self.assertTrue(eval_path.exists())
+
+            report = eval_search(db_path, eval_path, search_mode="hybrid", top_k=3, compare_modes=["hybrid", "tree", "fts"])
+            self.assertEqual(report["eval_set_schema"], "search_eval_set.v1")
+            self.assertEqual(set(report["mode_results"].keys()), {"hybrid", "tree", "fts"})
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main([
+                    "--db",
+                    str(db_path),
+                    "feedback-put",
+                    "动态角色任务规划",
+                    "--operation",
+                    "ask",
+                    "--rating",
+                    "4",
+                    "--label",
+                    "good",
+                    "--expected-doc-id",
+                    doc_id,
+                    "--expected-node-id",
+                    target_node["node_id"],
+                    "--expected-keyword",
+                    "动态角色",
+                    "--preferred-search-mode",
+                    "tree",
+                ])
+            self.assertIn("feedback_write.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "feedback-list", "--label", "good"])
+            self.assertIn("feedback_list.v1", stdout.getvalue())
+
+            cli_eval_path = root / "cli_feedback_eval.json"
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "feedback-to-eval", str(cli_eval_path), "--min-rating", "4"])
+            self.assertIn("search_eval_set.v1", stdout.getvalue())
+            self.assertTrue(cli_eval_path.exists())
+
+    def test_feedback_sanitizes_paper_assets_and_dashboard_reports_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_id = _sync_insight_sample(Path(tmp))
+            result = put_feedback(
+                db_path,
+                query="动态角色任务规划",
+                operation="tree-search",
+                rating=1,
+                label="missing_evidence",
+                comment="node_id=node_x page_range=[1,2] excerpt=这是一段论文正文，不能进入反馈评论。",
+                expected_doc_ids=[doc_id],
+                expected_keywords=["动态角色"],
+                preferred_search_mode="hybrid",
+            )
+            self.assertEqual(result["comment_status"], "rejected")
+            self.assertIn("comment_rejected:paper_asset_boundary", result["warnings"])
+
+            feedback = list_feedback(db_path, limit=5)
+            self.assertEqual(feedback["items"][0]["comment"], "")
+            dumped = json.dumps(feedback, ensure_ascii=False)
+            self.assertNotIn("这是一段论文正文", dumped)
+
+            stats = query_stats(db_path)
+            self.assertEqual(stats["feedback_count"], 1)
+            self.assertEqual(stats["low_rating_count"], 1)
+            self.assertIn("missing_evidence", stats["feedback_label_counts"])
+
+            dashboard = eval_dashboard(db_path)
+            self.assertEqual(dashboard["schema"], "eval_dashboard.v1")
+            self.assertTrue(Path(dashboard["path"]).exists())
+            self.assertTrue(Path(dashboard["json_path"]).exists())
+            self.assertEqual(dashboard["feedback_summary"]["low_rating_count"], 1)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "eval-dashboard"])
+            self.assertIn("eval_dashboard.v1", stdout.getvalue())
+
     def test_opencode_observer_plugin_is_static_valid_and_sanitizes_sensitive_keys(self) -> None:
         plugin_path = Path(".opencode/plugins/kb-observer/index.mjs")
         self.assertTrue(plugin_path.exists())
@@ -1064,6 +1177,8 @@ class IngestSearchTest(unittest.TestCase):
         self.assertIn("tool.execute.after", content)
         self.assertIn("experimental.session.compacting", content)
         self.assertIn("SENSITIVE_KEYS", content)
+        self.assertIn("kb_put_feedback", content)
+        self.assertIn("feedback_hint", content)
         node = shutil.which("node")
         if node:
             result = subprocess.run([node, "--check", str(plugin_path)], capture_output=True, text=True)
@@ -1238,7 +1353,7 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(parse_report["status"], "failed")
             self.assertIn("Cannot read DOCX", parse_report["error"])
 
-    def test_v1_database_migrates_to_v4(self) -> None:
+    def test_v1_database_migrates_to_v5(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "v1.sqlite"
             conn = sqlite3.connect(db_path)
@@ -1299,7 +1414,8 @@ class IngestSearchTest(unittest.TestCase):
                 self.assertIn("document_embeddings", tables)
                 self.assertIn("operation", query_log_columns)
                 self.assertIn("metrics_json", query_log_columns)
-                self.assertEqual(conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()["value"], "4")
+                self.assertIn("feedback_items", tables)
+                self.assertEqual(conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()["value"], "5")
             finally:
                 conn.close()
 
