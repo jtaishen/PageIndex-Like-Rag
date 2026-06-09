@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from .artifacts import get_citation_map, get_doc_card, get_innovations, get_parse_quality
 from .config import DEFAULT_DB_PATH, PROJECT_ROOT
+from .fact_audit import fact_audit_summary
 from .facts import fact_summary_for_doc
 from .insights import extract_doc_insights
 from .llm import LLMError, generate_json_object
@@ -110,8 +111,9 @@ def compare_papers(
     started = time.time()
     selected = _select_papers(db_path, query, doc_ids, top_k_docs, search_mode)
     contexts, prepare_warnings = _prepare_paper_contexts(db_path, selected)
+    audit = fact_audit_summary(db_path, doc_ids=[context["doc_id"] for context in contexts])
     evidence_by_dimension = _collect_dimension_evidence(db_path, query, contexts, COMPARE_DIMENSIONS, search_mode)
-    warnings = [*prepare_warnings]
+    warnings = [*prepare_warnings, *_fact_audit_warning_tags(audit)]
     if len(contexts) < 2:
         warnings.append("insufficient_papers_for_comparison")
 
@@ -138,6 +140,7 @@ def compare_papers(
         matrix = _rule_based_comparison(query, contexts, evidence_by_dimension, warnings)
 
     coverage = _matrix_coverage(matrix)
+    _apply_fact_audit_to_comparison(matrix, audit)
     matrix["evidence_coverage"] = coverage
     matrix["warnings"] = _unique_strings([*matrix.get("warnings", []), *coverage["warnings"]])
     matrix["status"] = "partial" if matrix["warnings"] or matrix.get("source") == "rule" else "extracted"
@@ -199,8 +202,9 @@ def generate_review_plan(
     started = time.time()
     selected = _select_papers(db_path, topic, doc_ids, top_k_docs, search_mode)
     contexts, prepare_warnings = _prepare_paper_contexts(db_path, selected)
+    audit = fact_audit_summary(db_path, doc_ids=[context["doc_id"] for context in contexts])
     section_evidence = _collect_section_evidence(db_path, topic, contexts, search_mode)
-    warnings = [*prepare_warnings]
+    warnings = [*prepare_warnings, *_fact_audit_warning_tags(audit)]
     if not contexts:
         warnings.append("no_selected_papers")
 
@@ -227,6 +231,7 @@ def generate_review_plan(
         outline = _rule_based_review_plan(topic, contexts, section_evidence, warnings)
 
     coverage = _outline_coverage(outline, section_evidence)
+    _apply_fact_audit_to_review(outline, audit)
     outline["evidence_coverage"] = coverage
     outline["warnings"] = _unique_strings([*outline.get("warnings", []), *coverage["warnings"]])
     outline["status"] = "partial" if outline["warnings"] or outline.get("source") == "rule" else "extracted"
@@ -836,6 +841,51 @@ def _review_open_questions(sections: List[Dict[str, Any]]) -> List[str]:
         if section.get("warnings"):
             questions.append(f"{section['title']}章节缺少足够证据，需要补充文献或重新解析。")
     return _unique_strings(questions)
+
+
+def _fact_audit_warning_tags(audit: Dict[str, Any]) -> List[str]:
+    warnings = []
+    if audit.get("conflict_count", 0) > 0:
+        warnings.append(f"fact_audit_conflicts:{audit.get('conflict_count')}")
+    if audit.get("high_severity_conflict_count", 0) > 0:
+        warnings.append(f"fact_audit_high_conflicts:{audit.get('high_severity_conflict_count')}")
+    if audit.get("table_text_mismatch_count", 0) > 0:
+        warnings.append(f"fact_audit_table_text_mismatch:{audit.get('table_text_mismatch_count')}")
+    if audit.get("citation_gap_count", 0) > 0:
+        warnings.append(f"fact_audit_citation_gaps:{audit.get('citation_gap_count')}")
+    if audit.get("no_evidence_count", 0) > 0:
+        warnings.append(f"fact_audit_no_evidence:{audit.get('no_evidence_count')}")
+    return warnings
+
+
+def _apply_fact_audit_to_comparison(matrix: Dict[str, Any], audit: Dict[str, Any]) -> None:
+    matrix["fact_audit"] = audit
+    audit_warnings = _fact_audit_warning_tags(audit)
+    if not audit_warnings:
+        return
+    matrix["warnings"] = _unique_strings([*matrix.get("warnings", []), *audit_warnings])
+    questions = [
+        f"事实审计发现 {audit.get('conflict_count', 0)} 个冲突和 {audit.get('citation_gap_count', 0)} 个引用关系缺口，需要回到 evidence packet 人工确认。"
+    ]
+    matrix["open_questions"] = _unique_strings([*matrix.get("open_questions", []), *questions])
+    for dimension in matrix.get("dimensions") or []:
+        if dimension.get("id") in {"evidence_strength", "limitations"}:
+            dimension["warnings"] = _unique_strings([*(dimension.get("warnings") or []), *audit_warnings])
+
+
+def _apply_fact_audit_to_review(outline: Dict[str, Any], audit: Dict[str, Any]) -> None:
+    outline["fact_audit"] = audit
+    audit_warnings = _fact_audit_warning_tags(audit)
+    if not audit_warnings:
+        return
+    outline["warnings"] = _unique_strings([*outline.get("warnings", []), *audit_warnings])
+    questions = [
+        f"事实层存在 {audit.get('conflict_count', 0)} 个冲突、{audit.get('table_text_mismatch_count', 0)} 个表格-正文不一致和 {audit.get('citation_gap_count', 0)} 个引用缺口，综述写作前需要复核。"
+    ]
+    outline["open_questions"] = _unique_strings([*outline.get("open_questions", []), *questions])
+    for section in outline.get("sections") or []:
+        if section.get("section_id") in {"evaluation_evidence", "limitations_future"}:
+            section["warnings"] = _unique_strings([*(section.get("warnings") or []), *audit_warnings])
 
 
 def _matrix_coverage(matrix: Dict[str, Any]) -> Dict[str, Any]:

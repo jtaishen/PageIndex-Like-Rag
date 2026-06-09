@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from .artifacts import get_parse_quality
 from .config import DATA_DIR
+from .fact_audit import fact_conflict_summary
 from .facts import fact_search
 from .feedback import list_feedback
 from .query import classify_query
@@ -207,6 +208,7 @@ def generate_case_study(
         )
         mode_reports[mode] = _case_mode_summary(report)
     facts = fact_search(db_path, query, doc_ids=clean_doc_ids or None, top_k=8)
+    conflicts = fact_conflict_summary(db_path, query, doc_ids=clean_doc_ids or None)
     created_at = time.time()
     case_id = stable_id("case", query, ",".join(clean_doc_ids), created_at, length=12)
     payload = {
@@ -218,9 +220,10 @@ def generate_case_study(
         "query_profile": profile,
         "mode_reports": mode_reports,
         "fact_matches": _fact_summary(facts),
+        "fact_conflicts": conflicts,
         "evidence_summary": _case_evidence_summary(mode_reports),
         "answer_outline": _answer_outline(mode_reports, facts),
-        "warnings": _case_warnings(mode_reports, facts),
+        "warnings": _case_warnings(mode_reports, facts, conflicts),
         "created_at": created_at,
     }
     json_path = EVAL_DIR / f"case_study_{case_id}.json"
@@ -598,11 +601,14 @@ def _answer_outline(mode_reports: Dict[str, Any], facts: Dict[str, Any]) -> Dict
     }
 
 
-def _case_warnings(mode_reports: Dict[str, Any], facts: Dict[str, Any]) -> List[str]:
+def _case_warnings(mode_reports: Dict[str, Any], facts: Dict[str, Any], conflicts: Optional[Dict[str, Any]] = None) -> List[str]:
     warnings = []
     for report in mode_reports.values():
         warnings.extend(report.get("warnings") or [])
     warnings.extend(facts.get("warnings") or [])
+    warnings.extend((conflicts or {}).get("warnings") or [])
+    if (conflicts or {}).get("conflict_count", 0) > 0:
+        warnings.append(f"fact_conflicts:{(conflicts or {}).get('conflict_count')}")
     if not any((report.get("results") or []) for report in mode_reports.values()):
         warnings.append("case_has_no_evidence")
     return _unique_strings(warnings)
@@ -706,6 +712,7 @@ def _case_markdown(case: Dict[str, Any]) -> str:
         f"- query: {case.get('query')}",
         f"- modes: `{', '.join(case.get('compare_modes') or [])}`",
         f"- evidence_count: `{(case.get('evidence_summary') or {}).get('count', 0)}`",
+        f"- fact_conflict_count: `{(case.get('fact_conflicts') or {}).get('conflict_count', 0)}`",
         f"- warnings: `{', '.join(case.get('warnings') or [])}`",
     ]
     return "\n".join(lines) + "\n"

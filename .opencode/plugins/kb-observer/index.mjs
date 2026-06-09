@@ -10,6 +10,8 @@ const OBSERVED_TOOLS = new Set([
   "kb_eval_review",
   "kb_eval_memory",
   "kb_eval_facts",
+  "kb_audit_facts",
+  "kb_get_fact_conflicts",
   "kb_create_eval_suite",
   "kb_run_benchmark",
   "kb_analyze_failures",
@@ -176,6 +178,15 @@ function summarizeMetrics(tool, safe, coverage) {
       table_backed_fact_count: numberValue(safe.table_backed_fact_count),
       low_confidence_count: numberValue(safe.low_confidence_count),
       duplicate_group_count: numberValue(safe.duplicate_group_count),
+    };
+  }
+  if (tool === "kb_audit_facts" || tool === "kb_get_fact_conflicts") {
+    return {
+      total_fact_count: numberValue(safe.total_fact_count),
+      conflict_count: numberValue(safe.conflict_count || safe.count),
+      high_severity_conflict_count: numberValue(safe.high_severity_conflict_count || safe.high_severity_count),
+      table_text_mismatch_count: numberValue(safe.table_text_mismatch_count),
+      citation_gap_count: numberValue(safe.citation_gap_count),
     };
   }
   if (tool === "kb_create_eval_suite") {

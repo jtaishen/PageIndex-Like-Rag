@@ -40,6 +40,7 @@ from kb_agent.benchmark import (
 from kb_agent.cli import main as cli_main
 from kb_agent.embeddings import HashEmbeddingProvider, build_semantic_index, semantic_index_status
 from kb_agent.eval import eval_facts, eval_memory, eval_review, eval_search
+from kb_agent.fact_audit import audit_facts, fact_conflict_summary, get_fact_conflicts
 from kb_agent.facts import extract_facts, fact_search, get_claims, get_entities, get_fact_graph, get_relations
 from kb_agent.feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from kb_agent.ingest import sync_directory
@@ -483,6 +484,70 @@ class IngestSearchTest(unittest.TestCase):
             with contextlib.redirect_stdout(stdout):
                 cli_main(["--db", str(db_path), "eval-facts", "--doc-id", doc_id])
             self.assertIn("fact_eval.v1", stdout.getvalue())
+
+    def test_fact_audit_conflicts_dashboard_and_task_risk_hints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_fact_audit_samples(Path(tmp))
+
+            audit = audit_facts(db_path, doc_ids=doc_ids, min_confidence=0.5)
+            self.assertEqual(audit["schema"], "fact_audit.v1")
+            self.assertEqual(audit["status"], "needs_review")
+            self.assertGreaterEqual(audit["duplicate_group_count"], 1)
+            self.assertGreaterEqual(audit["low_confidence_count"], 1)
+            self.assertGreaterEqual(audit["no_evidence_count"], 1)
+            self.assertGreaterEqual(audit["conflict_count"], 1)
+            self.assertGreaterEqual(audit["table_text_mismatch_count"], 1)
+            self.assertGreaterEqual(audit["citation_gap_count"], 1)
+            self.assertTrue(Path(audit["path"]).exists())
+            dumped = json.dumps(audit, ensure_ascii=False)
+            self.assertNotIn("excerpt", dumped)
+            self.assertNotIn("这是很长的论文正文", dumped)
+
+            conflicts = get_fact_conflicts(db_path, doc_ids=doc_ids, severity="high", min_confidence=0.5)
+            self.assertEqual(conflicts["schema"], "fact_conflicts.v1")
+            self.assertGreaterEqual(conflicts["count"], 1)
+            first = conflicts["conflicts"][0]
+            for side in ("left", "right"):
+                self.assertTrue(first[side]["doc_id"])
+                self.assertTrue(first[side]["node_id"])
+                self.assertIn("page_range", first[side])
+                self.assertIn("fact_id", first[side])
+                self.assertIn("confidence", first[side])
+            self.assertIn("reason", first)
+
+            summary = fact_conflict_summary(db_path, "任务完成率", doc_ids=doc_ids)
+            self.assertEqual(summary["schema"], "fact_conflict_summary.v1")
+            self.assertGreaterEqual(summary["conflict_count"], 1)
+
+            comparison = compare_papers(db_path, "任务完成率方法对比", doc_ids=doc_ids, use_llm=False)
+            matrix = comparison["comparison_matrix"]
+            self.assertIn("fact_audit", matrix)
+            self.assertTrue(any("fact_audit_conflicts" in warning for warning in matrix["warnings"]))
+            evidence_strength = next(item for item in matrix["dimensions"] if item["id"] == "evidence_strength")
+            self.assertTrue(any("fact_audit" in warning for warning in evidence_strength["warnings"]))
+
+            review = generate_review_plan(db_path, "任务完成率研究综述", doc_ids=doc_ids, use_llm=False)
+            outline = review["review_outline"]
+            self.assertIn("fact_audit", outline)
+            self.assertTrue(any("事实层存在" in item for item in outline["open_questions"]))
+
+            case = generate_case_study(db_path, "任务完成率", doc_ids=doc_ids, compare_modes=["hybrid", "tree"], top_k=3)
+            self.assertIn("fact_conflicts", case)
+            self.assertGreaterEqual(case["fact_conflicts"]["conflict_count"], 1)
+
+            dashboard = eval_dashboard(db_path)
+            self.assertEqual(dashboard["latest_fact_audit"]["schema"], "fact_audit.v1")
+            self.assertGreaterEqual(dashboard["latest_fact_audit"]["conflict_count"], 1)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "audit-facts", "--doc-id", doc_ids[0], "--doc-id", doc_ids[1]])
+            self.assertIn("fact_audit.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["--db", str(db_path), "fact-conflicts", "--doc-id", doc_ids[0], "--doc-id", doc_ids[1], "--severity", "high"])
+            self.assertIn("fact_conflicts.v1", stdout.getvalue())
 
     def test_llm_fact_extraction_and_require_llm_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1737,12 +1802,16 @@ class IngestSearchTest(unittest.TestCase):
         self.assertIn("kb_put_feedback", content)
         self.assertIn("kb_tune_search", content)
         self.assertIn("kb_apply_search_profile", content)
+        self.assertIn("kb_audit_facts", content)
+        self.assertIn("kb_get_fact_conflicts", content)
         self.assertIn("kb_run_benchmark", content)
         self.assertIn("kb_analyze_failures", content)
         self.assertIn("kb_generate_case_study", content)
         self.assertIn("snippet", content)
         self.assertIn("feedback_hint", content)
         mcp_content = Path("kb_agent/mcp_server.py").read_text(encoding="utf-8")
+        self.assertIn("kb_audit_facts", mcp_content)
+        self.assertIn("kb_get_fact_conflicts", mcp_content)
         self.assertIn("kb_create_eval_suite", mcp_content)
         self.assertIn("kb_run_benchmark", mcp_content)
         self.assertIn("kb_analyze_failures", mcp_content)
@@ -2193,6 +2262,167 @@ def _sync_table_sample(root: Path) -> tuple[Path, str]:
         raise AssertionError(report["errors"])
     doc_id = str(search_documents(db_path, "任务规划 表格事实", top_k=1)[0]["doc_id"])
     return db_path, doc_id
+
+
+def _sync_fact_audit_samples(root: Path) -> tuple[Path, list[str]]:
+    papers = root / "papers"
+    papers.mkdir()
+    db_path = root / "kb.sqlite"
+    (papers / "audit_a.txt").write_text(
+        "摘要：本文研究任务完成率指标的一致性审计。\n"
+        "关键词：任务完成率；事实审计\n\n"
+        "1 实验结果\n"
+        "本文方法在任务完成率上提升，并优于基线方法。\n"
+        "参考文献\n"
+        "[1] 张三. 任务规划评测. 2025.\n",
+        encoding="utf-8",
+    )
+    (papers / "audit_b.txt").write_text(
+        "摘要：本文研究另一个任务规划方法的实验结论。\n"
+        "关键词：任务完成率；事实冲突\n\n"
+        "1 实验结果\n"
+        "本文方法在任务完成率上降低，并弱于基线方法。\n"
+        "参考文献\n"
+        "[1] 李四. 任务规划对比. 2024.\n",
+        encoding="utf-8",
+    )
+    report = sync_directory(papers, db_path)
+    if report["failed"]:
+        raise AssertionError(report["errors"])
+
+    conn = db.connect(db_path)
+    db.init_db(conn)
+    try:
+        rows = conn.execute("SELECT doc_id, path FROM documents ORDER BY path").fetchall()
+        doc_ids = [str(row["doc_id"]) for row in rows]
+    finally:
+        conn.close()
+    for doc_id in doc_ids:
+        extract_doc_insights(db_path, doc_id, use_llm=False)
+
+    node_ids: Dict[str, str] = {}
+    version_ids: Dict[str, str] = {}
+    for doc_id in doc_ids:
+        node_index = get_artifact(db_path, doc_id, "node_index.jsonl")["content"]
+        node_ids[doc_id] = next(node["node_id"] for node in node_index if node.get("text"))
+        conn = db.connect(db_path)
+        try:
+            version = db.get_document_version(conn, doc_id)
+            if version is None:
+                raise AssertionError(doc_id)
+            version_ids[doc_id] = str(version["version_id"])
+        finally:
+            conn.close()
+
+    doc_a, doc_b = doc_ids
+    now = 1.0
+    claims = [
+        {
+            "claim_id": "claim_a_positive",
+            "doc_id": doc_a,
+            "version_id": version_ids[doc_a],
+            "node_id": node_ids[doc_a],
+            "type": "result",
+            "text": "任务完成率提升，本文方法优于基线方法。",
+            "normalized_text": "任务完成率提升本文方法优于基线方法",
+            "page_range": [1, 1],
+            "confidence": 0.86,
+            "source": "rule",
+            "evidence": {"node_id": node_ids[doc_a]},
+            "created_at": now,
+        },
+        {
+            "claim_id": "claim_a_duplicate",
+            "doc_id": doc_a,
+            "version_id": version_ids[doc_a],
+            "node_id": node_ids[doc_a],
+            "type": "result",
+            "text": "任务完成率提升，本文方法优于基线方法。",
+            "normalized_text": "任务完成率提升本文方法优于基线方法",
+            "page_range": [1, 1],
+            "confidence": 0.82,
+            "source": "rule",
+            "evidence": {"node_id": node_ids[doc_a]},
+            "created_at": now,
+        },
+        {
+            "claim_id": "claim_a_low",
+            "doc_id": doc_a,
+            "version_id": version_ids[doc_a],
+            "node_id": node_ids[doc_a],
+            "type": "result",
+            "text": "响应时间改善但证据较弱。",
+            "normalized_text": "响应时间改善但证据较弱",
+            "page_range": [1, 1],
+            "confidence": 0.3,
+            "source": "rule",
+            "evidence": {"node_id": node_ids[doc_a]},
+            "created_at": now,
+        },
+        {
+            "claim_id": "claim_a_no_evidence",
+            "doc_id": doc_a,
+            "version_id": version_ids[doc_a],
+            "node_id": "",
+            "type": "result",
+            "text": "负载均衡提升但缺少证据绑定。",
+            "normalized_text": "负载均衡提升但缺少证据绑定",
+            "page_range": [],
+            "confidence": 0.9,
+            "source": "rule",
+            "evidence": {},
+            "created_at": now,
+        },
+        {
+            "claim_id": "claim_a_table",
+            "doc_id": doc_a,
+            "version_id": version_ids[doc_a],
+            "node_id": node_ids[doc_a],
+            "type": "result",
+            "text": "任务完成率提升，表格显示本文方法优于基线方法。",
+            "normalized_text": "任务完成率提升表格显示本文方法优于基线方法",
+            "page_range": [1, 1],
+            "confidence": 0.9,
+            "source": "table_rule",
+            "evidence": {"node_id": node_ids[doc_a], "table_id": "table_001"},
+            "created_at": now,
+        },
+        {
+            "claim_id": "claim_a_text_mismatch",
+            "doc_id": doc_a,
+            "version_id": version_ids[doc_a],
+            "node_id": node_ids[doc_a],
+            "type": "result",
+            "text": "任务完成率降低，正文认为本文方法弱于基线方法。",
+            "normalized_text": "任务完成率降低正文认为本文方法弱于基线方法",
+            "page_range": [1, 1],
+            "confidence": 0.88,
+            "source": "rule",
+            "evidence": {"node_id": node_ids[doc_a]},
+            "created_at": now,
+        },
+        {
+            "claim_id": "claim_b_negative",
+            "doc_id": doc_b,
+            "version_id": version_ids[doc_b],
+            "node_id": node_ids[doc_b],
+            "type": "result",
+            "text": "任务完成率降低，本文方法弱于基线方法。",
+            "normalized_text": "任务完成率降低本文方法弱于基线方法",
+            "page_range": [1, 1],
+            "confidence": 0.87,
+            "source": "rule",
+            "evidence": {"node_id": node_ids[doc_b]},
+            "created_at": now,
+        },
+    ]
+    conn = db.connect(db_path)
+    try:
+        db.insert_paper_claims(conn, claims)
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path, doc_ids
 
 
 def _sync_insight_sample(root: Path) -> tuple[Path, str]:

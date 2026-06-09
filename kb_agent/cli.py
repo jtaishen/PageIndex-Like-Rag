@@ -32,6 +32,7 @@ from .benchmark import (
 from .config import resolve_db_path
 from .embeddings import build_semantic_index, semantic_index_status
 from .eval import eval_facts, eval_memory, eval_review, eval_search
+from .fact_audit import audit_facts, get_fact_conflicts
 from .facts import extract_facts, fact_search, get_claims, get_entities, get_fact_graph, get_relations
 from .feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from .ingest import sync_directory
@@ -101,6 +102,15 @@ def main(argv: Any = None) -> None:
 
     eval_facts_parser = subparsers.add_parser("eval-facts", help="Evaluate grounded paper facts and table-backed coverage")
     eval_facts_parser.add_argument("--doc-id", action="append", default=[], help="Limit to one document id; repeatable")
+
+    audit_facts_parser = subparsers.add_parser("audit-facts", help="Audit grounded facts for duplicates, conflicts, and evidence gaps")
+    audit_facts_parser.add_argument("--doc-id", action="append", default=[], help="Limit to one document id; repeatable")
+    audit_facts_parser.add_argument("--min-confidence", type=float, default=0.5)
+
+    fact_conflicts_parser = subparsers.add_parser("fact-conflicts", help="Show fact conflicts from a fresh fact audit")
+    fact_conflicts_parser.add_argument("--doc-id", action="append", default=[], help="Limit to one document id; repeatable")
+    fact_conflicts_parser.add_argument("--severity", choices=["low", "medium", "high"], default=None)
+    fact_conflicts_parser.add_argument("--min-confidence", type=float, default=0.5)
 
     eval_suite_parser = subparsers.add_parser("eval-suite", help="Create, list, or show reusable evaluation suites")
     eval_suite_subparsers = eval_suite_parser.add_subparsers(dest="suite_command", required=True)
@@ -394,6 +404,19 @@ def main(argv: Any = None) -> None:
         _print_json(_memory_eval_summary(eval_memory(db_path)))
     elif args.command == "eval-facts":
         _print_json(_fact_eval_summary(eval_facts(db_path, doc_ids=args.doc_id or None)))
+    elif args.command == "audit-facts":
+        _print_json(_fact_audit_cli_summary(audit_facts(db_path, doc_ids=args.doc_id or None, min_confidence=args.min_confidence)))
+    elif args.command == "fact-conflicts":
+        _print_json(
+            _fact_conflicts_cli_summary(
+                get_fact_conflicts(
+                    db_path,
+                    doc_ids=args.doc_id or None,
+                    severity=args.severity,
+                    min_confidence=args.min_confidence,
+                )
+            )
+        )
     elif args.command == "eval-suite":
         if args.suite_command == "create":
             _print_json(
@@ -933,6 +956,40 @@ def _fact_eval_summary(result: dict) -> dict:
     }
 
 
+def _fact_audit_cli_summary(result: dict) -> dict:
+    return {
+        "schema": result.get("schema"),
+        "path": result.get("path"),
+        "md_path": result.get("md_path"),
+        "audit_id": result.get("audit_id"),
+        "doc_ids": result.get("doc_ids") or [],
+        "status": result.get("status"),
+        "total_fact_count": result.get("total_fact_count", 0),
+        "duplicate_group_count": result.get("duplicate_group_count", 0),
+        "low_confidence_count": result.get("low_confidence_count", 0),
+        "no_evidence_count": result.get("no_evidence_count", 0),
+        "conflict_count": result.get("conflict_count", 0),
+        "high_severity_conflict_count": result.get("high_severity_conflict_count", 0),
+        "table_text_mismatch_count": result.get("table_text_mismatch_count", 0),
+        "citation_gap_count": result.get("citation_gap_count", 0),
+        "warnings": result.get("warnings") or [],
+    }
+
+
+def _fact_conflicts_cli_summary(result: dict) -> dict:
+    return {
+        "schema": result.get("schema"),
+        "audit_id": result.get("audit_id"),
+        "audit_path": result.get("audit_path"),
+        "doc_ids": result.get("doc_ids") or [],
+        "severity": result.get("severity") or "",
+        "count": result.get("count", 0),
+        "high_severity_count": result.get("high_severity_count", 0),
+        "conflicts": result.get("conflicts") or [],
+        "warnings": result.get("warnings") or [],
+    }
+
+
 def _suite_summary(result: dict) -> dict:
     return {
         "schema": result.get("schema"),
@@ -985,6 +1042,8 @@ def _case_cli_summary(result: dict) -> dict:
         "intent": (result.get("query_profile") or {}).get("intent"),
         "evidence_count": (result.get("evidence_summary") or {}).get("count", 0),
         "fact_match_count": (result.get("fact_matches") or {}).get("count", 0),
+        "fact_conflict_count": (result.get("fact_conflicts") or {}).get("conflict_count", 0),
+        "high_severity_fact_conflict_count": (result.get("fact_conflicts") or {}).get("high_severity_conflict_count", 0),
         "warnings": result.get("warnings") or [],
     }
 

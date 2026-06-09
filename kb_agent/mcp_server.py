@@ -28,6 +28,7 @@ from .benchmark import (
 from .config import resolve_db_path
 from .embeddings import build_semantic_index, semantic_index_status
 from .eval import eval_facts, eval_memory, eval_review, eval_search
+from .fact_audit import audit_facts, get_fact_conflicts
 from .facts import extract_facts, fact_search, get_claims, get_entities, get_fact_graph, get_relations
 from .feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from .ingest import sync_directory
@@ -126,6 +127,30 @@ if FastMCP is not None:
     def kb_eval_facts(doc_ids: Optional[List[str]] = None, db_path: Optional[str] = None) -> Dict[str, Any]:
         """Evaluate grounded fact coverage, confidence, duplicates, and table-backed facts."""
         return eval_facts(resolve_db_path(db_path), doc_ids=doc_ids)
+
+    @mcp.tool()
+    def kb_audit_facts(
+        doc_ids: Optional[List[str]] = None,
+        min_confidence: float = 0.5,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Audit grounded facts for duplicates, conflicts, citation gaps, and evidence gaps."""
+        return audit_facts(resolve_db_path(db_path), doc_ids=doc_ids, min_confidence=min_confidence)
+
+    @mcp.tool()
+    def kb_get_fact_conflicts(
+        doc_ids: Optional[List[str]] = None,
+        severity: Optional[str] = None,
+        min_confidence: float = 0.5,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return fact conflicts from a fresh audit without long evidence text."""
+        return get_fact_conflicts(
+            resolve_db_path(db_path),
+            doc_ids=doc_ids,
+            severity=severity,
+            min_confidence=min_confidence,
+        )
 
     @mcp.tool()
     def kb_create_eval_suite(

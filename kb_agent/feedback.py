@@ -238,6 +238,7 @@ def build_eval_set_from_feedback(
 
 def eval_dashboard(db_path: Path, *, since_days: Optional[float] = None, output_format: str = "json") -> Dict[str, Any]:
     from .benchmark import latest_benchmark_reports, latest_case_studies, latest_failure_analyses
+    from .fact_audit import latest_fact_audit_report
     from .facts import fact_coverage_summary
     from .search_profile import latest_search_tuning_reports, list_search_profiles
 
@@ -246,13 +247,14 @@ def eval_dashboard(db_path: Path, *, since_days: Optional[float] = None, output_
     feedback = feedback_summary(db_path, since_days=since_days)
     fact_coverage = fact_coverage_summary(db_path)
     latest_fact_eval = _latest_fact_eval_report()
+    latest_fact_audit = latest_fact_audit_report(limit=1)
     latest_reports = _latest_eval_reports(limit=8)
     latest_benchmarks = latest_benchmark_reports(limit=5)
     latest_failures = latest_failure_analyses(limit=5)
     latest_cases = latest_case_studies(limit=5)
     tuning_reports = latest_search_tuning_reports(limit=5)
     profiles = list_search_profiles()
-    recommendations = _dashboard_recommendations(stats, feedback, fact_coverage, latest_failures)
+    recommendations = _dashboard_recommendations(stats, feedback, fact_coverage, latest_failures, latest_fact_audit)
     dashboard = {
         "schema": "eval_dashboard.v1",
         "since_days": since_days,
@@ -261,6 +263,7 @@ def eval_dashboard(db_path: Path, *, since_days: Optional[float] = None, output_
         "feedback_summary": feedback,
         "fact_coverage": fact_coverage,
         "latest_fact_eval": latest_fact_eval,
+        "latest_fact_audit": latest_fact_audit[0] if latest_fact_audit else {},
         "latest_eval_reports": latest_reports,
         "latest_benchmarks": latest_benchmarks,
         "latest_failure_analyses": latest_failures,
@@ -417,6 +420,7 @@ def _dashboard_recommendations(
     feedback: Dict[str, Any],
     fact_coverage: Optional[Dict[str, Any]] = None,
     failure_reports: Optional[List[Dict[str, Any]]] = None,
+    fact_audit_reports: Optional[List[Dict[str, Any]]] = None,
 ) -> List[str]:
     recommendations = []
     if stats.get("no_evidence_rate", 0) > 0:
@@ -436,6 +440,9 @@ def _dashboard_recommendations(
     latest_failure = (failure_reports or [{}])[0] if failure_reports else {}
     if latest_failure.get("failure_count", 0) > 0:
         recommendations.append("最近 benchmark 存在失败案例；建议运行 analyze-failures 查看 next actions，并用 case-study 复盘代表性查询。")
+    latest_audit = (fact_audit_reports or [{}])[0] if fact_audit_reports else {}
+    if latest_audit.get("conflict_count", 0) > 0:
+        recommendations.append("事实审计发现冲突；建议运行 fact-conflicts 查看高风险事实，再回到原 evidence packet 人工确认。")
     return recommendations
 
 
@@ -444,6 +451,7 @@ def _dashboard_markdown(dashboard: Dict[str, Any]) -> str:
     feedback = dashboard.get("feedback_summary") or {}
     facts = dashboard.get("fact_coverage") or {}
     fact_eval = dashboard.get("latest_fact_eval") or {}
+    fact_audit = dashboard.get("latest_fact_audit") or {}
     reports = dashboard.get("latest_eval_reports") or []
     benchmarks = dashboard.get("latest_benchmarks") or []
     failures = dashboard.get("latest_failure_analyses") or []
@@ -465,6 +473,9 @@ def _dashboard_markdown(dashboard: Dict[str, Any]) -> str:
         f"- no_evidence_rate: `{stats.get('no_evidence_rate', 0.0)}`",
         f"- latest_fact_eval_status: `{fact_eval.get('status', '')}`",
         f"- latest_fact_eval_low_confidence: `{fact_eval.get('low_confidence_count', 0)}`",
+        f"- latest_fact_audit_status: `{fact_audit.get('status', '')}`",
+        f"- latest_fact_audit_conflicts: `{fact_audit.get('conflict_count', 0)}`",
+        f"- latest_fact_audit_high_conflicts: `{fact_audit.get('high_severity_conflict_count', 0)}`",
         f"- latest_benchmark_count: `{len(benchmarks)}`",
         f"- latest_failure_count: `{(failures[0] if failures else {}).get('failure_count', 0)}`",
         f"- latest_case_study_count: `{len(cases)}`",
@@ -504,6 +515,7 @@ def _dashboard_html(dashboard: Dict[str, Any]) -> str:
     feedback = dashboard.get("feedback_summary") or {}
     facts = dashboard.get("fact_coverage") or {}
     fact_eval = dashboard.get("latest_fact_eval") or {}
+    fact_audit = dashboard.get("latest_fact_audit") or {}
     benchmarks = dashboard.get("latest_benchmarks") or []
     failures = dashboard.get("latest_failure_analyses") or []
     cases = dashboard.get("latest_case_studies") or []
@@ -523,6 +535,9 @@ def _dashboard_html(dashboard: Dict[str, Any]) -> str:
         ("Relations", facts.get("relation_count", 0)),
         ("Low Conf Facts", facts.get("low_confidence_count", 0)),
         ("Fact Eval Low Conf", fact_eval.get("low_confidence_count", 0)),
+        ("Fact Conflicts", fact_audit.get("conflict_count", 0)),
+        ("High Fact Conflicts", fact_audit.get("high_severity_conflict_count", 0)),
+        ("Table/Text Mismatch", fact_audit.get("table_text_mismatch_count", 0)),
         ("Benchmarks", len(benchmarks)),
         ("Benchmark Failures", (failures[0] if failures else {}).get("failure_count", 0)),
         ("Case Studies", len(cases)),
