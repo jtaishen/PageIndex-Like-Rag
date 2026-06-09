@@ -41,6 +41,7 @@ from .knowledge_graph import (
     get_knowledge_graph,
 )
 from .memory import compact_memory, put_memory_gated as write_memory_gated, remember_task, resume_task, search_memory
+from .quality_baseline import latest_quality_baseline, run_quality_baseline
 from .query import classify_query
 from .query_log import list_query_logs, query_stats
 from .review import assemble_review, check_review_citations, draft_review
@@ -202,6 +203,30 @@ if FastMCP is not None:
     def kb_get_graph_report(graph_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
         """Return a graph quality report with evidence coverage, conflicts, and isolated facts."""
         return get_graph_report(resolve_db_path(db_path), graph_id)
+
+    @mcp.tool()
+    def kb_run_quality_baseline(
+        corpus_path: str = "articles",
+        force: bool = True,
+        top_k: int = 5,
+        use_llm: bool = False,
+        embedding_model: Optional[str] = None,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Run a real-corpus quality baseline across parsing, embeddings, retrieval, tasks, memory, and graph risks."""
+        return run_quality_baseline(
+            resolve_db_path(db_path),
+            Path(corpus_path),
+            force=force,
+            top_k=top_k,
+            use_llm=use_llm,
+            embedding_model=embedding_model,
+        )
+
+    @mcp.tool()
+    def kb_get_latest_quality_baseline(limit: int = 1) -> Dict[str, Any]:
+        """Return latest quality baseline summaries without evidence text."""
+        return latest_quality_baseline(limit=limit)
 
     @mcp.tool()
     def kb_create_eval_suite(

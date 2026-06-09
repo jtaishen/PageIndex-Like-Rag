@@ -55,6 +55,7 @@ from kb_agent.llm import LLMError
 from kb_agent.memory import compact_memory, put_memory_gated, remember_task, resume_task, search_memory
 from kb_agent.models import ParsedBlock, ParsedDocument
 from kb_agent.query import classify_query
+from kb_agent.quality_baseline import latest_quality_baseline, run_quality_baseline
 from kb_agent.query_log import list_query_logs, query_stats
 from kb_agent.review import assemble_review, check_review_citations, draft_review
 from kb_agent.search import build_search_report, get_evidence, search_documents, search_nodes
@@ -633,6 +634,80 @@ class IngestSearchTest(unittest.TestCase):
             with contextlib.redirect_stdout(stdout):
                 cli_main(["--db", str(db_path), "graph-report", result["graph_id"]])
             self.assertIn("knowledge_graph_report.v1", stdout.getvalue())
+
+    def test_quality_baseline_runs_real_corpus_summary_without_sensitive_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "robot.txt").write_text(
+                "摘要：本文研究服务机器人任务规划方法，解决任务分解和工具调用问题。\n"
+                "关键词：服务机器人；任务规划；工具调用\n\n"
+                "1 方法设计\n"
+                "本文提出结合大语言模型和技能库的任务规划框架。\n\n"
+                "2 实验结果\n"
+                "实验结果表明，该方法提升任务成功率和响应时间表现。\n\n"
+                "结论\n"
+                "本文仍存在真实家庭环境验证不足的局限。\n",
+                encoding="utf-8",
+            )
+            (papers / "agents.txt").write_text(
+                "摘要：本文研究多智能体系统中的分布式任务规划。\n"
+                "关键词：多智能体；分布式任务规划；协同调度\n\n"
+                "1 方法设计\n"
+                "本文提出动态任务重分配算法和负载均衡模型。\n\n"
+                "2 实验结果\n"
+                "实验结果表明，该方法提升任务完成率和系统鲁棒性。\n\n"
+                "结论\n"
+                "本文仍存在复杂通信约束验证不足的局限。\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch("kb_agent.quality_baseline.importlib.util.find_spec", return_value=None):
+                result = run_quality_baseline(db_path, papers, use_llm=False, top_k=3)
+
+            self.assertEqual(result["schema"], "quality_baseline.v1")
+            self.assertEqual(result["doc_count"], 2)
+            self.assertTrue(Path(result["json_path"]).exists())
+            self.assertTrue(Path(result["md_path"]).exists())
+            self.assertTrue(Path(result["html_path"]).exists())
+            self.assertEqual(result["embedding"]["hash"]["status"], "completed")
+            self.assertEqual(result["embedding"]["sentence_transformers"]["status"], "skipped")
+            self.assertEqual(result["benchmark"]["schema"], "benchmark_report.v1")
+            self.assertIn(result["benchmark"]["best_mode_by_score"], {"fts", "hybrid", "tree"})
+            self.assertEqual(result["tree_search"]["schema"], "tree_search_baseline.v1")
+            self.assertEqual(result["tasks"]["schema"], "task_quality_baseline.v1")
+            self.assertTrue(result["tasks"]["compare"].get("task_id"))
+            self.assertTrue(result["tasks"]["review"].get("task_id"))
+            self.assertEqual(result["memory"]["schema"], "memory_eval.v1")
+            self.assertIn("claim_graph", result)
+            providers = {item["provider"]: item for item in result["parser_comparison"]["providers"]}
+            self.assertEqual(providers["docling"]["status"], "skipped")
+            self.assertEqual(providers["grobid"]["status"], "skipped")
+
+            html = Path(result["html_path"]).read_text(encoding="utf-8")
+            self.assertIn("Quality Baseline", html)
+            self.assertNotIn("excerpt", html)
+            self.assertNotIn("evidence packet", html.lower())
+            self.assertNotIn("本文提出结合大语言模型", html)
+
+            latest = latest_quality_baseline(limit=1)
+            self.assertEqual(latest["schema"], "quality_baseline_latest.v1")
+            self.assertGreaterEqual(latest["count"], 1)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout), mock.patch(
+                "kb_agent.quality_baseline.importlib.util.find_spec",
+                return_value=None,
+            ):
+                cli_main(["--db", str(db_path), "quality-baseline", str(papers), "--top-k", "2"])
+            self.assertIn("quality_baseline.v1", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                cli_main(["latest-quality-baseline", "--limit", "1"])
+            self.assertIn("quality_baseline_latest.v1", stdout.getvalue())
 
     def test_llm_fact_extraction_and_require_llm_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1891,6 +1966,7 @@ class IngestSearchTest(unittest.TestCase):
         self.assertIn("kb_get_fact_conflicts", content)
         self.assertIn("kb_build_knowledge_graph", content)
         self.assertIn("kb_get_graph_neighborhood", content)
+        self.assertIn("kb_run_quality_baseline", content)
         self.assertIn("kb_run_benchmark", content)
         self.assertIn("kb_analyze_failures", content)
         self.assertIn("kb_generate_case_study", content)
@@ -1902,6 +1978,8 @@ class IngestSearchTest(unittest.TestCase):
         self.assertIn("kb_build_knowledge_graph", mcp_content)
         self.assertIn("kb_get_graph_neighborhood", mcp_content)
         self.assertIn("kb_export_knowledge_graph", mcp_content)
+        self.assertIn("kb_run_quality_baseline", mcp_content)
+        self.assertIn("kb_get_latest_quality_baseline", mcp_content)
         self.assertIn("kb_create_eval_suite", mcp_content)
         self.assertIn("kb_run_benchmark", mcp_content)
         self.assertIn("kb_analyze_failures", mcp_content)

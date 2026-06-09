@@ -29,3 +29,4 @@ mode: primary
 19. 需要调优检索策略时，调用 `kb_tune_search` 生成 search profile，再由用户确认后调用 `kb_apply_search_profile`；之后仅在明确需要时使用 `search_mode="auto"`。
 20. `auto` 模式必须说明当前 active profile 和 resolved search mode，不要把它说成默认检索行为。
 21. 需要验证 PageIndex-like 核心创新是否有效时，优先创建或读取 `eval_suite.v1`，运行 `kb_run_benchmark` 比较 `fts/hybrid/tree/auto`，再用 `kb_analyze_failures` 和 `kb_generate_case_study` 复盘代表性失败；这些报告只含指标和 ID，不能替代 evidence packet。
+22. 需要判断项目当前真实可用程度时，优先调用 `kb_run_quality_baseline`；它是解析、embedding、tree-search、compare/review、memory 和 claim graph 的总体验收入口。

@@ -17,6 +17,8 @@ const OBSERVED_TOOLS = new Set([
   "kb_get_graph_neighborhood",
   "kb_export_knowledge_graph",
   "kb_get_graph_report",
+  "kb_run_quality_baseline",
+  "kb_get_latest_quality_baseline",
   "kb_create_eval_suite",
   "kb_run_benchmark",
   "kb_analyze_failures",
@@ -205,7 +207,9 @@ function summarizeMetrics(tool, safe, coverage) {
     tool === "kb_get_knowledge_graph" ||
     tool === "kb_get_graph_neighborhood" ||
     tool === "kb_export_knowledge_graph" ||
-    tool === "kb_get_graph_report"
+    tool === "kb_get_graph_report" ||
+    tool === "kb_run_quality_baseline" ||
+    tool === "kb_get_latest_quality_baseline"
   ) {
     const report = safe.graph_report || safe;
     return {
@@ -215,6 +219,9 @@ function summarizeMetrics(tool, safe, coverage) {
       conflict_count: numberValue(safe.conflict_count || report.conflict_count),
       isolated_fact_count: numberValue(safe.isolated_fact_count || report.isolated_fact_count),
       evidence_coverage_rate: numberValue(safe.evidence_coverage_rate || report.evidence_coverage_rate),
+      doc_count: numberValue(safe.doc_count),
+      pdf_count: numberValue(safe.pdf_count),
+      warning_count: numberValue(safe.warnings?.length),
     };
   }
   if (tool === "kb_create_eval_suite") {

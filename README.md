@@ -16,7 +16,7 @@ parse -> normalize -> tree -> artifacts -> indexes -> evidence packet -> CLI / M
 - 将文档保存为 `documents` 和 `doc_nodes`。
 - 使用 SQLite FTS5 做全文检索，并支持本地 embedding + hybrid rerank。
 - 返回带 `doc_id`、`node_id`、`node_path`、页码和 excerpt 的 evidence packet。
-- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`parse-report`、`layout`、`tables`、`table-content`、`table-summaries`、`embed`、`search-report`、`eval-search`、`eval-review`、`eval-memory`、`eval-facts`、`audit-facts`、`fact-conflicts`、`graph-build`、`graph-neighborhood`、`graph-export`、`graph-report`、`eval-suite`、`benchmark`、`analyze-failures`、`case-study`、`query-log`、`query-stats`、`feedback-put`、`feedback-to-eval`、`eval-dashboard`、`tune-search`、`search-profile`、`extract`、`innovations`、`citations`、`extract-facts`、`claims`、`entities`、`relations`、`fact-search`。
+- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`parse-report`、`layout`、`tables`、`table-content`、`table-summaries`、`embed`、`search-report`、`eval-search`、`eval-review`、`eval-memory`、`eval-facts`、`audit-facts`、`fact-conflicts`、`graph-build`、`graph-neighborhood`、`graph-export`、`graph-report`、`quality-baseline`、`latest-quality-baseline`、`eval-suite`、`benchmark`、`analyze-failures`、`case-study`、`query-log`、`query-stats`、`feedback-put`、`feedback-to-eval`、`eval-dashboard`、`tune-search`、`search-profile`、`extract`、`innovations`、`citations`、`extract-facts`、`claims`、`entities`、`relations`、`fact-search`。
 - 支持跨论文比较和综述规划任务工件，生成比较矩阵、综述大纲、章节证据表和下一步行动。
 - 支持长期 memory 写入门控、任务进度记忆、任务恢复和任务进度压缩。
 - 支持人工反馈闭环，可将用户评分、期望 doc/node/keyword 转为搜索评测集。
@@ -547,6 +547,26 @@ uv run python -m kb_agent.cli graph-export <graph_id> --format html
 
 `compare`、`generate-review` 和 `case-study` 会读取 Claim Graph 摘要，把共享实体、冲突事实、孤立事实和证据覆盖缺口作为风险提示。正式论文结论仍必须回到 `kb_get_evidence` 的 evidence packet。
 
+## v0.20 真实论文集质量基线与核心能力纠偏
+
+v0.20 不继续横向加新知识层，而是把当前系统放到真实论文集上做总体验收。`quality-baseline` 会同步语料、检查 PDF 解析质量、比较可选 parser 状态、构建 hash embedding、尝试可用的 sentence-transformers、生成 baseline eval suite、运行 `fts/hybrid/tree` benchmark、执行 tree-search、compare/review、case-study、memory eval 和 Claim Graph 风险汇总。
+
+运行默认真实论文集基线：
+
+```bash
+uv run --extra pdf python -m kb_agent.cli quality-baseline articles
+uv run python -m kb_agent.cli latest-quality-baseline
+```
+
+如果已安装 sentence-transformers，可指定真实 embedding 模型：
+
+```bash
+uv sync --extra embeddings
+uv run python -m kb_agent.cli quality-baseline articles --embedding-model sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+```
+
+报告会写入 `data/eval/quality_baseline_<id>.json/.md/.html`。HTML 只展示指标、路径、warning 和建议动作，不包含论文正文、长 excerpt、完整 evidence packet 或综述草稿正文。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
@@ -624,7 +644,7 @@ DeepSeek 官方 OpenCode 接入方式：
 推荐工具调用顺序：
 
 ```text
-kb_sync -> kb_build_semantic_index -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_get_layout_blocks -> kb_get_figures -> kb_get_tables -> kb_get_table_content -> kb_get_table_summaries -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_extract_facts -> kb_get_claims -> kb_get_entities -> kb_get_relations -> kb_get_fact_graph -> kb_fact_search -> kb_audit_facts -> kb_get_fact_conflicts -> kb_build_knowledge_graph -> kb_get_graph_neighborhood -> kb_classify_query -> kb_tree_search -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> kb_eval_search -> kb_eval_review -> kb_eval_memory -> kb_eval_facts -> kb_create_eval_suite -> kb_run_benchmark -> kb_analyze_failures -> kb_generate_case_study -> kb_get_query_stats -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
+kb_sync -> kb_build_semantic_index -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_get_layout_blocks -> kb_get_figures -> kb_get_tables -> kb_get_table_content -> kb_get_table_summaries -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_extract_facts -> kb_get_claims -> kb_get_entities -> kb_get_relations -> kb_get_fact_graph -> kb_fact_search -> kb_audit_facts -> kb_get_fact_conflicts -> kb_build_knowledge_graph -> kb_get_graph_neighborhood -> kb_run_quality_baseline -> kb_get_latest_quality_baseline -> kb_classify_query -> kb_tree_search -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> kb_eval_search -> kb_eval_review -> kb_eval_memory -> kb_eval_facts -> kb_create_eval_suite -> kb_run_benchmark -> kb_analyze_failures -> kb_generate_case_study -> kb_get_query_stats -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
 ```
 
 当用户明确指出某次结果好坏时，推荐追加：

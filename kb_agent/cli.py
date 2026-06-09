@@ -39,6 +39,7 @@ from .ingest import sync_directory
 from .insights import extract_doc_insights
 from .knowledge_graph import build_knowledge_graph, export_knowledge_graph, get_graph_neighborhood, get_graph_report
 from .memory import compact_memory, put_memory_gated, remember_task, resume_task, search_memory
+from .quality_baseline import latest_quality_baseline, run_quality_baseline
 from .query import classify_query
 from .query_log import list_query_logs, query_stats, write_query_log
 from .review import assemble_review, check_review_citations, draft_review
@@ -129,6 +130,16 @@ def main(argv: Any = None) -> None:
 
     graph_report_parser = subparsers.add_parser("graph-report", help="Show a claim graph quality report")
     graph_report_parser.add_argument("graph_id")
+
+    baseline_parser = subparsers.add_parser("quality-baseline", help="Run a real-corpus quality baseline")
+    baseline_parser.add_argument("corpus_path", nargs="?", default="articles")
+    baseline_parser.add_argument("--no-force", action="store_true", help="Do not force rebuild corpus artifacts")
+    baseline_parser.add_argument("--top-k", type=int, default=5)
+    baseline_parser.add_argument("--with-llm", action="store_true", help="Allow optional DeepSeek calls during insight/task checks")
+    baseline_parser.add_argument("--embedding-model", default=None)
+
+    latest_baseline_parser = subparsers.add_parser("latest-quality-baseline", help="Show latest quality baseline reports")
+    latest_baseline_parser.add_argument("--limit", type=int, default=1)
 
     eval_suite_parser = subparsers.add_parser("eval-suite", help="Create, list, or show reusable evaluation suites")
     eval_suite_subparsers = eval_suite_parser.add_subparsers(dest="suite_command", required=True)
@@ -459,6 +470,21 @@ def main(argv: Any = None) -> None:
         _print_json(export_knowledge_graph(db_path, args.graph_id, format=args.format))
     elif args.command == "graph-report":
         _print_json(get_graph_report(db_path, args.graph_id))
+    elif args.command == "quality-baseline":
+        _print_json(
+            _quality_baseline_cli_summary(
+                run_quality_baseline(
+                    db_path,
+                    Path(args.corpus_path),
+                    force=not args.no_force,
+                    top_k=args.top_k,
+                    use_llm=args.with_llm,
+                    embedding_model=args.embedding_model,
+                )
+            )
+        )
+    elif args.command == "latest-quality-baseline":
+        _print_json(latest_quality_baseline(limit=args.limit))
     elif args.command == "eval-suite":
         if args.suite_command == "create":
             _print_json(
@@ -1048,6 +1074,31 @@ def _graph_build_cli_summary(result: dict) -> dict:
         "isolated_fact_count": report.get("isolated_fact_count", 0),
         "evidence_coverage_rate": report.get("evidence_coverage_rate", 0.0),
         "warnings": result.get("warnings") or [],
+    }
+
+
+def _quality_baseline_cli_summary(result: dict) -> dict:
+    benchmark = result.get("benchmark") or {}
+    embedding = result.get("embedding") or {}
+    real_embedding = embedding.get("sentence_transformers") or {}
+    return {
+        "schema": result.get("schema"),
+        "baseline_id": result.get("baseline_id"),
+        "path": result.get("path"),
+        "md_path": result.get("md_path"),
+        "html_path": result.get("html_path"),
+        "corpus_path": result.get("corpus_path"),
+        "doc_count": result.get("doc_count", 0),
+        "pdf_count": result.get("pdf_count", 0),
+        "best_search_mode": benchmark.get("best_mode_by_score"),
+        "best_mode_by_node_recall": benchmark.get("best_mode_by_node_recall"),
+        "real_embedding_status": real_embedding.get("status", ""),
+        "compare_task_id": ((result.get("tasks") or {}).get("compare") or {}).get("task_id", ""),
+        "review_task_id": ((result.get("tasks") or {}).get("review") or {}).get("task_id", ""),
+        "claim_graph_id": (result.get("claim_graph") or {}).get("graph_id", ""),
+        "warning_count": len(result.get("warnings") or []),
+        "warnings": result.get("warnings") or [],
+        "recommendations": result.get("recommendations") or [],
     }
 
 

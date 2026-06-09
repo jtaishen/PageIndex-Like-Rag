@@ -24,6 +24,7 @@ description: 在候选论文中执行树搜索、证据抽取与可追溯问答�
 17. 需要复盘趋势时，调用 `kb_eval_dashboard`，只使用其中的统计、warning 和建议动作。
 18. 需要调优检索策略时，调用 `kb_tune_search`，保存 profile 后再调用 `kb_apply_search_profile`；只有用户要求或任务明确需要时，才传入 `search_mode="auto"`。
 19. 需要验证 PageIndex-like 树检索是否优于扁平检索时，调用 `kb_create_eval_suite`、`kb_run_benchmark`、`kb_analyze_failures` 和 `kb_generate_case_study`；报告只用于复盘，不作为论文内容证据。
+20. 需要判断真实论文集整体质量时，调用 `kb_run_quality_baseline`，再根据报告中的 parser、embedding、benchmark、task、memory 和 claim graph 建议动作继续处理。
 
 输出要求：
 
@@ -40,3 +41,4 @@ description: 在候选论文中执行树搜索、证据抽取与可追溯问答�
 - 不把论文正文、长 excerpt、evidence packet 或草稿正文写入反馈、日志或 memory。
 - 若使用 `auto` 检索，说明 active profile 名称和实际 resolved search mode。
 - 若引用 benchmark 或 case-study 结果，只说明指标、ID、warning 和建议动作，不复述其中的检索正文。
+- 若引用 quality baseline，只说明 baseline_id、报告路径、指标、warning 和建议动作，不复述论文正文或 evidence 内容。
