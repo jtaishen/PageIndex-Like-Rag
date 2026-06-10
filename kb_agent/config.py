@@ -113,6 +113,18 @@ def baseline_llm_stage_timeout_seconds() -> int:
     return _env_int("KB_BASELINE_LLM_STAGE_TIMEOUT_SECONDS", 120)
 
 
+def llm_fact_batch_size() -> int:
+    return _env_int("KB_LLM_FACT_BATCH_SIZE", 6)
+
+
+def llm_fact_max_nodes() -> int:
+    return _env_int("KB_LLM_FACT_MAX_NODES", 18)
+
+
+def llm_compare_evidence_per_doc() -> int:
+    return _env_int("KB_LLM_COMPARE_EVIDENCE_PER_DOC", 3)
+
+
 def ensure_data_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "parsed").mkdir(parents=True, exist_ok=True)

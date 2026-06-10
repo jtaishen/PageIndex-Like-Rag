@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from .artifacts import get_citation_map, get_doc_card, get_innovations, get_parse_quality
-from .config import DEFAULT_DB_PATH, PROJECT_ROOT
+from .config import DEFAULT_DB_PATH, PROJECT_ROOT, llm_compare_evidence_per_doc
 from .fact_audit import fact_audit_summary
 from .facts import fact_summary_for_doc
 from .insights import extract_doc_insights
@@ -123,16 +123,12 @@ def compare_papers(
     llm_diagnostics = _llm_diagnostics("disabled" if not use_llm else "fallback_rule")
     if use_llm:
         try:
-            payload = _compare_with_llm(query, contexts, evidence_by_dimension)
-            matrix = _normalize_comparison_payload(
-                payload,
+            matrix, llm_diagnostics = _compare_with_dimension_llm(
                 query,
                 contexts,
                 evidence_by_dimension,
-                source="llm",
                 warnings=warnings,
             )
-            llm_diagnostics = _llm_diagnostics("full_json", metadata=llm_payload_metadata(payload))
         except LLMError as exc:
             if require_llm:
                 raise
@@ -456,6 +452,199 @@ def _search_doc_evidence(db_path: Path, doc_id: str, query: str, top_k: int, sea
     for result in results:
         packets.extend(packet.to_dict() for packet in get_evidence(db_path, result.doc_id, [result.node_id]))
     return _dedupe_evidence(packets)
+
+
+def _compare_with_dimension_llm(
+    query: str,
+    contexts: List[Dict[str, Any]],
+    evidence_by_dimension: Dict[str, Dict[str, List[Dict[str, Any]]]],
+    *,
+    warnings: List[str],
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    rule_matrix = _rule_based_comparison(query, contexts, evidence_by_dimension, warnings)
+    rule_dimensions = {str(item.get("id") or ""): item for item in rule_matrix.get("dimensions") or []}
+    dimensions = []
+    fallback_dimensions: List[str] = []
+    timeout_count = 0
+    retry_count = 0
+    repair_used = False
+    first_error_type = ""
+    last_error: Optional[LLMError] = None
+    for dimension in COMPARE_DIMENSIONS:
+        dimension_id = str(dimension["id"])
+        try:
+            payload = _compare_dimension_with_llm(query, dimension, contexts, evidence_by_dimension)
+            metadata = llm_payload_metadata(payload)
+            retry_count += int(metadata.get("retry_count") or 0)
+            repair_used = repair_used or bool(metadata.get("repair_used"))
+            normalized = _normalize_comparison_dimension_payload(payload, query, dimension, contexts, evidence_by_dimension)
+            dimensions.append(normalized)
+        except LLMError as exc:
+            last_error = exc
+            if not first_error_type:
+                first_error_type = exc.error_type
+            retry_count += int(exc.metadata.get("retry_count") or 0)
+            repair_used = repair_used or bool(exc.metadata.get("repair_used"))
+            if exc.error_type == "request_timeout":
+                timeout_count += 1
+            fallback_dimensions.append(dimension_id)
+            fallback = dict(rule_dimensions.get(dimension_id) or {})
+            fallback["warnings"] = _unique_strings([*fallback.get("warnings", []), f"llm_dimension_unavailable:{exc.error_type}"])
+            dimensions.append(fallback)
+    success_count = len(COMPARE_DIMENSIONS) - len(fallback_dimensions)
+    if success_count == 0:
+        error = last_error or LLMError("DeepSeek dimension compare failed.", error_type="all_compare_dimensions_failed")
+        raise LLMError(
+            "DeepSeek compare dimension extraction failed.",
+            error_type=error.error_type,
+            metadata={
+                "dimension_success_count": 0,
+                "dimension_timeout_count": timeout_count,
+                "fallback_dimensions": fallback_dimensions,
+                "retry_count": retry_count,
+                "repair_used": repair_used,
+                "first_error_type": first_error_type,
+            },
+        ) from error
+    matrix_warnings = _unique_strings(
+        [
+            *warnings,
+            *(rule_matrix.get("warnings") or [] if fallback_dimensions else []),
+            *(["dimension_json_partial"] if fallback_dimensions else []),
+        ]
+    )
+    mode = "dimension_json" if not fallback_dimensions else "dimension_partial"
+    diagnostics = _llm_diagnostics(
+        mode,
+        metadata={
+            "retry_count": retry_count,
+            "repair_used": repair_used,
+            "error_type": "",
+            "first_error_type": first_error_type,
+        },
+        fallback_dimensions=fallback_dimensions,
+        extra={
+            "dimension_count": len(COMPARE_DIMENSIONS),
+            "dimension_success_count": success_count,
+            "dimension_timeout_count": timeout_count,
+        },
+    )
+    return (
+        {
+            "schema": "comparison_matrix.v1",
+            "status": "extracted" if not fallback_dimensions else "partial",
+            "source": "llm_dimension",
+            "query": query,
+            "dimensions": dimensions,
+            "open_questions": _comparison_open_questions(dimensions),
+            "warnings": matrix_warnings,
+            "created_at": time.time(),
+        },
+        diagnostics,
+    )
+
+
+def _compare_dimension_with_llm(
+    query: str,
+    dimension: Dict[str, Any],
+    contexts: List[Dict[str, Any]],
+    evidence_by_dimension: Dict[str, Dict[str, List[Dict[str, Any]]]],
+) -> Dict[str, object]:
+    dimension_id = str(dimension["id"])
+    system_prompt = (
+        "你是严谨的论文比较分析助手。只比较一个指定维度，只能引用给定 node_id，"
+        "不要编造，不要输出长正文。必须返回 JSON object，不要 Markdown。"
+    )
+    user_prompt = "\n".join(
+        [
+            f"比较主题：{query}",
+            f"dimension_id: {dimension_id}",
+            f"dimension_name: {dimension['name']}",
+            "返回格式：",
+            '{"id":"","synthesis":"","overlaps":[],"differences":[],'
+            '"cells":[{"doc_id":"","claim":"","evidence":[],"confidence":0.0,"warnings":[]}],"warnings":[]}',
+            "",
+            "论文与本维度证据：",
+            *_format_dimension_contexts_for_prompt(contexts, dimension_id, evidence_by_dimension),
+        ]
+    )
+    return generate_json_object(system_prompt, user_prompt)
+
+
+def _format_dimension_contexts_for_prompt(
+    contexts: List[Dict[str, Any]],
+    dimension_id: str,
+    evidence_by_dimension: Dict[str, Dict[str, List[Dict[str, Any]]]],
+) -> List[str]:
+    limit = max(1, llm_compare_evidence_per_doc())
+    lines: List[str] = []
+    for context in contexts:
+        lines.append(f"doc_id: {context['doc_id']}")
+        lines.append(f"title: {_excerpt(str(context['title']), 120)}")
+        lines.append(f"description: {_excerpt(context.get('description', ''), 180)}")
+        lines.append(f"innovations: {_format_innovations(context.get('innovation', {}), limit=2)}")
+        facts = _format_fact_summary(context.get("facts", {}), limit=2)
+        lines.append(
+            "facts: "
+            + json.dumps(
+                {
+                    "available": facts.get("available", False),
+                    "claim_count": facts.get("claim_count", 0),
+                    "entity_count": facts.get("entity_count", 0),
+                    "top_claims": facts.get("top_claims", [])[:2],
+                    "top_table_entities": facts.get("top_table_entities", [])[:2],
+                },
+                ensure_ascii=False,
+            )
+        )
+        lines.append("evidence:")
+        for evidence in evidence_by_dimension.get(dimension_id, {}).get(context["doc_id"], [])[:limit]:
+            lines.append(_format_short_evidence_line(evidence))
+        lines.append("")
+    return lines
+
+
+def _normalize_comparison_dimension_payload(
+    payload: Dict[str, object],
+    query: str,
+    dimension: Dict[str, Any],
+    contexts: List[Dict[str, Any]],
+    evidence_by_dimension: Dict[str, Dict[str, List[Dict[str, Any]]]],
+) -> Dict[str, Any]:
+    del query
+    raw_dimension = payload.get("dimension") if isinstance(payload.get("dimension"), dict) else payload
+    if not isinstance(raw_dimension, dict):
+        raw_dimension = {}
+    dimension_id = str(dimension["id"])
+    raw_cells = raw_dimension.get("cells") if isinstance(raw_dimension, dict) else []
+    cells = []
+    for context in contexts:
+        raw_cell = _find_by_doc_id(raw_cells, context["doc_id"])
+        fallback_evidence = evidence_by_dimension.get(dimension_id, {}).get(context["doc_id"], [])
+        evidence = _normalize_evidence_refs(raw_cell.get("evidence") if raw_cell else None, fallback_evidence)
+        cell_warnings = _string_list(raw_cell.get("warnings") if raw_cell else None)
+        if not evidence:
+            cell_warnings.append(f"missing_evidence:{dimension_id}:{context['doc_id']}")
+        cells.append(
+            {
+                "doc_id": context["doc_id"],
+                "title": context["title"],
+                "claim": _string_value(raw_cell.get("claim") if raw_cell else "") or _dimension_claim(context, dimension_id, evidence),
+                "evidence": evidence,
+                "evidence_count": len(evidence),
+                "confidence": _confidence(raw_cell.get("confidence") if raw_cell else None, _evidence_confidence(evidence)),
+                "warnings": _unique_strings(cell_warnings),
+            }
+        )
+    return {
+        "id": dimension_id,
+        "name": dimension["name"],
+        "synthesis": _string_value(raw_dimension.get("synthesis")) or _dimension_synthesis("", dimension, cells),
+        "overlaps": _string_list(raw_dimension.get("overlaps")) or _rule_overlaps(dimension_id, cells),
+        "differences": _string_list(raw_dimension.get("differences")) or _rule_differences(dimension_id, cells),
+        "cells": cells,
+        "warnings": _unique_strings([*_string_list(raw_dimension.get("warnings")), *[warning for cell in cells for warning in cell["warnings"]]]),
+    }
 
 
 def _compare_with_llm(
@@ -913,6 +1102,16 @@ def _format_evidence_line(evidence: Dict[str, Any]) -> str:
     )
 
 
+def _format_short_evidence_line(evidence: Dict[str, Any]) -> str:
+    return (
+        f"- node_id={evidence.get('node_id')} doc_id={evidence.get('doc_id')} "
+        f"path={_excerpt(str(evidence.get('node_path') or ''), 120)} "
+        f"page={evidence.get('page_range')} "
+        f"summary={_excerpt(str(evidence.get('excerpt') or evidence.get('summary') or ''), 160)} "
+        f"confidence={evidence.get('confidence', '')}"
+    )
+
+
 def _format_review_evidence_line(evidence: Dict[str, Any]) -> str:
     return (
         f"- node_id={evidence.get('node_id')} doc_id={evidence.get('doc_id')} "
@@ -1050,6 +1249,8 @@ def _llm_diagnostics(
     error: Optional[LLMError] = None,
     first_error: Optional[LLMError] = None,
     fallback_sections: Optional[List[str]] = None,
+    fallback_dimensions: Optional[List[str]] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     meta = metadata or {}
     error_type = str(meta.get("error_type") or "")
@@ -1062,8 +1263,11 @@ def _llm_diagnostics(
         "retry_count": int(meta.get("retry_count") or 0),
         "repair_used": bool(meta.get("repair_used")),
         "fallback_sections": fallback_sections or [],
+        "fallback_dimensions": fallback_dimensions or [],
         "error_type": error_type,
     }
+    if extra:
+        result.update(extra)
     first_type = str(meta.get("first_error_type") or "")
     if first_error is not None:
         first_type = first_error.error_type

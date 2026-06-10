@@ -650,6 +650,28 @@ uv run python -m kb_agent.cli latest-quality-baseline --real-only --limit 1
 
 如果 DeepSeek 慢、超时或返回不可解析 JSON，baseline 仍会落盘；`llm_baseline.stage_summary`、`llm_timeout_count`、`llm_budget_exhausted` 和 Markdown/HTML 报告中的 “LLM Runtime” 会说明具体卡在哪个阶段。默认 `--with-llm` 只对前 2 篇论文运行 LLM 阶段，可用 `--llm-max-docs` 调整；如只想复测解析/检索而跳过 compare/review 的 LLM，可加 `--skip-llm-tasks`。
 
+## v0.25 Facts / Compare 分块化
+
+v0.25 修复 v0.24 暴露的 `llm_facts=timeout` 和 `llm_compare=timeout`。事实抽取改为按 evidence node batch 生成小 JSON，再本地合并、去重和噪声过滤；多论文比较改为按六个固定维度分别生成 JSON，失败维度使用规则版补齐。
+
+真实验收命令：
+
+```bash
+uv run python -m kb_agent.cli llm-status --probe
+uv run --extra pdf python -m kb_agent.cli quality-baseline articles --with-llm --top-k 3 --llm-timeout-seconds 20 --llm-stage-timeout-seconds 60 --llm-max-docs 2
+uv run python -m kb_agent.cli latest-quality-baseline --real-only --limit 1
+```
+
+查看指标时重点看：
+
+- `llm_facts_success_rate`
+- `llm_facts_batch_timeout_count`
+- `llm_compare_dimension_success_rate`
+- `llm_compare_dimension_timeout_count`
+- `llm_stage_status.llm_facts` 和 `llm_stage_status.llm_compare`
+
+允许阶段显示 `partial`，但不应再因为一个大 prompt 导致 facts 或 compare 整体不可恢复。报告仍只保存 ID、短摘要、指标和 warning，不保存完整 prompt、论文正文、长 excerpt 或完整 evidence packet。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
@@ -706,6 +728,9 @@ DEEPSEEK_PROBE_TIMEOUT_SECONDS=15
 DEEPSEEK_JSON_RETRY_COUNT=1
 KB_BASELINE_LLM_TIMEOUT_SECONDS=420
 KB_BASELINE_LLM_STAGE_TIMEOUT_SECONDS=120
+KB_LLM_FACT_BATCH_SIZE=6
+KB_LLM_FACT_MAX_NODES=18
+KB_LLM_COMPARE_EVIDENCE_PER_DOC=3
 ```
 
 如果 `DEEPSEEK_BASE_URL` 使用 `http://`，密钥会以明文经过该网络链路；只建议在可信内网或临时科研验证环境中使用。

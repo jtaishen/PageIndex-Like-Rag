@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from . import db
 from .artifacts import get_artifact, get_doc_card, get_parse_quality, list_artifacts
+from .config import llm_fact_batch_size, llm_fact_max_nodes
 from .insights import extract_doc_insights
 from .llm import LLMError, generate_json_object
 from .utils import compact_whitespace, stable_id, write_json
@@ -76,36 +77,38 @@ def extract_facts(
     llm_error = ""
 
     if use_llm:
+        batch_report: Dict[str, Any] = {}
         try:
-            payload = _extract_facts_with_llm(
+            facts = _extract_facts_with_llm_batches(
+                doc_id,
+                version_id,
                 card,
                 quality,
                 innovation,
                 citation_map,
                 selected_nodes,
-                layout,
-                tables,
                 table_summaries,
-                figures,
+                node_by_id,
+                warnings,
             )
-            facts = _normalize_fact_payload(
-                payload,
-                doc_id=doc_id,
-                version_id=version_id,
-                card=card,
-                quality=quality,
-                node_by_id=node_by_id,
-                selected_nodes=selected_nodes,
-                source="llm",
-                status="extracted",
-                warnings=warnings,
-            )
+            batch_report = dict(facts.get("llm_batch_report") or {})
         except LLMError as exc:
             if require_llm:
                 raise
             llm_error = str(exc)
             warnings.append(f"llm_unavailable:{llm_error}")
             facts = _rule_based_facts(doc_id, version_id, card, quality, innovation, citation_map, selected_nodes, node_by_id, warnings)
+            batch_report = {
+                "schema": "llm_fact_batch_report.v1",
+                "llm_mode": "batch_json",
+                "batch_count": int(exc.metadata.get("batch_count") or 0),
+                "batch_success_count": int(exc.metadata.get("batch_success_count") or 0),
+                "batch_timeout_count": int(exc.metadata.get("batch_timeout_count") or 0),
+                "batch_fallback_count": int(exc.metadata.get("batch_fallback_count") or 0),
+                "llm_batch_warnings": [exc.error_type],
+                "success_rate": 0.0,
+            }
+            facts["llm_batch_report"] = batch_report
     else:
         warnings.append("llm_disabled")
         facts = _rule_based_facts(doc_id, version_id, card, quality, innovation, citation_map, selected_nodes, node_by_id, warnings)
@@ -376,6 +379,120 @@ def _select_fact_nodes(nodes: Any, innovation: Dict[str, Any], citation_map: Dic
     return selected[:24]
 
 
+def _extract_facts_with_llm_batches(
+    doc_id: str,
+    version_id: str,
+    card: Dict[str, Any],
+    quality: Dict[str, Any],
+    innovation: Dict[str, Any],
+    citation_map: Dict[str, Any],
+    selected_nodes: List[Dict[str, Any]],
+    table_summaries: Any,
+    node_by_id: Dict[str, Dict[str, Any]],
+    warnings: List[str],
+) -> Dict[str, Any]:
+    max_nodes = max(1, llm_fact_max_nodes())
+    batch_size = max(1, llm_fact_batch_size())
+    llm_nodes = selected_nodes[:max_nodes]
+    batches = _node_batches(llm_nodes, batch_size)
+    parts: List[Dict[str, Any]] = []
+    batch_warnings: List[str] = []
+    timeout_count = 0
+    fallback_count = 0
+    for batch_index, batch_nodes in enumerate(batches, start=1):
+        try:
+            payload = _extract_facts_batch_with_llm(
+                card,
+                quality,
+                innovation,
+                citation_map,
+                batch_nodes,
+                table_summaries,
+                batch_index=batch_index,
+                batch_count=len(batches),
+            )
+            normalized = _normalize_fact_payload(
+                payload,
+                doc_id=doc_id,
+                version_id=version_id,
+                card=card,
+                quality=quality,
+                node_by_id=node_by_id,
+                selected_nodes=batch_nodes,
+                source="llm",
+                status="extracted",
+                warnings=[],
+            )
+            parts.append(normalized)
+            batch_warnings.extend(f"batch_{batch_index}:{warning}" for warning in normalized.get("warnings") or [])
+        except LLMError as exc:
+            fallback_count += 1
+            if exc.error_type == "request_timeout":
+                timeout_count += 1
+            batch_warnings.append(f"batch_{batch_index}:{exc.error_type}")
+    if not parts:
+        raise LLMError(
+            "DeepSeek fact batch extraction failed.",
+            error_type="all_fact_batches_failed",
+            metadata={
+                "batch_count": len(batches),
+                "batch_success_count": 0,
+                "batch_timeout_count": timeout_count,
+                "batch_fallback_count": fallback_count,
+            },
+        )
+    merged = _merge_fact_parts(parts)
+    batch_report = {
+        "schema": "llm_fact_batch_report.v1",
+        "llm_mode": "batch_json",
+        "batch_size": batch_size,
+        "max_nodes": max_nodes,
+        "selected_node_count": len(llm_nodes),
+        "batch_count": len(batches),
+        "batch_success_count": len(parts),
+        "batch_timeout_count": timeout_count,
+        "batch_fallback_count": fallback_count,
+        "llm_batch_warnings": _unique_strings(batch_warnings),
+        "success_rate": round(len(parts) / max(1, len(batches)), 4),
+    }
+    status = "extracted" if fallback_count == 0 and merged.get("claims") else "partial"
+    if fallback_count:
+        warnings.append("llm_fact_batch_partial")
+    merged["status"] = status
+    merged["source"] = "llm"
+    merged["llm_batch_report"] = batch_report
+    merged["warnings"] = _unique_strings([*warnings, *merged.get("warnings", []), *batch_report["llm_batch_warnings"]])
+    return merged
+
+
+def _node_batches(nodes: List[Dict[str, Any]], batch_size: int) -> List[List[Dict[str, Any]]]:
+    if not nodes:
+        return []
+    return [nodes[index : index + batch_size] for index in range(0, len(nodes), batch_size)]
+
+
+def _merge_fact_parts(parts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    quality_stats: Dict[str, int] = {}
+    warnings: List[str] = []
+    merged = {
+        "claims": [],
+        "entities": [],
+        "relations": [],
+    }
+    for part in parts:
+        merged["claims"].extend(part.get("claims") or [])
+        merged["entities"].extend(part.get("entities") or [])
+        merged["relations"].extend(part.get("relations") or [])
+        warnings.extend(part.get("warnings") or [])
+        for key, value in (part.get("quality_stats") or {}).items():
+            quality_stats[key] = quality_stats.get(key, 0) + int(value or 0)
+    normalized = _dedupe_facts(merged)
+    _apply_fact_quality_filters(normalized, quality_stats)
+    normalized["quality_stats"] = quality_stats
+    normalized["warnings"] = _unique_strings(warnings)
+    return normalized
+
+
 def _extract_facts_with_llm(
     card: Dict[str, Any],
     quality: Dict[str, Any],
@@ -387,27 +504,48 @@ def _extract_facts_with_llm(
     table_summaries: Any,
     figures: Any,
 ) -> Dict[str, object]:
+    return _extract_facts_batch_with_llm(
+        card,
+        quality,
+        innovation,
+        citation_map,
+        selected_nodes,
+        table_summaries,
+        batch_index=1,
+        batch_count=1,
+    )
+
+
+def _extract_facts_batch_with_llm(
+    card: Dict[str, Any],
+    quality: Dict[str, Any],
+    innovation: Dict[str, Any],
+    citation_map: Dict[str, Any],
+    selected_nodes: List[Dict[str, Any]],
+    table_summaries: Any,
+    *,
+    batch_index: int,
+    batch_count: int,
+) -> Dict[str, object]:
     system_prompt = (
-        "你是严谨的论文事实层抽取助手。只能基于给定节点、创新点、引用和版面工件抽取，"
-        "每个事实必须绑定 evidence 节点，不能编造。必须返回 JSON object，不要返回 Markdown。"
+        "你是严谨的论文事实层抽取助手。只能基于给定短证据节点抽取短 claims、entities、relations，"
+        "每条必须引用已有 evidence 编号或 node_id，不能编造。输出要短。只返回 JSON object，不要 Markdown。"
     )
     user_prompt = "\n".join(
         [
-            "请抽取 claims、entities、relations。返回格式：",
+            f"fact_batch: {batch_index}/{batch_count}",
+            "请抽取短 facts；每批最多 4 条 claims、6 个 entities、4 条 relations。返回格式：",
             '{"claims":[{"type":"","text":"","evidence":[],"confidence":0.0}],'
             '"entities":[{"type":"","name":"","aliases":[],"evidence":[],"confidence":0.0}],'
             '"relations":[{"type":"","subject":"","object":"","evidence":[],"confidence":0.0}],'
             '"warnings":[]}',
             "",
             f"title: {card.get('title')}",
-            f"abstract: {_excerpt(str(card.get('abstract') or card.get('description') or ''), 800)}",
-            f"parse_quality: {quality}",
-            f"innovation_items: {innovation.get('items') or []}",
+            f"abstract: {_excerpt(str(card.get('abstract') or card.get('description') or ''), 160)}",
+            f"quality_level: {quality.get('quality_level')}",
+            f"innovation_items: {_short_innovation_items(innovation)}",
             f"citation_relation_count: {len(citation_map.get('relations') or [])}",
-            f"layout_block_count: {(layout or {}).get('count') if isinstance(layout, dict) else 0}",
-            f"table_count: {(tables or {}).get('count') if isinstance(tables, dict) else 0}",
-            f"table_summaries: {(table_summaries or {}).get('table_summaries') if isinstance(table_summaries, dict) else []}",
-            f"figure_count: {(figures or {}).get('count') if isinstance(figures, dict) else 0}",
+            f"table_summaries: {_short_table_summaries(table_summaries)}",
             "",
             "候选证据节点：",
             *_format_nodes_for_prompt(selected_nodes),
@@ -416,13 +554,45 @@ def _extract_facts_with_llm(
     return generate_json_object(system_prompt, user_prompt)
 
 
+def _short_innovation_items(innovation: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items = []
+    for item in (innovation.get("items") or [])[:4]:
+        if not isinstance(item, dict):
+            continue
+        items.append(
+            {
+                "title": _excerpt(str(item.get("title") or ""), 80),
+                "type": item.get("type") or "",
+                "claim": _excerpt(str(item.get("claim") or ""), 80),
+            }
+        )
+    return items
+
+
+def _short_table_summaries(table_summaries: Any) -> List[Dict[str, Any]]:
+    if not isinstance(table_summaries, dict):
+        return []
+    result = []
+    for item in (table_summaries.get("table_summaries") or [])[:3]:
+        if not isinstance(item, dict):
+            continue
+        result.append(
+            {
+                "table_id": item.get("table_id") or "",
+                "caption": _excerpt(str(item.get("caption") or ""), 80),
+                "summary": _excerpt(str(item.get("summary") or ""), 120),
+            }
+        )
+    return result
+
+
 def _format_nodes_for_prompt(nodes: List[Dict[str, Any]]) -> List[str]:
     lines = []
     for index, node in enumerate(nodes, start=1):
         lines.append(f"[N{index}] node_id: {node.get('node_id')}")
         lines.append(f"node_path: {node.get('node_path')}")
         lines.append(f"page_range: {[node.get('page_start'), node.get('page_end')]}")
-        lines.append(f"text: {_excerpt(_node_text(node), 900)}")
+        lines.append(f"summary: {_excerpt(_node_text(node), 180)}")
         lines.append("")
     return lines
 
@@ -666,6 +836,8 @@ def _merge_citation_relations(
     normalized["status"] = facts.get("status") or "partial"
     normalized["source"] = facts.get("source") or "rule"
     normalized["quality_stats"] = quality_stats
+    if facts.get("llm_batch_report"):
+        normalized["llm_batch_report"] = facts.get("llm_batch_report")
     normalized["warnings"] = _unique_strings([*(facts.get("warnings") or []), "citation_fact_relations_added"])
     return normalized
 
@@ -743,6 +915,8 @@ def _merge_table_facts(
     normalized["status"] = facts.get("status") or "partial"
     normalized["source"] = facts.get("source") or "rule"
     normalized["quality_stats"] = quality_stats
+    if facts.get("llm_batch_report"):
+        normalized["llm_batch_report"] = facts.get("llm_batch_report")
     normalized["warnings"] = _unique_strings([*(facts.get("warnings") or []), *table_facts["warnings"]])
     return normalized
 
@@ -937,6 +1111,7 @@ def _build_fact_artifacts(
     relations = facts.get("relations") or []
     warnings = _unique_strings(facts.get("warnings") or [])
     quality_stats = facts.get("quality_stats") or {}
+    batch_report = facts.get("llm_batch_report") or {}
     low_confidence = sum(1 for item in [*claims, *entities, *relations] if float(item.get("confidence") or 0.0) < 0.5)
     no_evidence = sum(1 for item in [*claims, *entities, *relations] if not item.get("node_id"))
     table_backed = sum(1 for item in [*claims, *entities, *relations] if _is_table_source(str(item.get("source") or "")))
@@ -992,6 +1167,13 @@ def _build_fact_artifacts(
         "title": card.get("title") or "",
         "source": facts.get("source") or "rule",
         "llm_used": (facts.get("source") == "llm" and not llm_error),
+        "llm_mode": batch_report.get("llm_mode") or ("batch_json" if facts.get("source") == "llm" else ""),
+        "batch_count": int(batch_report.get("batch_count") or 0),
+        "batch_success_count": int(batch_report.get("batch_success_count") or 0),
+        "batch_timeout_count": int(batch_report.get("batch_timeout_count") or 0),
+        "batch_fallback_count": int(batch_report.get("batch_fallback_count") or 0),
+        "llm_batch_warnings": batch_report.get("llm_batch_warnings") or [],
+        "llm_batch_success_rate": float(batch_report.get("success_rate") or 0.0),
         "noise_filtered_count": int(quality_stats.get("noise_filtered_count") or 0),
         "entity_noise_filtered_count": int(quality_stats.get("entity_noise_filtered_count") or 0),
         "long_claim_trimmed_count": int(quality_stats.get("long_claim_trimmed_count") or 0),

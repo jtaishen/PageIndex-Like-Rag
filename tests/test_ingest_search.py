@@ -63,7 +63,7 @@ from kb_agent.query_log import list_query_logs, query_stats
 from kb_agent.review import assemble_review, check_review_citations, draft_review
 from kb_agent.search import build_search_report, get_evidence, search_documents, search_nodes
 from kb_agent.search_profile import apply_search_profile, get_search_profile, list_search_profiles, tune_search
-from kb_agent.tasks import compare_papers, generate_review_plan, get_task_artifact
+from kb_agent.tasks import COMPARE_DIMENSIONS, compare_papers, generate_review_plan, get_task_artifact
 from kb_agent.tree_search import tree_search
 
 
@@ -822,6 +822,8 @@ class IngestSearchTest(unittest.TestCase):
             self.assertIn("llm_stage_status", filtered_latest["items"][0])
             self.assertIn("llm_timeout_count", filtered_latest["items"][0])
             self.assertIn("llm_budget_exhausted", filtered_latest["items"][0])
+            self.assertIn("llm_facts_success_rate", filtered_latest["items"][0])
+            self.assertIn("llm_compare_dimension_success_rate", filtered_latest["items"][0])
             real_filtered = latest_quality_baseline(limit=1, corpus=papers, real_only=True)
             self.assertEqual(real_filtered["count"], 0)
 
@@ -913,7 +915,11 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(result["tree_search"]["llm_enabled"], True)
             self.assertEqual(len(result["tree_search"]["llm_items"]), 2)
             self.assertGreaterEqual(result["llm_baseline"]["insights_and_facts"]["llm_used_count"], 1)
+            self.assertIn("llm_facts_success_rate", result["llm_baseline"]["insights_and_facts"])
+            self.assertIn("llm_facts_batch_timeout_count", result["llm_baseline"]["insights_and_facts"])
             self.assertIn("review_fallback_mode", result["llm_baseline"]["tasks"])
+            self.assertIn("llm_compare_dimension_success_rate", result["llm_baseline"]["tasks"])
+            self.assertIn("compare_dimension_timeout_count", result["llm_baseline"]["tasks"])
             self.assertIn("review_retry_count", result["llm_baseline"]["tasks"])
             self.assertIn("review_partial_reasons", result["llm_baseline"]["tasks"])
             self.assertIn("llm_diagnostics", result["tasks"]["review"])
@@ -1071,6 +1077,26 @@ class IngestSearchTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             db_path, doc_id = _sync_insight_sample(Path(tmp))
+            success_payload = {
+                "claims": [{"type": "method", "text": "提出动态角色发现机制。", "evidence": ["N1"], "confidence": 0.84}],
+                "entities": [{"type": "method", "name": "动态角色发现机制", "evidence": ["N1"], "confidence": 0.8}],
+                "relations": [],
+                "warnings": [],
+            }
+            with mock.patch.dict(os.environ, {"KB_LLM_FACT_BATCH_SIZE": "1", "KB_LLM_FACT_MAX_NODES": "2"}, clear=False), mock.patch(
+                "kb_agent.facts.generate_json_object",
+                side_effect=[success_payload, LLMError("timeout", error_type="request_timeout")],
+            ):
+                partial = extract_facts(db_path, doc_id, force=True, use_llm=True)
+            self.assertEqual(partial["fact_report"]["llm_mode"], "batch_json")
+            self.assertEqual(partial["fact_report"]["batch_count"], 2)
+            self.assertEqual(partial["fact_report"]["batch_success_count"], 1)
+            self.assertEqual(partial["fact_report"]["batch_timeout_count"], 1)
+            self.assertEqual(partial["fact_report"]["status"], "partial")
+            self.assertTrue(partial["claims"]["claims"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_id = _sync_insight_sample(Path(tmp))
             with mock.patch("kb_agent.facts.generate_json_object", side_effect=LLMError("boom")):
                 with self.assertRaises(LLMError):
                     extract_facts(db_path, doc_id, force=True, use_llm=True, require_llm=True)
@@ -1080,7 +1106,9 @@ class IngestSearchTest(unittest.TestCase):
             with mock.patch("kb_agent.facts.generate_json_object", side_effect=LLMError("boom")):
                 fallback = extract_facts(db_path, doc_id, force=True, use_llm=True)
             self.assertEqual(fallback["fact_report"]["status"], "partial")
-            self.assertTrue(any("llm_unavailable:boom" in item for item in fallback["fact_report"]["warnings"]))
+            self.assertIn("all_fact_batches_failed", fallback["fact_report"]["llm_batch_warnings"])
+            self.assertEqual(fallback["fact_report"]["llm_mode"], "batch_json")
+            self.assertEqual(fallback["fact_report"]["batch_success_count"], 0)
 
     def test_compare_writes_grounded_task_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1178,44 +1206,87 @@ class IngestSearchTest(unittest.TestCase):
             for doc_id in doc_ids:
                 extract_doc_insights(db_path, doc_id, force=True, use_llm=False)
 
-            payload = {
-                "dimensions": [
-                    {
-                        "id": "problem_setting",
-                        "synthesis": "两篇论文都关注动态任务规划问题。",
-                        "overlaps": ["都涉及任务规划。"],
-                        "differences": ["服务机器人强调工具调用，多智能体论文强调分布式协同。"],
-                        "cells": [
-                            {
-                                "doc_id": doc_ids[0],
-                                "claim": "服务机器人论文关注大模型任务规划。",
-                                "evidence": [],
-                                "confidence": 0.82,
-                            },
-                            {
-                                "doc_id": doc_ids[1],
-                                "claim": "多智能体论文关注分布式任务分配。",
-                                "evidence": [],
-                                "confidence": 0.8,
-                            },
-                        ],
-                    }
-                ],
-                "open_questions": ["需要进一步比较真实实验设置。"],
-                "warnings": [],
-            }
+            payloads = [
+                {
+                    "id": dimension["id"],
+                    "synthesis": f"{dimension['name']}维度的结构化比较。",
+                    "overlaps": ["都涉及任务规划。"],
+                    "differences": ["服务机器人强调工具调用，多智能体论文强调分布式协同。"],
+                    "cells": [
+                        {
+                            "doc_id": doc_ids[0],
+                            "claim": "服务机器人论文关注大模型任务规划。",
+                            "evidence": [],
+                            "confidence": 0.82,
+                        },
+                        {
+                            "doc_id": doc_ids[1],
+                            "claim": "多智能体论文关注分布式任务分配。",
+                            "evidence": [],
+                            "confidence": 0.8,
+                        },
+                    ],
+                    "warnings": [],
+                }
+                for dimension in COMPARE_DIMENSIONS
+            ]
 
-            with mock.patch("kb_agent.tasks.generate_json_object", return_value=payload):
+            with mock.patch("kb_agent.tasks.generate_json_object", side_effect=payloads):
                 result = compare_papers(
                     db_path,
                     "服务机器人与多智能体任务规划方法对比",
                     doc_ids=doc_ids,
                     use_llm=True,
                 )
-            self.assertEqual(result["comparison_matrix"]["source"], "llm")
-            self.assertEqual(result["comparison_matrix"]["llm_diagnostics"]["mode"], "full_json")
-            self.assertIn("需要进一步比较", result["comparison_matrix"]["open_questions"][0])
+            self.assertEqual(result["comparison_matrix"]["source"], "llm_dimension")
+            diagnostics = result["comparison_matrix"]["llm_diagnostics"]
+            self.assertEqual(diagnostics["mode"], "dimension_json")
+            self.assertEqual(diagnostics["dimension_success_count"], len(COMPARE_DIMENSIONS))
+            self.assertEqual(diagnostics["dimension_timeout_count"], 0)
             self.assertIn("node_id", result["comparison_matrix"]["dimensions"][0]["cells"][0]["evidence"][0])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+            for doc_id in doc_ids:
+                extract_doc_insights(db_path, doc_id, force=True, use_llm=False)
+
+            partial_payloads = [
+                {
+                    "id": COMPARE_DIMENSIONS[0]["id"],
+                    "synthesis": "问题设定维度成功。",
+                    "overlaps": [],
+                    "differences": [],
+                    "cells": [
+                        {"doc_id": doc_ids[0], "claim": "服务机器人规划。", "evidence": [], "confidence": 0.8},
+                        {"doc_id": doc_ids[1], "claim": "多智能体规划。", "evidence": [], "confidence": 0.8},
+                    ],
+                    "warnings": [],
+                },
+                LLMError("DeepSeek API request timed out.", error_type="request_timeout"),
+                *[
+                    {
+                        "id": dimension["id"],
+                        "synthesis": f"{dimension['name']}维度成功。",
+                        "overlaps": [],
+                        "differences": [],
+                        "cells": [],
+                        "warnings": [],
+                    }
+                    for dimension in COMPARE_DIMENSIONS[2:]
+                ],
+            ]
+            with mock.patch("kb_agent.tasks.generate_json_object", side_effect=partial_payloads):
+                partial = compare_papers(
+                    db_path,
+                    "服务机器人与多智能体任务规划方法对比",
+                    doc_ids=doc_ids,
+                    use_llm=True,
+                )
+            diagnostics = partial["comparison_matrix"]["llm_diagnostics"]
+            self.assertEqual(diagnostics["mode"], "dimension_partial")
+            self.assertEqual(diagnostics["dimension_timeout_count"], 1)
+            self.assertEqual(diagnostics["fallback_dimensions"], [COMPARE_DIMENSIONS[1]["id"]])
+            self.assertEqual(partial["comparison_matrix"]["status"], "partial")
 
         with tempfile.TemporaryDirectory() as tmp:
             db_path, doc_ids = _sync_compare_samples(Path(tmp))

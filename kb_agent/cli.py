@@ -1108,6 +1108,8 @@ def _quality_baseline_cli_summary(result: dict) -> dict:
     llm_status = result.get("llm_status") or {}
     llm_baseline = result.get("llm_baseline") or {}
     stage_summary = llm_baseline.get("stage_summary") or {}
+    llm_facts = llm_baseline.get("insights_and_facts") or {}
+    llm_tasks = llm_baseline.get("tasks") or {}
     review_task = ((result.get("tasks") or {}).get("review") or {})
     review_diagnostics = review_task.get("llm_diagnostics") or {}
     return {
@@ -1135,6 +1137,10 @@ def _quality_baseline_cli_summary(result: dict) -> dict:
         "llm_tree_used": ((llm_baseline.get("tree_search") or {}).get("llm_used_count")),
         "llm_tree_fallback": ((llm_baseline.get("tree_search") or {}).get("fallback_count")),
         "llm_fact_used": ((llm_baseline.get("insights_and_facts") or {}).get("llm_used_count")),
+        "llm_facts_success_rate": llm_facts.get("llm_facts_success_rate", 0.0),
+        "llm_facts_batch_timeout_count": llm_facts.get("llm_facts_batch_timeout_count", 0),
+        "llm_compare_dimension_success_rate": llm_tasks.get("llm_compare_dimension_success_rate", 0.0),
+        "llm_compare_dimension_timeout_count": llm_tasks.get("compare_dimension_timeout_count", 0),
         "review_llm_error": review_task.get("llm_error", ""),
         "review_fallback_mode": review_diagnostics.get("mode", ""),
         "review_retry_count": review_diagnostics.get("retry_count", 0),

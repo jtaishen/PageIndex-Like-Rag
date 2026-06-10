@@ -23,7 +23,7 @@ from .insights import extract_doc_insights
 from .knowledge_graph import graph_summary
 from .llm import llm_runtime_options, llm_status
 from .parsers import pdf_adapter_statuses
-from .tasks import compare_papers, generate_review_plan
+from .tasks import COMPARE_DIMENSIONS, compare_papers, generate_review_plan
 from .tree_search import tree_search
 from .utils import compact_whitespace, stable_id, write_json
 
@@ -146,8 +146,8 @@ class _LLMStageRuntime:
                 self.status = "timeout" if getattr(exc, "error_type", "") == "request_timeout" else "failed"
                 self.warnings.append(f"{self.name}_{self.status}")
             elif self.duration_ms > self.runtime.stage_timeout_seconds * 1000:
-                self.status = "timeout"
-                self.reason = "stage_timeout"
+                self.status = "timeout" if self.call_count == 0 or (self.timeout_count and self.timeout_count >= self.call_count) else "partial"
+                self.reason = "stage_timeout" if self.status == "timeout" else "stage_budget_exceeded"
                 self.warnings.append("stage_timeout")
             elif self.timeout_count and self.timeout_count >= max(1, self.call_count):
                 self.status = "timeout"
@@ -393,6 +393,8 @@ def latest_quality_baseline(
         fact_delta = payload.get("fact_audit_delta") or {}
         llm_baseline = payload.get("llm_baseline") or {}
         stage_summary = llm_baseline.get("stage_summary") or {}
+        llm_facts = llm_baseline.get("insights_and_facts") or {}
+        llm_tasks = llm_baseline.get("tasks") or {}
         items.append(
             {
                 "path": str(path),
@@ -411,6 +413,10 @@ def latest_quality_baseline(
                 "llm_timeout_count": llm_baseline.get("timeout_count", 0),
                 "llm_total_duration_ms": llm_baseline.get("total_llm_duration_ms", 0.0),
                 "llm_budget_exhausted": bool(llm_baseline.get("budget_exhausted")),
+                "llm_facts_success_rate": llm_facts.get("llm_facts_success_rate", 0.0),
+                "llm_facts_batch_timeout_count": llm_facts.get("llm_facts_batch_timeout_count", 0),
+                "llm_compare_dimension_success_rate": llm_tasks.get("llm_compare_dimension_success_rate", 0.0),
+                "llm_compare_dimension_timeout_count": llm_tasks.get("compare_dimension_timeout_count", 0),
                 "review_llm_error": (((payload.get("tasks") or {}).get("review") or {}).get("llm_error") or ""),
                 "review_fallback_mode": review_diagnostics.get("mode") or "",
                 "review_partial_reasons": review.get("review_partial_reasons") or [],
@@ -694,11 +700,17 @@ def _prepare_insights_and_facts(
                     "source": llm_summary.get("source", ""),
                     "llm_used": llm_summary.get("llm_used", False),
                     "llm_error": llm_summary.get("llm_error", ""),
-                    "noise_filtered_count": llm_summary.get("noise_filtered_count", 0),
-                    "entity_noise_filtered_count": llm_summary.get("entity_noise_filtered_count", 0),
-                    "long_claim_trimmed_count": llm_summary.get("long_claim_trimmed_count", 0),
-                    "rule": rule_summary,
-                    "llm": llm_summary,
+                        "noise_filtered_count": llm_summary.get("noise_filtered_count", 0),
+                        "entity_noise_filtered_count": llm_summary.get("entity_noise_filtered_count", 0),
+                        "long_claim_trimmed_count": llm_summary.get("long_claim_trimmed_count", 0),
+                        "llm_mode": llm_summary.get("llm_mode", ""),
+                        "batch_count": llm_summary.get("batch_count", 0),
+                        "batch_success_count": llm_summary.get("batch_success_count", 0),
+                        "batch_timeout_count": llm_summary.get("batch_timeout_count", 0),
+                        "batch_fallback_count": llm_summary.get("batch_fallback_count", 0),
+                        "llm_batch_success_rate": llm_summary.get("llm_batch_success_rate", 0.0),
+                        "rule": rule_summary,
+                        "llm": llm_summary,
                     "warnings": _unique_strings(llm_summary.get("warnings") or []),
                 }
             )
@@ -751,6 +763,12 @@ def _extract_fact_summary(db_path: Path, doc_id: str, *, use_llm: bool) -> Dict[
         "noise_filtered_count": fact_report.get("noise_filtered_count", 0),
         "entity_noise_filtered_count": fact_report.get("entity_noise_filtered_count", 0),
         "long_claim_trimmed_count": fact_report.get("long_claim_trimmed_count", 0),
+        "llm_mode": fact_report.get("llm_mode") or "",
+        "batch_count": fact_report.get("batch_count", 0),
+        "batch_success_count": fact_report.get("batch_success_count", 0),
+        "batch_timeout_count": fact_report.get("batch_timeout_count", 0),
+        "batch_fallback_count": fact_report.get("batch_fallback_count", 0),
+        "llm_batch_success_rate": fact_report.get("llm_batch_success_rate", 0.0),
         "warnings": _unique_strings(fact_report.get("warnings", [])),
     }
 
@@ -776,6 +794,12 @@ def _merge_insight_fact_summaries(rule_summary: Dict[str, Any], llm_parts: Dict[
         "noise_filtered_count": fact.get("noise_filtered_count", rule_summary.get("noise_filtered_count", 0)),
         "entity_noise_filtered_count": fact.get("entity_noise_filtered_count", rule_summary.get("entity_noise_filtered_count", 0)),
         "long_claim_trimmed_count": fact.get("long_claim_trimmed_count", rule_summary.get("long_claim_trimmed_count", 0)),
+        "llm_mode": fact.get("llm_mode", rule_summary.get("llm_mode", "")),
+        "batch_count": fact.get("batch_count", rule_summary.get("batch_count", 0)),
+        "batch_success_count": fact.get("batch_success_count", rule_summary.get("batch_success_count", 0)),
+        "batch_timeout_count": fact.get("batch_timeout_count", rule_summary.get("batch_timeout_count", 0)),
+        "batch_fallback_count": fact.get("batch_fallback_count", rule_summary.get("batch_fallback_count", 0)),
+        "llm_batch_success_rate": fact.get("llm_batch_success_rate", rule_summary.get("llm_batch_success_rate", 0.0)),
         "warnings": _unique_strings([*rule_summary.get("warnings", []), *insight.get("warnings", []), *fact.get("warnings", [])]),
     }
     return merged
@@ -1190,7 +1214,19 @@ def _llm_baseline_summary(
             "timeout_count": runtime.get("timeout_count", 0),
             "budget_exhausted": bool(runtime.get("budget_exhausted")),
             "tree_search": {"rule_doc_count": len(tree.get("items") or []), "llm_doc_count": 0, "llm_used_count": 0, "fallback_count": 0, "comparison": []},
-            "insights_and_facts": {"doc_count": len(insights.get("items") or []), "llm_doc_count": 0, "llm_used_count": 0, "llm_error_count": 0, "noise_filtered_count": 0, "long_claim_trimmed_count": 0},
+            "insights_and_facts": {
+                "doc_count": len(insights.get("items") or []),
+                "llm_doc_count": 0,
+                "llm_used_count": 0,
+                "llm_error_count": 0,
+                "noise_filtered_count": 0,
+                "long_claim_trimmed_count": 0,
+                "llm_facts_success_rate": 0.0,
+                "llm_facts_batch_count": 0,
+                "llm_facts_batch_success_count": 0,
+                "llm_facts_batch_timeout_count": 0,
+                "llm_facts_batch_fallback_count": 0,
+            },
             "tasks": {},
             "fact_conflict_count": graph.get("conflict_count", 0),
             "warnings": [],
@@ -1200,6 +1236,9 @@ def _llm_baseline_summary(
     llm_fact_items = [item for item in insight_items if isinstance(item, dict) and item.get("llm")]
     compare = tasks.get("compare") or {}
     review = tasks.get("review") or {}
+    compare_diag = compare.get("llm_diagnostics") or {}
+    fact_batch_count = sum(int((item.get("llm") or {}).get("batch_count") or 0) for item in llm_fact_items)
+    fact_batch_success = sum(int((item.get("llm") or {}).get("batch_success_count") or 0) for item in llm_fact_items)
     warning_tags = []
     if status.get("configured") and status.get("probe") and not status.get("reachable"):
         warning_tags.append("llm_failed")
@@ -1237,11 +1276,26 @@ def _llm_baseline_summary(
             "noise_filtered_count": sum(int((item.get("llm") or {}).get("noise_filtered_count") or 0) for item in llm_fact_items),
             "entity_noise_filtered_count": sum(int((item.get("llm") or {}).get("entity_noise_filtered_count") or 0) for item in llm_fact_items),
             "long_claim_trimmed_count": sum(int((item.get("llm") or {}).get("long_claim_trimmed_count") or 0) for item in llm_fact_items),
+            "llm_facts_success_rate": round(fact_batch_success / max(1, fact_batch_count), 4),
+            "llm_facts_batch_count": fact_batch_count,
+            "llm_facts_batch_success_count": fact_batch_success,
+            "llm_facts_batch_timeout_count": sum(int((item.get("llm") or {}).get("batch_timeout_count") or 0) for item in llm_fact_items),
+            "llm_facts_batch_fallback_count": sum(int((item.get("llm") or {}).get("batch_fallback_count") or 0) for item in llm_fact_items),
         },
         "tasks": {
             "compare_status": compare.get("status") or "",
             "compare_warning_count": compare.get("warning_count", 0),
             "compare_llm_error": bool(compare.get("llm_error")),
+            "compare_fallback_mode": compare_diag.get("mode", ""),
+            "compare_dimension_success_count": compare_diag.get("dimension_success_count", 0),
+            "compare_dimension_timeout_count": compare_diag.get("dimension_timeout_count", 0),
+            "compare_fallback_dimensions": compare_diag.get("fallback_dimensions", []),
+            "llm_compare_dimension_success_rate": round(
+                int(compare_diag.get("dimension_success_count") or 0) / max(1, int(compare_diag.get("dimension_count") or len(COMPARE_DIMENSIONS))),
+                4,
+            )
+            if compare_diag
+            else 0.0,
             "review_status": review.get("status") or "",
             "review_warning_count": review.get("warning_count", 0),
             "review_llm_error": bool(review.get("llm_error")),
@@ -1369,6 +1423,8 @@ def _baseline_markdown(report: Dict[str, Any]) -> str:
         f"- llm_reachable: `{(report.get('llm_status') or {}).get('reachable', '')}`",
         f"- llm_timeout_count: `{(report.get('llm_baseline') or {}).get('timeout_count', 0)}`",
         f"- llm_budget_exhausted: `{(report.get('llm_baseline') or {}).get('budget_exhausted', False)}`",
+        f"- llm_facts_success_rate: `{((report.get('llm_baseline') or {}).get('insights_and_facts') or {}).get('llm_facts_success_rate', 0.0)}`",
+        f"- llm_compare_dimension_success_rate: `{((report.get('llm_baseline') or {}).get('tasks') or {}).get('llm_compare_dimension_success_rate', 0.0)}`",
         f"- real_embedding_status: `{(report.get('embedding') or {}).get('sentence_transformers', {}).get('status', '')}`",
         f"- review_partial_reasons: `{', '.join(((report.get('tasks') or {}).get('review') or {}).get('review_partial_reasons') or [])}`",
         f"- warning_count: `{len(report.get('warnings') or [])}`",
@@ -1402,6 +1458,8 @@ def _baseline_html(report: Dict[str, Any]) -> str:
     fact_delta = report.get("fact_audit_delta") or {}
     tree_summary = (report.get("tree_search") or {}).get("comparison_summary") or {}
     llm_baseline = report.get("llm_baseline") or {}
+    llm_facts = llm_baseline.get("insights_and_facts") or {}
+    llm_tasks = llm_baseline.get("tasks") or {}
     cards = [
         ("Docs", report.get("doc_count", 0)),
         ("PDFs", report.get("pdf_count", 0)),
@@ -1413,6 +1471,8 @@ def _baseline_html(report: Dict[str, Any]) -> str:
         ("LLM Calls", llm_baseline.get("total_llm_call_count", 0)),
         ("LLM Timeouts", llm_baseline.get("timeout_count", 0)),
         ("LLM Budget", "exhausted" if llm_baseline.get("budget_exhausted") else "ok"),
+        ("Facts LLM Rate", llm_facts.get("llm_facts_success_rate", 0.0)),
+        ("Compare LLM Rate", llm_tasks.get("llm_compare_dimension_success_rate", 0.0)),
         ("Real Embedding", (report.get("embedding") or {}).get("sentence_transformers", {}).get("status", "")),
         ("Tree Trace", tree_summary.get("llm_trace_completeness_avg") or tree_summary.get("rule_trace_completeness_avg") or 0.0),
         ("Evidence Dedupe", review.get("duplicate_evidence_removed", 0)),
