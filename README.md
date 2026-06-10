@@ -859,6 +859,20 @@ uv run python -m unittest discover -s tests
 git diff --check
 ```
 
+## v0.34 Facts 查询边界拆分
+
+v0.34 聚焦 `facts.py` 的低风险结构拆分，不改变事实抽取算法、LLM fallback、表格事实融合、数据库 schema 或 CLI 输出结构。事实检索、事实覆盖率和单文档事实摘要移动到 `kb_agent.fact_queries`，事实抽取与检索共用的纯工具函数移动到 `kb_agent.fact_utils`。
+
+本次拆分保留 `kb_agent.facts` 的公开导入兼容性，`extract_facts()` 仍留在 `facts.py` 作为事实抽取编排入口。这样后续继续拆 LLM 批量抽取、规则事实抽取和表格/引用事实融合时，查询边界已经独立，回归范围更清楚。
+
+验证：
+
+```bash
+uv run python -m unittest discover -s tests
+uv run python -m compileall -q kb_agent
+git diff --check
+```
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
