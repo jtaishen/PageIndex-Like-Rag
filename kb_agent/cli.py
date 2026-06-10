@@ -1089,6 +1089,8 @@ def _quality_baseline_cli_summary(result: dict) -> dict:
     real_embedding = embedding.get("sentence_transformers") or {}
     llm_status = result.get("llm_status") or {}
     llm_baseline = result.get("llm_baseline") or {}
+    review_task = ((result.get("tasks") or {}).get("review") or {})
+    review_diagnostics = review_task.get("llm_diagnostics") or {}
     return {
         "schema": result.get("schema"),
         "baseline_id": result.get("baseline_id"),
@@ -1106,8 +1108,11 @@ def _quality_baseline_cli_summary(result: dict) -> dict:
         "llm_tree_used": ((llm_baseline.get("tree_search") or {}).get("llm_used_count")),
         "llm_tree_fallback": ((llm_baseline.get("tree_search") or {}).get("fallback_count")),
         "llm_fact_used": ((llm_baseline.get("insights_and_facts") or {}).get("llm_used_count")),
+        "review_llm_error": review_task.get("llm_error", ""),
+        "review_fallback_mode": review_diagnostics.get("mode", ""),
+        "review_retry_count": review_diagnostics.get("retry_count", 0),
         "compare_task_id": ((result.get("tasks") or {}).get("compare") or {}).get("task_id", ""),
-        "review_task_id": ((result.get("tasks") or {}).get("review") or {}).get("task_id", ""),
+        "review_task_id": review_task.get("task_id", ""),
         "claim_graph_id": (result.get("claim_graph") or {}).get("graph_id", ""),
         "warning_count": len(result.get("warnings") or []),
         "warnings": result.get("warnings") or [],

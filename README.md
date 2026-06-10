@@ -589,6 +589,31 @@ uv run --extra pdf python -m kb_agent.cli quality-baseline articles --with-llm -
 
 如果 DeepSeek 调用失败，普通 `--with-llm` 会回退规则版并在报告写入 warning；`--require-llm` 会直接失败，避免写入伪成功工件。
 
+## v0.22 DeepSeek 结构化输出稳定性
+
+v0.22 针对真实基线里 `generate-review` 偶发 `DeepSeek returned invalid JSON` 的问题做稳定性增强。JSON 调用会清理 fenced JSON、截取完整 object、剥离尾部噪声，并在解析失败时自动重试一次；错误信息只保留错误类型，不保存模型原文片段。
+
+`generate-review` 会先尝试整体 JSON。如果整体输出超时、截断或非法，会改为逐章节生成小 JSON，再组装 `review_outline.v1`。诊断信息写入 `llm_diagnostics`：
+
+```json
+{
+  "mode": "full_json | section_json | fallback_rule",
+  "retry_count": 0,
+  "repair_used": false,
+  "fallback_sections": [],
+  "error_type": ""
+}
+```
+
+验收命令：
+
+```bash
+uv run python -m kb_agent.cli generate-review "任务规划方法研究综述" --require-llm --search-mode tree
+uv run --extra pdf python -m kb_agent.cli quality-baseline articles --with-llm --top-k 3
+```
+
+如果整体 JSON 失败但分章节恢复成功，报告会显示 `review_fallback_mode=section_json`，不会再标记为纯 `rule_based_review_plan`。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：

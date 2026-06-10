@@ -12,7 +12,7 @@ from .fact_audit import fact_audit_summary
 from .facts import fact_summary_for_doc
 from .insights import extract_doc_insights
 from .knowledge_graph import graph_summary
-from .llm import LLMError, generate_json_object
+from .llm import LLMError, generate_json_object, llm_payload_metadata
 from .query_log import write_query_log
 from .search import get_evidence, search_documents, search_nodes
 from .tree_search import tree_search
@@ -119,6 +119,7 @@ def compare_papers(
         warnings.append("insufficient_papers_for_comparison")
 
     llm_error = ""
+    llm_diagnostics = _llm_diagnostics("disabled" if not use_llm else "fallback_rule")
     if use_llm:
         try:
             payload = _compare_with_llm(query, contexts, evidence_by_dimension)
@@ -130,15 +131,18 @@ def compare_papers(
                 source="llm",
                 warnings=warnings,
             )
+            llm_diagnostics = _llm_diagnostics("full_json", metadata=llm_payload_metadata(payload))
         except LLMError as exc:
             if require_llm:
                 raise
             llm_error = str(exc)
             warnings.append(f"llm_unavailable:{llm_error}")
             matrix = _rule_based_comparison(query, contexts, evidence_by_dimension, warnings)
+            llm_diagnostics = _llm_diagnostics("fallback_rule", error=exc)
     else:
         warnings.append("llm_disabled")
         matrix = _rule_based_comparison(query, contexts, evidence_by_dimension, warnings)
+    matrix["llm_diagnostics"] = llm_diagnostics
 
     coverage = _matrix_coverage(matrix)
     graph = graph_summary(db_path, doc_ids=[context["doc_id"] for context in contexts], include_conflicts=True)
@@ -212,6 +216,7 @@ def generate_review_plan(
         warnings.append("no_selected_papers")
 
     llm_error = ""
+    llm_diagnostics = _llm_diagnostics("disabled" if not use_llm else "fallback_rule")
     if use_llm:
         try:
             payload = _review_plan_with_llm(topic, contexts, section_evidence)
@@ -223,15 +228,30 @@ def generate_review_plan(
                 source="llm",
                 warnings=warnings,
             )
+            llm_diagnostics = _llm_diagnostics("full_json", metadata=llm_payload_metadata(payload))
         except LLMError as exc:
-            if require_llm:
-                raise
-            llm_error = str(exc)
-            warnings.append(f"llm_unavailable:{llm_error}")
-            outline = _rule_based_review_plan(topic, contexts, section_evidence, warnings)
+            full_error = exc
+            try:
+                outline = _review_plan_with_section_llm(
+                    topic,
+                    contexts,
+                    section_evidence,
+                    warnings=warnings,
+                    full_error=full_error,
+                )
+                llm_diagnostics = outline.get("llm_diagnostics") or _llm_diagnostics("section_json", error=full_error)
+                llm_error = ""
+            except LLMError as section_exc:
+                if require_llm:
+                    raise section_exc
+                llm_error = str(section_exc)
+                warnings.append(f"llm_unavailable:{llm_error}")
+                outline = _rule_based_review_plan(topic, contexts, section_evidence, warnings)
+                llm_diagnostics = _llm_diagnostics("fallback_rule", error=section_exc, first_error=full_error)
     else:
         warnings.append("llm_disabled")
         outline = _rule_based_review_plan(topic, contexts, section_evidence, warnings)
+    outline["llm_diagnostics"] = llm_diagnostics
 
     coverage = _outline_coverage(outline, section_evidence)
     graph = graph_summary(db_path, doc_ids=[context["doc_id"] for context in contexts], include_conflicts=True)
@@ -476,10 +496,108 @@ def _review_plan_with_llm(
             *[f"- {item['section_id']}: {item['title']}，{item['purpose']}" for item in REVIEW_SECTIONS],
             "",
             "论文：",
-            *_format_papers_for_prompt(contexts),
+            *_format_papers_for_review_prompt(contexts),
             "",
             "章节证据：",
-            *_format_section_evidence_for_prompt(section_evidence),
+            *_format_section_evidence_for_review_prompt(section_evidence),
+        ]
+    )
+    return generate_json_object(system_prompt, user_prompt)
+
+
+def _review_plan_with_section_llm(
+    topic: str,
+    contexts: List[Dict[str, Any]],
+    section_evidence: Dict[str, List[Dict[str, Any]]],
+    *,
+    warnings: List[str],
+    full_error: LLMError,
+) -> Dict[str, Any]:
+    sections = []
+    fallback_sections: List[str] = []
+    total_retry = int(full_error.metadata.get("retry_count") or 0)
+    repair_used = bool(full_error.metadata.get("repair_used"))
+    last_error: Optional[LLMError] = None
+    success_count = 0
+    for spec in REVIEW_SECTIONS:
+        section_id = str(spec["section_id"])
+        evidence = section_evidence.get(section_id, [])
+        try:
+            payload = _review_section_with_llm(topic, spec, contexts, evidence)
+            metadata = llm_payload_metadata(payload)
+            total_retry += int(metadata.get("retry_count") or 0)
+            repair_used = repair_used or bool(metadata.get("repair_used"))
+            sections.append(_normalize_review_section_payload(payload, spec, evidence))
+            success_count += 1
+        except LLMError as exc:
+            last_error = exc
+            total_retry += int(exc.metadata.get("retry_count") or 0)
+            repair_used = repair_used or bool(exc.metadata.get("repair_used"))
+            fallback_sections.append(section_id)
+            section = _rule_review_section(spec, evidence)
+            section["warnings"] = _unique_strings([*section.get("warnings", []), f"llm_section_unavailable:{exc.error_type}"])
+            sections.append(section)
+    if success_count == 0:
+        error = last_error or full_error
+        raise LLMError(
+            f"DeepSeek section review failed: {error.error_type}",
+            error_type=error.error_type,
+            metadata={"retry_count": total_retry, "repair_used": repair_used, "first_error_type": full_error.error_type},
+        ) from error
+    outline_warnings = [*warnings, "section_json_recovery"]
+    if fallback_sections:
+        outline_warnings.append("section_json_partial")
+    diagnostics = _llm_diagnostics(
+        "section_json",
+        metadata={
+            "retry_count": total_retry,
+            "repair_used": repair_used,
+            "error_type": full_error.error_type,
+            "first_error_type": full_error.error_type,
+        },
+        fallback_sections=fallback_sections,
+    )
+    return {
+        "schema": "review_outline.v1",
+        "status": "partial" if fallback_sections else "extracted",
+        "source": "llm_section",
+        "topic": topic,
+        "title": f"{topic}研究综述规划",
+        "scope": _review_scope(topic, contexts),
+        "sections": sections,
+        "open_questions": _review_open_questions(sections),
+        "warnings": _unique_strings(outline_warnings),
+        "llm_diagnostics": diagnostics,
+        "created_at": time.time(),
+    }
+
+
+def _review_section_with_llm(
+    topic: str,
+    spec: Dict[str, Any],
+    contexts: List[Dict[str, Any]],
+    evidence: List[Dict[str, Any]],
+) -> Dict[str, object]:
+    section_id = str(spec["section_id"])
+    system_prompt = (
+        "你是严谨的论文综述章节规划助手。只能基于给定论文和证据节点规划一个章节，"
+        "不要写正文，不要编造证据。必须返回 JSON object，不要返回 Markdown。"
+    )
+    user_prompt = "\n".join(
+        [
+            f"综述主题：{topic}",
+            f"section_id: {section_id}",
+            f"title: {spec['title']}",
+            f"purpose: {spec['purpose']}",
+            "返回格式：",
+            '{"section_id":"","title":"","purpose":"","paper_ids":[],"evidence":[],"warnings":[]}',
+            "证据只能引用下面已有的 node_id 或 evidence id；不要生成长正文。",
+            "",
+            "论文：",
+            *_format_papers_for_review_prompt(contexts, limit=2),
+            "",
+            "本章节候选证据：",
+            *[_format_review_evidence_line(item) for item in evidence[:6]],
         ]
     )
     return generate_json_object(system_prompt, user_prompt)
@@ -596,23 +714,7 @@ def _rule_based_review_plan(
     section_evidence: Dict[str, List[Dict[str, Any]]],
     warnings: List[str],
 ) -> Dict[str, Any]:
-    sections = []
-    for spec in REVIEW_SECTIONS:
-        evidence = section_evidence.get(str(spec["section_id"]), [])
-        paper_ids = _unique_strings(str(item.get("doc_id") or "") for item in evidence if item.get("doc_id"))
-        section_warnings = [] if evidence else [f"missing_section_evidence:{spec['section_id']}"]
-        sections.append(
-            {
-                "section_id": spec["section_id"],
-                "title": spec["title"],
-                "purpose": spec["purpose"],
-                "paper_ids": paper_ids,
-                "evidence": evidence,
-                "evidence_count": len(evidence),
-                "source_doc_count": len(set(paper_ids)),
-                "warnings": section_warnings,
-            }
-        )
+    sections = [_rule_review_section(spec, section_evidence.get(str(spec["section_id"]), [])) for spec in REVIEW_SECTIONS]
     return {
         "schema": "review_outline.v1",
         "status": "partial",
@@ -624,6 +726,21 @@ def _rule_based_review_plan(
         "open_questions": _review_open_questions(sections),
         "warnings": _unique_strings([*warnings, "rule_based_review_plan"]),
         "created_at": time.time(),
+    }
+
+
+def _rule_review_section(spec: Dict[str, Any], evidence: List[Dict[str, Any]]) -> Dict[str, Any]:
+    paper_ids = _unique_strings(str(item.get("doc_id") or "") for item in evidence if item.get("doc_id"))
+    section_warnings = [] if evidence else [f"missing_section_evidence:{spec['section_id']}"]
+    return {
+        "section_id": spec["section_id"],
+        "title": spec["title"],
+        "purpose": spec["purpose"],
+        "paper_ids": paper_ids,
+        "evidence": evidence,
+        "evidence_count": len(evidence),
+        "source_doc_count": len(set(paper_ids)),
+        "warnings": section_warnings,
     }
 
 
@@ -675,6 +792,33 @@ def _normalize_review_payload(
     }
 
 
+def _normalize_review_section_payload(
+    payload: Dict[str, object],
+    spec: Dict[str, Any],
+    fallback_evidence: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    raw_section = payload.get("section") if isinstance(payload.get("section"), dict) else payload
+    if not isinstance(raw_section, dict):
+        raw_section = {}
+    evidence = _normalize_evidence_refs(raw_section.get("evidence"), fallback_evidence)
+    paper_ids = _string_list(raw_section.get("paper_ids"))
+    if not paper_ids:
+        paper_ids = _unique_strings(str(item.get("doc_id") or "") for item in evidence if item.get("doc_id"))
+    warnings = _string_list(raw_section.get("warnings"))
+    if not evidence:
+        warnings.append(f"missing_section_evidence:{spec['section_id']}")
+    return {
+        "section_id": str(spec["section_id"]),
+        "title": _string_value(raw_section.get("title")) or str(spec["title"]),
+        "purpose": _string_value(raw_section.get("purpose")) or str(spec["purpose"]),
+        "paper_ids": paper_ids,
+        "evidence": evidence,
+        "evidence_count": len(evidence),
+        "source_doc_count": len(set(paper_ids)),
+        "warnings": _unique_strings(warnings),
+    }
+
+
 def _format_contexts_for_prompt(
     contexts: List[Dict[str, Any]],
     evidence_by_dimension: Dict[str, Dict[str, List[Dict[str, Any]]]],
@@ -707,6 +851,31 @@ def _format_papers_for_prompt(contexts: List[Dict[str, Any]]) -> List[str]:
     return lines
 
 
+def _format_papers_for_review_prompt(contexts: List[Dict[str, Any]], limit: int = 4) -> List[str]:
+    lines = []
+    for context in contexts[:limit]:
+        lines.append(f"- doc_id: {context['doc_id']}")
+        lines.append(f"  title: {context['title']}")
+        lines.append(f"  description: {_excerpt(context.get('description', ''), 240)}")
+        lines.append(f"  innovations: {_format_innovations(context.get('innovation', {}), limit=2)}")
+        facts = _format_fact_summary(context.get("facts", {}), limit=2)
+        lines.append(
+            "  facts: "
+            + json.dumps(
+                {
+                    "available": facts.get("available", False),
+                    "claim_count": facts.get("claim_count", 0),
+                    "entity_count": facts.get("entity_count", 0),
+                    "table_backed_fact_count": facts.get("table_backed_fact_count", 0),
+                    "top_claims": facts.get("top_claims", [])[:2],
+                    "top_table_entities": facts.get("top_table_entities", [])[:2],
+                },
+                ensure_ascii=False,
+            )
+        )
+    return lines
+
+
 def _format_section_evidence_for_prompt(section_evidence: Dict[str, List[Dict[str, Any]]]) -> List[str]:
     lines = []
     for section_id, items in section_evidence.items():
@@ -717,11 +886,28 @@ def _format_section_evidence_for_prompt(section_evidence: Dict[str, List[Dict[st
     return lines
 
 
+def _format_section_evidence_for_review_prompt(section_evidence: Dict[str, List[Dict[str, Any]]]) -> List[str]:
+    lines = []
+    for section_id, items in section_evidence.items():
+        lines.append(f"section_id: {section_id}")
+        for evidence in items[:4]:
+            lines.append(_format_review_evidence_line(evidence))
+        lines.append("")
+    return lines
+
+
 def _format_evidence_line(evidence: Dict[str, Any]) -> str:
     return (
         f"- node_id={evidence.get('node_id')} doc_id={evidence.get('doc_id')} "
         f"path={evidence.get('node_path')} page={evidence.get('page_range')} "
         f"excerpt={_excerpt(str(evidence.get('excerpt') or ''), 360)}"
+    )
+
+
+def _format_review_evidence_line(evidence: Dict[str, Any]) -> str:
+    return (
+        f"- node_id={evidence.get('node_id')} doc_id={evidence.get('doc_id')} "
+        f"page={evidence.get('page_range')} summary={_excerpt(str(evidence.get('excerpt') or ''), 160)}"
     )
 
 
@@ -846,6 +1032,35 @@ def _review_open_questions(sections: List[Dict[str, Any]]) -> List[str]:
         if section.get("warnings"):
             questions.append(f"{section['title']}章节缺少足够证据，需要补充文献或重新解析。")
     return _unique_strings(questions)
+
+
+def _llm_diagnostics(
+    mode: str,
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
+    error: Optional[LLMError] = None,
+    first_error: Optional[LLMError] = None,
+    fallback_sections: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    meta = metadata or {}
+    error_type = str(meta.get("error_type") or "")
+    if error is not None:
+        error_type = error.error_type
+        meta = {**error.metadata, **meta}
+    result = {
+        "schema": "llm_diagnostics.v1",
+        "mode": mode,
+        "retry_count": int(meta.get("retry_count") or 0),
+        "repair_used": bool(meta.get("repair_used")),
+        "fallback_sections": fallback_sections or [],
+        "error_type": error_type,
+    }
+    first_type = str(meta.get("first_error_type") or "")
+    if first_error is not None:
+        first_type = first_error.error_type
+    if first_type:
+        result["first_error_type"] = first_type
+    return result
 
 
 def _fact_audit_warning_tags(audit: Dict[str, Any]) -> List[str]:

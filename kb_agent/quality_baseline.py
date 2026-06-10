@@ -134,6 +134,8 @@ def latest_quality_baseline(limit: int = 1) -> Dict[str, Any]:
                 "best_search_mode": (payload.get("benchmark") or {}).get("best_mode_by_score") or "",
                 "llm_baseline_status": (payload.get("llm_baseline") or {}).get("status", ""),
                 "llm_reachable": ((payload.get("llm_status") or {}).get("reachable")),
+                "review_llm_error": (((payload.get("tasks") or {}).get("review") or {}).get("llm_error") or ""),
+                "review_fallback_mode": ((((payload.get("tasks") or {}).get("review") or {}).get("llm_diagnostics") or {}).get("mode") or ""),
                 "weak_doc_count": sum(1 for item in payload.get("documents") or [] if item.get("quality_level") == "weak"),
                 "real_embedding_status": (payload.get("embedding") or {}).get("sentence_transformers", {}).get("status", ""),
                 "warning_count": len(payload.get("warnings") or []),
@@ -518,6 +520,7 @@ def _task_baseline(db_path: Path, doc_ids: List[str], *, use_llm: bool) -> Dict[
             "warning_count": len(matrix.get("warnings") or []),
             "warnings": matrix.get("warnings") or [],
             "llm_error": compare.get("llm_error", ""),
+            "llm_diagnostics": matrix.get("llm_diagnostics") or {},
         }
     except Exception as exc:
         result["compare"] = {"status": "failed", "error": str(exc)}
@@ -543,6 +546,7 @@ def _task_baseline(db_path: Path, doc_ids: List[str], *, use_llm: bool) -> Dict[
             "warning_count": len(outline.get("warnings") or []),
             "warnings": outline.get("warnings") or [],
             "llm_error": review.get("llm_error", ""),
+            "llm_diagnostics": outline.get("llm_diagnostics") or {},
         }
     except Exception as exc:
         result["review"] = {"status": "failed", "error": str(exc)}
@@ -657,6 +661,10 @@ def _llm_baseline_summary(
             "review_status": review.get("status") or "",
             "review_warning_count": review.get("warning_count", 0),
             "review_llm_error": bool(review.get("llm_error")),
+            "review_fallback_mode": (review.get("llm_diagnostics") or {}).get("mode", ""),
+            "review_retry_count": (review.get("llm_diagnostics") or {}).get("retry_count", 0),
+            "review_repair_used": bool((review.get("llm_diagnostics") or {}).get("repair_used")),
+            "review_fallback_sections": (review.get("llm_diagnostics") or {}).get("fallback_sections", []),
         },
         "fact_conflict_count": graph.get("conflict_count", 0),
         "warnings": _unique_strings(warning_tags),

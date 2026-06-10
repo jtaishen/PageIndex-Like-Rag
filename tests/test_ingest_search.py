@@ -52,7 +52,7 @@ from kb_agent.knowledge_graph import (
     get_graph_neighborhood,
     get_graph_report,
 )
-from kb_agent.llm import LLMError, llm_status
+from kb_agent.llm import LLMError, generate_json_object, llm_payload_metadata, llm_status
 from kb_agent.memory import compact_memory, put_memory_gated, remember_task, resume_task, search_memory
 from kb_agent.models import ParsedBlock, ParsedDocument
 from kb_agent.query import classify_query
@@ -327,6 +327,40 @@ class IngestSearchTest(unittest.TestCase):
         output = stdout.getvalue()
         self.assertIn("llm_status.v1", output)
         self.assertNotIn("sk-test-secret", output)
+
+    def test_generate_json_object_repairs_and_retries_safely(self) -> None:
+        env = {
+            "DEEPSEEK_API_KEY": "sk-json-secret",
+            "DEEPSEEK_BASE_URL": "http://localhost:3000/v1",
+            "DEEPSEEK_MODEL": "deepseek_v4",
+        }
+        with mock.patch("kb_agent.config._ENV_LOADED", True), mock.patch.dict(os.environ, env, clear=True), mock.patch(
+            "kb_agent.llm._chat_completion_content",
+            side_effect=['{"ok": ', '{"ok": true}'],
+        ):
+            payload = generate_json_object("json only", "return ok")
+
+        self.assertTrue(payload["ok"])
+        metadata = llm_payload_metadata(payload)
+        self.assertEqual(metadata["retry_count"], 1)
+        self.assertEqual(metadata["first_error_type"], "truncated_json")
+        self.assertNotIn("sk-json-secret", json.dumps(payload, ensure_ascii=False))
+
+        with mock.patch("kb_agent.config._ENV_LOADED", True), mock.patch.dict(os.environ, env, clear=True), mock.patch(
+            "kb_agent.llm._chat_completion_content",
+            return_value='```json\n{"ok": true}\n```',
+        ):
+            fenced = generate_json_object("json only", "return ok")
+        self.assertTrue(llm_payload_metadata(fenced)["repair_used"])
+
+        with mock.patch("kb_agent.config._ENV_LOADED", True), mock.patch.dict(os.environ, env, clear=True), mock.patch(
+            "kb_agent.llm._chat_completion_content",
+            return_value='["not-object"]',
+        ):
+            with self.assertRaises(LLMError) as raised:
+                generate_json_object("json only", "return object")
+        self.assertEqual(raised.exception.error_type, "non_object_json")
+        self.assertNotIn("not-object", str(raised.exception))
 
     def test_extract_requires_llm_does_not_overwrite_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -813,6 +847,9 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(result["tree_search"]["llm_enabled"], True)
             self.assertEqual(len(result["tree_search"]["llm_items"]), 2)
             self.assertGreaterEqual(result["llm_baseline"]["insights_and_facts"]["llm_used_count"], 1)
+            self.assertIn("review_fallback_mode", result["llm_baseline"]["tasks"])
+            self.assertIn("review_retry_count", result["llm_baseline"]["tasks"])
+            self.assertIn("llm_diagnostics", result["tasks"]["review"])
             html = Path(result["html_path"]).read_text(encoding="utf-8")
             self.assertNotIn("sk-", html)
             self.assertNotIn("excerpt", html)
@@ -1014,6 +1051,7 @@ class IngestSearchTest(unittest.TestCase):
                     use_llm=True,
                 )
             self.assertEqual(result["comparison_matrix"]["source"], "llm")
+            self.assertEqual(result["comparison_matrix"]["llm_diagnostics"]["mode"], "full_json")
             self.assertIn("需要进一步比较", result["comparison_matrix"]["open_questions"][0])
             self.assertIn("node_id", result["comparison_matrix"]["dimensions"][0]["cells"][0]["evidence"][0])
 
@@ -1025,6 +1063,61 @@ class IngestSearchTest(unittest.TestCase):
                     compare_papers(
                         db_path,
                         "服务机器人与多智能体任务规划方法对比",
+                        doc_ids=doc_ids,
+                        use_llm=True,
+                        require_llm=True,
+                    )
+            self.assertFalse(state_root.exists())
+
+    def test_review_llm_section_recovery_and_require_llm_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+            full_error = LLMError("DeepSeek JSON parse failed: truncated_json", error_type="truncated_json", metadata={"retry_count": 1})
+            section_payloads = [
+                {
+                    "section_id": section["section_id"],
+                    "title": section["title"],
+                    "purpose": section["purpose"],
+                    "paper_ids": doc_ids,
+                    "evidence": [],
+                    "warnings": [],
+                }
+                for section in [
+                    {"section_id": "background_problem", "title": "研究背景与问题定义", "purpose": "界定主题。"},
+                    {"section_id": "method_paradigms", "title": "方法范式与系统框架", "purpose": "归纳方法。"},
+                    {"section_id": "coordination_mechanisms", "title": "任务分解、分配与协同机制", "purpose": "整理机制。"},
+                    {"section_id": "evaluation_evidence", "title": "实验评测与证据强度", "purpose": "比较证据。"},
+                    {"section_id": "limitations_future", "title": "局限性与未来方向", "purpose": "汇总局限。"},
+                ]
+            ]
+            with mock.patch("kb_agent.tasks.generate_json_object", side_effect=[full_error, *section_payloads]):
+                result = generate_review_plan(
+                    db_path,
+                    "任务规划方法研究综述",
+                    doc_ids=doc_ids,
+                    use_llm=True,
+                )
+
+            outline = result["review_outline"]
+            self.assertEqual(outline["source"], "llm_section")
+            self.assertEqual(outline["llm_diagnostics"]["mode"], "section_json")
+            self.assertEqual(outline["llm_diagnostics"]["retry_count"], 1)
+            self.assertEqual(outline["llm_diagnostics"]["fallback_sections"], [])
+            self.assertNotIn("rule_based_review_plan", outline["warnings"])
+            self.assertEqual(len(outline["sections"]), 5)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+            state_root = db_path.parent / ".kb_state"
+            errors = [
+                LLMError("DeepSeek JSON parse failed: truncated_json", error_type="truncated_json", metadata={"retry_count": 1}),
+                *[LLMError("DeepSeek JSON parse failed: invalid_json", error_type="invalid_json") for _ in range(5)],
+            ]
+            with mock.patch("kb_agent.tasks.generate_json_object", side_effect=errors):
+                with self.assertRaises(LLMError):
+                    generate_review_plan(
+                        db_path,
+                        "任务规划方法研究综述",
                         doc_ids=doc_ids,
                         use_llm=True,
                         require_llm=True,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -19,7 +20,13 @@ from .utils import compact_whitespace, first_words
 
 
 class LLMError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, error_type: str = "", metadata: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(message)
+        self.error_type = error_type or "llm_error"
+        self.metadata = metadata or {}
+
+
+LLM_METADATA_KEY = "_llm_metadata"
 
 
 @dataclass
@@ -139,15 +146,49 @@ def generate_json_object(
     resolved = settings or get_llm_settings()
     if resolved is None:
         raise LLMError("DEEPSEEK_API_KEY is not configured.")
-    body = _chat_body(
-        resolved,
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    body = _chat_body(resolved, messages)
     content = _chat_completion_content(body, resolved)
-    return _parse_json_object(content)
+    try:
+        payload, metadata = _parse_json_object(content)
+        payload[LLM_METADATA_KEY] = {**metadata, "retry_count": 0, "error_type": ""}
+        return payload
+    except LLMError as first_error:
+        retry_messages = [
+            *messages,
+            {
+                "role": "user",
+                "content": (
+                    "上一次输出不是可解析的完整 JSON object。请重新生成，只返回完整 JSON object，"
+                    "不要解释、不要 Markdown、不要截断，不要输出 JSON 之外的任何文本。"
+                ),
+            },
+        ]
+        retry_body = _chat_body(resolved, retry_messages)
+        retry_content = _chat_completion_content(retry_body, resolved)
+        try:
+            payload, metadata = _parse_json_object(retry_content)
+        except LLMError as retry_error:
+            raise LLMError(
+                f"DeepSeek JSON parse failed: {retry_error.error_type}",
+                error_type=retry_error.error_type,
+                metadata={
+                    "retry_count": 1,
+                    "repair_used": False,
+                    "first_error_type": first_error.error_type,
+                    "error_type": retry_error.error_type,
+                },
+            ) from retry_error
+        payload[LLM_METADATA_KEY] = {
+            **metadata,
+            "retry_count": 1,
+            "first_error_type": first_error.error_type,
+            "error_type": "",
+        }
+        return payload
 
 
 def _chat_body(resolved: LLMSettings, messages: List[Dict[str, str]]) -> Dict[str, object]:
@@ -183,7 +224,9 @@ def _chat_completion_content(body: Dict[str, object], resolved: LLMSettings, *, 
         detail = exc.read().decode("utf-8", errors="replace")
         raise LLMError(f"DeepSeek API HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
-        raise LLMError(f"DeepSeek API request failed: {exc}") from exc
+        raise LLMError(f"DeepSeek API request failed: {exc}", error_type="request_failed") from exc
+    except TimeoutError as exc:
+        raise LLMError("DeepSeek API request timed out.", error_type="request_timeout") from exc
 
     try:
         content = payload["choices"][0]["message"]["content"]
@@ -194,27 +237,66 @@ def _chat_completion_content(body: Dict[str, object], resolved: LLMSettings, *, 
     return str(content).strip()
 
 
-def _parse_json_object(content: str) -> Dict[str, object]:
-    text = content.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:]
-        text = text.strip()
+def llm_payload_metadata(payload: Dict[str, object]) -> Dict[str, Any]:
+    metadata = payload.get(LLM_METADATA_KEY) if isinstance(payload, dict) else None
+    return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _parse_json_object(content: str) -> tuple[Dict[str, object], Dict[str, Any]]:
+    text, clean_repair = _clean_json_text(content)
+    stripped = text.strip()
+    if stripped.startswith("["):
+        try:
+            json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise LLMError("DeepSeek returned invalid JSON.", error_type="invalid_json") from exc
+        raise LLMError("DeepSeek JSON response is not an object.", error_type="non_object_json")
+    text, slice_repair = _balanced_json_object_text(text)
+    repair_used = clean_repair or slice_repair
     try:
         payload = json.loads(text)
-    except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start < 0 or end <= start:
-            raise LLMError("DeepSeek did not return a JSON object.")
-        try:
-            payload = json.loads(text[start : end + 1])
-        except json.JSONDecodeError as exc:
-            raise LLMError("DeepSeek returned invalid JSON.") from exc
+    except json.JSONDecodeError as exc:
+        raise LLMError("DeepSeek returned invalid JSON.", error_type="invalid_json") from exc
     if not isinstance(payload, dict):
-        raise LLMError("DeepSeek JSON response is not an object.")
-    return payload
+        raise LLMError("DeepSeek JSON response is not an object.", error_type="non_object_json")
+    return payload, {"repair_used": repair_used}
+
+
+def _clean_json_text(content: str) -> tuple[str, bool]:
+    text = content.strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        return fenced.group(1).strip(), True
+    return text, False
+
+
+def _balanced_json_object_text(text: str) -> tuple[str, bool]:
+    start = text.find("{")
+    if start < 0:
+        raise LLMError("DeepSeek did not return a JSON object.", error_type="no_json_object")
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                return text[start:end], start > 0 or end < len(text.strip())
+    raise LLMError("DeepSeek returned truncated JSON.", error_type="truncated_json")
 
 
 def build_grounded_prompt(query: str, evidence: Iterable[Dict[str, object]]) -> str:
