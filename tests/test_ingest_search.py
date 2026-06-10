@@ -794,8 +794,11 @@ class IngestSearchTest(unittest.TestCase):
             self.assertTrue(Path(result["html_path"]).exists())
             self.assertEqual(result["embedding"]["hash"]["status"], "completed")
             self.assertEqual(result["embedding"]["sentence_transformers"]["status"], "skipped")
+            self.assertEqual(result["embedding"]["hybrid_embedding_provider"], "hash")
+            self.assertEqual(result["embedding"]["real_embedding_status"], "skipped")
             self.assertEqual(result["benchmark"]["schema"], "benchmark_report.v1")
-            self.assertIn(result["benchmark"]["best_mode_by_score"], {"fts", "hybrid", "tree"})
+            self.assertIn("auto", result["benchmark"]["compare_modes"])
+            self.assertIn(result["benchmark"]["best_mode_by_score"], {"fts", "hybrid", "tree", "auto"})
             self.assertEqual(result["tree_search"]["schema"], "tree_search_baseline.v1")
             self.assertEqual(result["tasks"]["schema"], "task_quality_baseline.v1")
             self.assertTrue(result["tasks"]["compare"].get("task_id"))
@@ -824,6 +827,8 @@ class IngestSearchTest(unittest.TestCase):
             self.assertIn("llm_budget_exhausted", filtered_latest["items"][0])
             self.assertIn("llm_facts_success_rate", filtered_latest["items"][0])
             self.assertIn("llm_compare_dimension_success_rate", filtered_latest["items"][0])
+            self.assertIn("hybrid_embedding_provider", filtered_latest["items"][0])
+            self.assertIn("real_embedding_node_coverage", filtered_latest["items"][0])
             real_filtered = latest_quality_baseline(limit=1, corpus=papers, real_only=True)
             self.assertEqual(real_filtered["count"], 0)
 
@@ -928,6 +933,48 @@ class IngestSearchTest(unittest.TestCase):
             self.assertIn("LLM Runtime", html)
             self.assertNotIn("sk-", html)
             self.assertNotIn("excerpt", html)
+
+    def test_quality_baseline_uses_sentence_transformers_when_available(self) -> None:
+        class FakeSentenceTransformer:
+            def __init__(self, model_name: str) -> None:
+                self.model_name = model_name
+
+            def get_sentence_embedding_dimension(self) -> int:
+                return 4
+
+            def encode(self, texts, normalize_embeddings=True, batch_size=16):  # type: ignore[no-untyped-def]
+                del normalize_embeddings, batch_size
+                return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+        fake_module = types.SimpleNamespace(SentenceTransformer=FakeSentenceTransformer)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(sys.modules, {"sentence_transformers": fake_module}):
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "robot.txt").write_text(
+                "摘要：本文研究服务机器人任务规划方法。\n"
+                "关键词：服务机器人；任务规划\n\n"
+                "1 方法设计\n"
+                "本文提出技能库驱动的任务规划框架。\n\n"
+                "2 实验结果\n"
+                "实验结果表明任务成功率提升。\n",
+                encoding="utf-8",
+            )
+
+            result = run_quality_baseline(db_path, papers, use_llm=False, top_k=2, embedding_model="fake-real-model")
+
+            embedding = result["embedding"]
+            self.assertEqual(embedding["sentence_transformers"]["status"], "completed")
+            self.assertEqual(embedding["real_embedding_model"], "fake-real-model")
+            self.assertEqual(embedding["real_embedding_dim"], 4)
+            self.assertEqual(embedding["real_embedding_node_coverage"], 1.0)
+            self.assertEqual(embedding["hybrid_embedding_provider"], "sentence-transformers")
+            self.assertEqual(embedding["hybrid_embedding_model"], "fake-real-model")
+            self.assertFalse(embedding["embedding_rebuild_needed"])
+            self.assertIn("auto", result["benchmark"]["compare_modes"])
+            benchmark_payload = json.loads(Path(result["benchmark"]["path"]).read_text(encoding="utf-8"))
+            self.assertEqual(benchmark_payload["mode_results"]["hybrid"]["fallback_rate"], 0.0)
 
     def test_quality_baseline_llm_stage_timeout_and_budget_are_reported(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1657,6 +1704,10 @@ class IngestSearchTest(unittest.TestCase):
             status = semantic_index_status(db_path, provider="sentence-transformers", model="fake-model-v1")
             self.assertTrue(status["ready"])
             self.assertEqual(status["model"], "fake-model-v1")
+            self.assertEqual(status["dim"], 3)
+            self.assertEqual(status["node_coverage"], 1.0)
+            self.assertEqual(status["document_coverage"], 1.0)
+            self.assertFalse(status["needs_rebuild"])
 
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):

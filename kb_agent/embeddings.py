@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import math
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -192,6 +194,8 @@ def build_semantic_index(
                 indexed_nodes += 1
         conn.commit()
         counts = db.embedding_counts(conn, resolved.name, resolved.model)
+        document_total = len(documents)
+        node_total = len(nodes)
     finally:
         conn.close()
 
@@ -208,6 +212,11 @@ def build_semantic_index(
         "skipped_nodes": skipped_nodes,
         "total_document_embeddings": counts["document_count"],
         "total_node_embeddings": counts["node_count"],
+        "document_total": document_total,
+        "node_total": node_total,
+        "document_coverage": _coverage(counts["document_count"], document_total),
+        "node_coverage": _coverage(counts["node_count"], node_total),
+        "needs_rebuild": counts["document_count"] < document_total or counts["node_count"] < node_total,
     }
 
 
@@ -220,20 +229,40 @@ def semantic_index_status(db_path: Path, provider: Optional[str] = None, model: 
         counts = db.embedding_counts(conn, provider_name, model_name)
         document_total = len(db.get_ready_document_rows(conn))
         node_total = len(db.get_indexable_node_rows(conn))
+        dim_row = conn.execute(
+            """
+            SELECT MAX(dim) AS dim
+            FROM (
+              SELECT dim FROM node_embeddings WHERE provider = ? AND model = ?
+              UNION ALL
+              SELECT dim FROM document_embeddings WHERE provider = ? AND model = ?
+            )
+            """,
+            (provider_name, model_name, provider_name, model_name),
+        ).fetchone()
     finally:
         conn.close()
-    dim = DEFAULT_HASH_DIM if provider_name == "hash" else 0
+    stored_dim = int((dim_row["dim"] if dim_row else 0) or 0)
+    dim = stored_dim or (DEFAULT_HASH_DIM if provider_name == "hash" else 0)
+    document_coverage = _coverage(counts["document_count"], document_total)
+    node_coverage = _coverage(counts["node_count"], node_total)
+    needs_rebuild = counts["document_count"] < document_total or counts["node_count"] < node_total
+    package_available = True if provider_name == "hash" else sentence_transformers_available()
     return {
         "schema": "semantic_index_status.v1",
         "provider": provider_name,
         "model": model_name,
         "dim": dim,
         "ready": counts["node_count"] > 0,
+        "package_available": package_available,
+        "install_command": "" if package_available else "uv sync --extra embeddings",
         "document_total": document_total,
         "node_total": node_total,
         "missing_document_embeddings": max(0, document_total - counts["document_count"]),
         "missing_node_embeddings": max(0, node_total - counts["node_count"]),
-        "needs_rebuild": counts["node_count"] < node_total,
+        "document_coverage": document_coverage,
+        "node_coverage": node_coverage,
+        "needs_rebuild": needs_rebuild,
         **counts,
     }
 
@@ -284,6 +313,21 @@ def _embedding_tokens(text: str) -> List[str]:
             for size in (2, 3):
                 tokens.extend(token[index : index + size] for index in range(0, len(token) - size + 1))
     return tokens[:1000]
+
+
+def sentence_transformers_available() -> bool:
+    if "sentence_transformers" in sys.modules:
+        return True
+    try:
+        return importlib.util.find_spec("sentence_transformers") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _coverage(count: int, total: int) -> float:
+    if total <= 0:
+        return 1.0
+    return round(float(count) / float(total), 4)
 
 
 def _normalize_vector(vector: Iterable[float]) -> List[float]:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import time
 import hashlib
@@ -14,7 +16,7 @@ from . import db
 from .artifacts import get_doc_card, get_parse_quality, get_parse_report
 from .benchmark import create_eval_suite, generate_case_study, run_benchmark
 from .config import DATA_DIR, PROJECT_ROOT, baseline_llm_stage_timeout_seconds, baseline_llm_timeout_seconds, deepseek_timeout_seconds
-from .embeddings import EmbeddingError, build_semantic_index, semantic_index_status
+from .embeddings import EmbeddingError, build_semantic_index, semantic_index_status, sentence_transformers_available
 from .eval import eval_memory
 from .fact_audit import fact_audit_summary
 from .facts import extract_facts
@@ -286,25 +288,26 @@ def run_quality_baseline(
     )
     fact_audit_after = fact_audit_summary(db_path, doc_ids=doc_ids) if doc_ids else {}
     embedding = _embedding_baseline(db_path, doc_ids, embedding_model=embedding_model)
-    eval_set = _write_baseline_eval_set(doc_reports)
-    suite = create_eval_suite(db_path, f"quality_baseline_{int(started)}", input_json=Path(eval_set["path"]))
-    benchmark = run_benchmark(db_path, str(suite["name"]), compare_modes=["fts", "hybrid", "tree"], top_k=top_k)
-    tree = _tree_search_baseline(
-        db_path,
-        doc_reports,
-        top_k=top_k,
-        use_llm=use_llm,
-        runtime=llm_runtime,
-        llm_doc_ids=llm_doc_ids,
-    )
-    tasks = _task_baseline(
-        db_path,
-        doc_ids,
-        use_llm=use_llm,
-        runtime=llm_runtime,
-        llm_doc_ids=llm_doc_ids,
-        skip_llm_tasks=skip_llm_tasks,
-    )
+    with _embedding_search_env(embedding):
+        eval_set = _write_baseline_eval_set(doc_reports)
+        suite = create_eval_suite(db_path, f"quality_baseline_{int(started)}", input_json=Path(eval_set["path"]))
+        benchmark = run_benchmark(db_path, str(suite["name"]), compare_modes=["fts", "hybrid", "tree", "auto"], top_k=top_k)
+        tree = _tree_search_baseline(
+            db_path,
+            doc_reports,
+            top_k=top_k,
+            use_llm=use_llm,
+            runtime=llm_runtime,
+            llm_doc_ids=llm_doc_ids,
+        )
+        tasks = _task_baseline(
+            db_path,
+            doc_ids,
+            use_llm=use_llm,
+            runtime=llm_runtime,
+            llm_doc_ids=llm_doc_ids,
+            skip_llm_tasks=skip_llm_tasks,
+        )
     memory = eval_memory(db_path)
     graph = graph_summary(db_path, doc_ids=doc_ids, include_conflicts=True) if doc_ids else {
         "schema": "knowledge_graph_summary.v1",
@@ -427,6 +430,13 @@ def latest_quality_baseline(
                 "tree_trace_completeness_after": tree_delta.get("llm_trace_completeness_avg", 0.0),
                 "weak_doc_count": sum(1 for item in payload.get("documents") or [] if item.get("quality_level") == "weak"),
                 "real_embedding_status": (payload.get("embedding") or {}).get("sentence_transformers", {}).get("status", ""),
+                "real_embedding_model": (payload.get("embedding") or {}).get("real_embedding_model", ""),
+                "real_embedding_dim": (payload.get("embedding") or {}).get("real_embedding_dim", 0),
+                "real_embedding_node_coverage": (payload.get("embedding") or {}).get("real_embedding_node_coverage", 0.0),
+                "real_embedding_doc_coverage": (payload.get("embedding") or {}).get("real_embedding_doc_coverage", 0.0),
+                "hybrid_embedding_provider": (payload.get("embedding") or {}).get("hybrid_embedding_provider", ""),
+                "hybrid_embedding_model": (payload.get("embedding") or {}).get("hybrid_embedding_model", ""),
+                "embedding_rebuild_needed": bool((payload.get("embedding") or {}).get("embedding_rebuild_needed")),
                 "warning_count": len(payload.get("warnings") or []),
                 "warnings": payload.get("warnings") or [],
                 "created_at": payload.get("created_at"),
@@ -811,26 +821,36 @@ def _embedding_baseline(db_path: Path, doc_ids: List[str], *, embedding_model: O
         "doc_ids": doc_ids,
         "hash": {},
         "sentence_transformers": {},
+        "hybrid_embedding_provider": "hash",
+        "hybrid_embedding_model": "hash-ngram-v1",
+        "hybrid_embedding_ready": False,
+        "real_embedding_status": "skipped",
+        "real_embedding_model": embedding_model or "",
+        "real_embedding_dim": 0,
+        "real_embedding_node_coverage": 0.0,
+        "real_embedding_doc_coverage": 0.0,
+        "embedding_rebuild_needed": True,
         "warnings": [],
     }
     if not doc_ids:
         result["hash"] = {"status": "skipped", "reason": "no_ready_documents"}
         result["sentence_transformers"] = {"status": "skipped", "reason": "no_ready_documents"}
         result["warnings"].append("embedding_skipped:no_ready_documents")
-        return result
+        return _finalize_embedding_baseline(result)
     try:
         build = build_semantic_index(db_path, doc_ids=doc_ids or None, force=True, provider="hash")
         result["hash"] = {"status": "completed", "build": build, "status_report": semantic_index_status(db_path, provider="hash")}
     except Exception as exc:
         result["hash"] = {"status": "failed", "error": str(exc)}
         result["warnings"].append("hash_embedding_failed")
-    if importlib.util.find_spec("sentence_transformers") is None:
+    if not _baseline_sentence_transformers_available():
         result["sentence_transformers"] = {
             "status": "skipped",
             "reason": "sentence_transformers_not_installed",
+            "install_command": "uv sync --extra embeddings",
         }
         result["warnings"].append("real_embedding_not_enabled")
-        return result
+        return _finalize_embedding_baseline(result)
     try:
         build = build_semantic_index(
             db_path,
@@ -847,7 +867,75 @@ def _embedding_baseline(db_path: Path, doc_ids: List[str], *, embedding_model: O
     except Exception as exc:
         result["sentence_transformers"] = {"status": "failed", "error": str(exc)}
         result["warnings"].append("real_embedding_failed")
+    return _finalize_embedding_baseline(result)
+
+
+def _finalize_embedding_baseline(result: Dict[str, Any]) -> Dict[str, Any]:
+    real = result.get("sentence_transformers") or {}
+    hash_part = result.get("hash") or {}
+    real_status = str(real.get("status") or "skipped")
+    result["real_embedding_status"] = real_status
+    real_status_report = real.get("status_report") if isinstance(real.get("status_report"), dict) else {}
+    real_build = real.get("build") if isinstance(real.get("build"), dict) else {}
+    result["real_embedding_model"] = str(
+        real_status_report.get("model")
+        or real_build.get("model")
+        or result.get("real_embedding_model")
+        or ""
+    )
+    result["real_embedding_dim"] = int(real_status_report.get("dim") or real_build.get("dim") or 0)
+    result["real_embedding_node_coverage"] = float(real_status_report.get("node_coverage") or real_build.get("node_coverage") or 0.0)
+    result["real_embedding_doc_coverage"] = float(
+        real_status_report.get("document_coverage") or real_build.get("document_coverage") or 0.0
+    )
+    if real_status == "completed":
+        result["hybrid_embedding_provider"] = "sentence-transformers"
+        result["hybrid_embedding_model"] = result["real_embedding_model"]
+        result["hybrid_embedding_ready"] = bool(real_status_report.get("ready", True))
+        result["embedding_rebuild_needed"] = bool(real_status_report.get("needs_rebuild", False))
+    else:
+        hash_status_report = hash_part.get("status_report") if isinstance(hash_part.get("status_report"), dict) else {}
+        hash_build = hash_part.get("build") if isinstance(hash_part.get("build"), dict) else {}
+        result["hybrid_embedding_provider"] = "hash"
+        result["hybrid_embedding_model"] = str(hash_status_report.get("model") or hash_build.get("model") or "hash-ngram-v1")
+        result["hybrid_embedding_ready"] = bool(hash_status_report.get("ready") or hash_build.get("total_node_embeddings"))
+        result["embedding_rebuild_needed"] = bool(hash_status_report.get("needs_rebuild", True))
+        if hash_part.get("status") == "completed":
+            result["warnings"].append("hybrid_uses_hash_embedding")
+    result["warnings"] = _unique_strings(result.get("warnings") or [])
     return result
+
+
+def _baseline_sentence_transformers_available() -> bool:
+    if "sentence_transformers" in sys.modules:
+        return True
+    try:
+        return importlib.util.find_spec("sentence_transformers") is not None
+    except (ImportError, ValueError):
+        return sentence_transformers_available()
+
+
+@contextmanager
+def _embedding_search_env(embedding: Dict[str, Any]):
+    provider = str(embedding.get("hybrid_embedding_provider") or "hash")
+    model = str(embedding.get("hybrid_embedding_model") or "")
+    previous_provider = os.environ.get("KB_EMBEDDING_PROVIDER")
+    previous_model = os.environ.get("KB_EMBEDDING_MODEL")
+    if provider:
+        os.environ["KB_EMBEDDING_PROVIDER"] = provider
+    if model:
+        os.environ["KB_EMBEDDING_MODEL"] = model
+    try:
+        yield
+    finally:
+        if previous_provider is None:
+            os.environ.pop("KB_EMBEDDING_PROVIDER", None)
+        else:
+            os.environ["KB_EMBEDDING_PROVIDER"] = previous_provider
+        if previous_model is None:
+            os.environ.pop("KB_EMBEDDING_MODEL", None)
+        else:
+            os.environ["KB_EMBEDDING_MODEL"] = previous_model
 
 
 def _write_baseline_eval_set(documents: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1426,6 +1514,10 @@ def _baseline_markdown(report: Dict[str, Any]) -> str:
         f"- llm_facts_success_rate: `{((report.get('llm_baseline') or {}).get('insights_and_facts') or {}).get('llm_facts_success_rate', 0.0)}`",
         f"- llm_compare_dimension_success_rate: `{((report.get('llm_baseline') or {}).get('tasks') or {}).get('llm_compare_dimension_success_rate', 0.0)}`",
         f"- real_embedding_status: `{(report.get('embedding') or {}).get('sentence_transformers', {}).get('status', '')}`",
+        f"- real_embedding_model: `{(report.get('embedding') or {}).get('real_embedding_model', '')}`",
+        f"- real_embedding_node_coverage: `{(report.get('embedding') or {}).get('real_embedding_node_coverage', 0.0)}`",
+        f"- hybrid_embedding_provider: `{(report.get('embedding') or {}).get('hybrid_embedding_provider', '')}`",
+        f"- embedding_rebuild_needed: `{(report.get('embedding') or {}).get('embedding_rebuild_needed', False)}`",
         f"- review_partial_reasons: `{', '.join(((report.get('tasks') or {}).get('review') or {}).get('review_partial_reasons') or [])}`",
         f"- warning_count: `{len(report.get('warnings') or [])}`",
         "",
@@ -1460,6 +1552,7 @@ def _baseline_html(report: Dict[str, Any]) -> str:
     llm_baseline = report.get("llm_baseline") or {}
     llm_facts = llm_baseline.get("insights_and_facts") or {}
     llm_tasks = llm_baseline.get("tasks") or {}
+    embedding = report.get("embedding") or {}
     cards = [
         ("Docs", report.get("doc_count", 0)),
         ("PDFs", report.get("pdf_count", 0)),
@@ -1473,7 +1566,10 @@ def _baseline_html(report: Dict[str, Any]) -> str:
         ("LLM Budget", "exhausted" if llm_baseline.get("budget_exhausted") else "ok"),
         ("Facts LLM Rate", llm_facts.get("llm_facts_success_rate", 0.0)),
         ("Compare LLM Rate", llm_tasks.get("llm_compare_dimension_success_rate", 0.0)),
-        ("Real Embedding", (report.get("embedding") or {}).get("sentence_transformers", {}).get("status", "")),
+        ("Real Embedding", (embedding.get("sentence_transformers") or {}).get("status", "")),
+        ("Embedding Model", embedding.get("real_embedding_model", "")),
+        ("Embedding Coverage", embedding.get("real_embedding_node_coverage", 0.0)),
+        ("Hybrid Provider", embedding.get("hybrid_embedding_provider", "")),
         ("Tree Trace", tree_summary.get("llm_trace_completeness_avg") or tree_summary.get("rule_trace_completeness_avg") or 0.0),
         ("Evidence Dedupe", review.get("duplicate_evidence_removed", 0)),
         ("Citation Gaps", f"{fact_delta.get('citation_gap_count_before', 0)}->{fact_delta.get('citation_gap_count_after', 0)}"),

@@ -672,6 +672,45 @@ uv run python -m kb_agent.cli latest-quality-baseline --real-only --limit 1
 
 允许阶段显示 `partial`，但不应再因为一个大 prompt 导致 facts 或 compare 整体不可恢复。报告仍只保存 ID、短摘要、指标和 warning，不保存完整 prompt、论文正文、长 excerpt 或完整 evidence packet。
 
+## v0.26 真实 Embedding 启用与检索质量复测
+
+v0.26 不要求外部 embedding API，优先启用本地 `sentence-transformers`。如果依赖或模型不可用，系统继续使用 `hash` 兜底，并在 `quality-baseline` 中明确显示 `real_embedding_status`、`hybrid_embedding_provider` 和安装建议。
+
+安装可选依赖并构建真实 embedding：
+
+```bash
+uv sync --extra embeddings
+uv run python -m kb_agent.cli embed --provider sentence-transformers --model sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 --batch-size 16 --force
+uv run python -m kb_agent.cli embed --provider sentence-transformers --model sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 --status
+```
+
+复测真实 `articles/`：
+
+```bash
+uv run --extra pdf python -m kb_agent.cli quality-baseline articles --embedding-model sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 --top-k 3
+uv run python -m kb_agent.cli latest-quality-baseline --real-only --limit 1
+```
+
+重点查看这些字段：
+
+- `real_embedding_status`
+- `real_embedding_model`
+- `real_embedding_dim`
+- `real_embedding_node_coverage`
+- `hybrid_embedding_provider`
+- `embedding_rebuild_needed`
+- `best_search_mode`
+
+如果要让显式 `--search-mode auto` 使用评测调优结果：
+
+```bash
+uv run python -m kb_agent.cli tune-search data/eval_sets/<eval_set>.json --compare-modes hybrid,tree,fts --save-profile real-articles-v1
+uv run python -m kb_agent.cli search-profile apply real-articles-v1
+uv run python -m kb_agent.cli search-report "服务机器人任务规划的方法设计" --search-mode auto
+```
+
+默认检索模式仍是 `hybrid`，不会因为保存 profile 自动改变；只有显式传入 `--search-mode auto` 时才读取 active profile。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
