@@ -833,6 +833,19 @@ uv run python -m kb_agent.cli eval-dashboard --format html
 
 `top_review_blockers` 现在只展示会直接影响综述草稿质量的硬问题，例如缺引用、无证据段落、低覆盖或去重后仍重复；`baseline_limitations` 展示当前实验边界，例如 `small_corpus`、`real_embedding_not_enabled`、可选 parser 未启用或 DeepSeek 慢/超时。section evidence 会在生成阶段完成去重和跨文档保留，facts 也会在写入 artifacts / SQLite 前按语义 key 合并重复项。
 
+## v0.32 CLI 模块化与重构边界收敛
+
+v0.32 聚焦结构性重构，不改变默认检索、事实抽取、综述任务或数据库 schema。`kb_agent.cli` 现在只保留薄入口；CLI 参数定义移动到 `kb_agent.cli_parser`，命令分发和运行时输出移动到 `kb_agent.cli_handlers`，CLI 摘要裁剪函数移动到 `kb_agent.cli_summaries`。
+
+本次拆分为后续继续重构 `parsers.py`、`facts.py`、`tasks.py` 和 `quality_baseline.py` 降低风险。新增的 CLI 结构测试会验证 `main()` 复用 parser/handler 模块，摘要测试会覆盖 facts 与 baseline 摘要字段，避免模块迁移后只靠集成测试兜底。
+
+验证：
+
+```bash
+uv run python -m unittest discover -s tests
+git diff --check
+```
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：

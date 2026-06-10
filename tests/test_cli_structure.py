@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from kb_agent.cli import build_parser
+from kb_agent import cli
+from kb_agent.cli_parser import build_parser
 
 
 class CliStructureTest(unittest.TestCase):
@@ -23,6 +24,10 @@ class CliStructureTest(unittest.TestCase):
         self.assertEqual(args.command, "search-profile")
         self.assertEqual(args.profile_command, "show")
         self.assertEqual(args.name, "active")
+
+    def test_cli_entrypoint_reuses_parser_and_handler_modules(self) -> None:
+        self.assertIs(cli.build_parser, build_parser)
+        self.assertEqual(cli.dispatch_command.__module__, "kb_agent.cli_handlers")
 
 
 if __name__ == "__main__":
