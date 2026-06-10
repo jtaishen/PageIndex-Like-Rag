@@ -567,6 +567,28 @@ uv run python -m kb_agent.cli quality-baseline articles --embedding-model senten
 
 报告会写入 `data/eval/quality_baseline_<id>.json/.md/.html`。HTML 只展示指标、路径、warning 和建议动作，不包含论文正文、长 excerpt、完整 evidence packet 或综述草稿正文。
 
+## v0.21 DeepSeek 论文理解质量增强
+
+v0.21 将 DeepSeek Chat API 用于论文理解质量复测，而不是继续等待真实 embedding API。`quality-baseline --with-llm` 会记录 LLM 状态、规则版与 LLM 版 Tree Search 对比、创新点/事实抽取成功率、compare/review warning 和 evidence coverage。报告仍不保存 API key、完整 prompt、论文正文、长 excerpt 或完整 evidence packet。
+
+检查本地 DeepSeek 配置和连通性：
+
+```bash
+uv run python -m kb_agent.cli llm-status
+uv run python -m kb_agent.cli llm-status --probe
+```
+
+运行 LLM 强制验收：
+
+```bash
+uv run python -m kb_agent.cli tree-search <doc_id> "这篇论文的方法设计是什么？" --require-llm
+uv run python -m kb_agent.cli extract <doc_id> --force --require-llm
+uv run python -m kb_agent.cli extract-facts <doc_id> --force --require-llm
+uv run --extra pdf python -m kb_agent.cli quality-baseline articles --with-llm --top-k 3
+```
+
+如果 DeepSeek 调用失败，普通 `--with-llm` 会回退规则版并在报告写入 warning；`--require-llm` 会直接失败，避免写入伪成功工件。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
@@ -609,6 +631,18 @@ DEEPSEEK_API_KEY=sk-your-key-here
 DEEPSEEK_MODEL=deepseek-v4-pro
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 ```
+
+也可以使用 OpenAI-compatible 私有网关，例如：
+
+```text
+DEEPSEEK_BASE_URL=http://202.117.56.203:3000/v1
+DEEPSEEK_MODEL=deepseek_v4
+DEEPSEEK_API_KEY=sk-your-key-here
+DEEPSEEK_TEMPERATURE=0
+DEEPSEEK_MAX_TOKENS=3000
+```
+
+如果 `DEEPSEEK_BASE_URL` 使用 `http://`，密钥会以明文经过该网络链路；只建议在可信内网或临时科研验证环境中使用。
 
 配置后运行：
 

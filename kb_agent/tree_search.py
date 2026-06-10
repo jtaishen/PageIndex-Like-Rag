@@ -52,11 +52,18 @@ def tree_search(
         subtree_scores = _subtree_scores(rows, children, scored)
         selected_ids = _deterministic_selection(rows, scored, budget)
         llm_decisions: Dict[str, Any] = {}
+        llm_selected_count = 0
+        llm_warning_count = 0
 
         if use_llm:
             try:
                 llm_decisions = _llm_select_nodes(query, profile, rows, scored, selected_ids, preferences, budget)
                 llm_ids = _valid_llm_node_ids(llm_decisions, rows)
+                llm_selected_count = len(llm_ids)
+                raw_llm_warnings = llm_decisions.get("warnings") or []
+                if isinstance(raw_llm_warnings, str):
+                    raw_llm_warnings = [raw_llm_warnings]
+                llm_warning_count = len(_unique_strings(raw_llm_warnings))
                 if llm_ids:
                     selected_ids = _merge_selected_ids(llm_ids, selected_ids, budget)
             except LLMError as exc:
@@ -82,6 +89,9 @@ def tree_search(
             "effective_search_mode": flat_mode,
             "budget": budget,
             "use_llm": use_llm,
+            "llm_used": bool(use_llm and not llm_error and (llm_decisions or profile.get("source") == "llm")),
+            "llm_selected_count": llm_selected_count,
+            "llm_warning_count": llm_warning_count,
             "llm_error": llm_error,
             "fallback_reason": fallback_reason,
             "memory_preferences": _preference_refs(preferences),

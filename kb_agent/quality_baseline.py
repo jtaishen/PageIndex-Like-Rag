@@ -19,6 +19,7 @@ from .facts import extract_facts
 from .ingest import discover_files, sync_directory
 from .insights import extract_doc_insights
 from .knowledge_graph import graph_summary
+from .llm import llm_status
 from .parsers import pdf_adapter_statuses
 from .tasks import compare_papers, generate_review_plan
 from .tree_search import tree_search
@@ -54,12 +55,13 @@ def run_quality_baseline(
     doc_ids = _doc_ids_for_corpus(db_path, root)
     doc_reports = [_doc_quality_summary(db_path, doc_id) for doc_id in doc_ids]
     parser_comparison = _parser_comparison(root, pdf_files, primary_sync)
+    llm = llm_status(probe=use_llm)
     insights = _prepare_insights_and_facts(db_path, doc_ids, use_llm=use_llm)
     embedding = _embedding_baseline(db_path, doc_ids, embedding_model=embedding_model)
     eval_set = _write_baseline_eval_set(doc_reports)
     suite = create_eval_suite(db_path, f"quality_baseline_{int(started)}", input_json=Path(eval_set["path"]))
     benchmark = run_benchmark(db_path, str(suite["name"]), compare_modes=["fts", "hybrid", "tree"], top_k=top_k)
-    tree = _tree_search_baseline(db_path, doc_reports, top_k=top_k)
+    tree = _tree_search_baseline(db_path, doc_reports, top_k=top_k, use_llm=use_llm)
     tasks = _task_baseline(db_path, doc_ids, use_llm=use_llm)
     memory = eval_memory(db_path)
     graph = graph_summary(db_path, doc_ids=doc_ids, include_conflicts=True) if doc_ids else {
@@ -67,8 +69,9 @@ def run_quality_baseline(
         "available": False,
         "warnings": ["no_ready_documents_for_graph"],
     }
+    llm_baseline = _llm_baseline_summary(llm, insights, tree, tasks, graph, enabled=use_llm)
     recommendations = _recommendations(doc_reports, parser_comparison, embedding, benchmark, tree, tasks, memory, graph)
-    warnings.extend(_baseline_warnings(doc_reports, parser_comparison, embedding, benchmark, tasks, memory, graph))
+    warnings.extend(_baseline_warnings(doc_reports, parser_comparison, embedding, benchmark, tasks, memory, graph, llm_baseline))
     baseline_id = stable_id("quality_baseline", str(root), ",".join(doc_ids), started, length=12)
     report = {
         "schema": BASELINE_SCHEMA,
@@ -80,6 +83,7 @@ def run_quality_baseline(
         "doc_count": len(doc_ids),
         "primary_parser": "pypdf",
         "primary_sync": _sync_summary(primary_sync),
+        "llm_status": llm,
         "parser_comparison": parser_comparison,
         "documents": doc_reports,
         "insights_and_facts": insights,
@@ -88,6 +92,7 @@ def run_quality_baseline(
         "eval_suite": _suite_summary(suite),
         "benchmark": _benchmark_summary(benchmark),
         "tree_search": tree,
+        "llm_baseline": llm_baseline,
         "tasks": tasks,
         "memory": _memory_summary(memory),
         "claim_graph": graph,
@@ -127,6 +132,8 @@ def latest_quality_baseline(limit: int = 1) -> Dict[str, Any]:
                 "doc_count": payload.get("doc_count", 0),
                 "pdf_count": payload.get("pdf_count", 0),
                 "best_search_mode": (payload.get("benchmark") or {}).get("best_mode_by_score") or "",
+                "llm_baseline_status": (payload.get("llm_baseline") or {}).get("status", ""),
+                "llm_reachable": ((payload.get("llm_status") or {}).get("reachable")),
                 "weak_doc_count": sum(1 for item in payload.get("documents") or [] if item.get("quality_level") == "weak"),
                 "real_embedding_status": (payload.get("embedding") or {}).get("sentence_transformers", {}).get("status", ""),
                 "warning_count": len(payload.get("warnings") or []),
@@ -252,39 +259,70 @@ def _prepare_insights_and_facts(db_path: Path, doc_ids: List[str], *, use_llm: b
     items = []
     warnings: List[str] = []
     for doc_id in doc_ids:
-        insight_status = "skipped"
-        fact_status = "skipped"
         try:
-            insight = extract_doc_insights(db_path, doc_id, force=True, use_llm=use_llm, require_llm=False)
-            innovation = insight.get("innovation") or {}
-            citation_map = insight.get("citation_map") or {}
-            insight_status = str(innovation.get("status") or "partial")
-            fact = extract_facts(db_path, doc_id, force=True, use_llm=use_llm, require_llm=False)
-            fact_report = fact.get("fact_report") or {}
-            fact_status = str(fact_report.get("status") or "partial")
-            items.append(
-                {
-                    "doc_id": doc_id,
-                    "innovation_status": insight_status,
-                    "innovation_count": len(innovation.get("items") or []),
-                    "citation_reference_count": len(citation_map.get("references") or []),
-                    "citation_relation_count": len(citation_map.get("relations") or []),
-                    "fact_status": fact_status,
-                    "claim_count": fact_report.get("claim_count", 0),
-                    "entity_count": fact_report.get("entity_count", 0),
-                    "relation_count": fact_report.get("relation_count", 0),
-                    "warnings": _unique_strings([*innovation.get("warnings", []), *fact_report.get("warnings", [])]),
-                }
-            )
+            rule_summary = _extract_insight_fact_summary(db_path, doc_id, use_llm=False)
+            if use_llm:
+                llm_summary = _extract_insight_fact_summary(db_path, doc_id, use_llm=True)
+                final = llm_summary
+                items.append(
+                    {
+                        "doc_id": doc_id,
+                        "innovation_status": final.get("innovation_status", "partial"),
+                        "innovation_count": final.get("innovation_count", 0),
+                        "citation_reference_count": final.get("citation_reference_count", 0),
+                        "citation_relation_count": final.get("citation_relation_count", 0),
+                        "fact_status": final.get("fact_status", "partial"),
+                        "claim_count": final.get("claim_count", 0),
+                        "entity_count": final.get("entity_count", 0),
+                        "relation_count": final.get("relation_count", 0),
+                        "source": final.get("source", ""),
+                        "llm_used": final.get("llm_used", False),
+                        "llm_error": final.get("llm_error", ""),
+                        "noise_filtered_count": final.get("noise_filtered_count", 0),
+                        "long_claim_trimmed_count": final.get("long_claim_trimmed_count", 0),
+                        "rule": rule_summary,
+                        "llm": llm_summary,
+                        "warnings": _unique_strings(final.get("warnings") or []),
+                    }
+                )
+            else:
+                items.append(rule_summary)
         except Exception as exc:
             warnings.append(f"insight_fact_failed:{doc_id}:{exc}")
-            items.append({"doc_id": doc_id, "innovation_status": insight_status, "fact_status": fact_status, "error": str(exc)})
+            items.append({"doc_id": doc_id, "innovation_status": "skipped", "fact_status": "skipped", "error": str(exc)})
     return {
         "schema": "baseline_insights_facts.v1",
         "use_llm": use_llm,
         "doc_count": len(items),
         "items": items,
         "warnings": _unique_strings(warnings),
+    }
+
+
+def _extract_insight_fact_summary(db_path: Path, doc_id: str, *, use_llm: bool) -> Dict[str, Any]:
+    insight = extract_doc_insights(db_path, doc_id, force=True, use_llm=use_llm, require_llm=False)
+    innovation = insight.get("innovation") or {}
+    citation_map = insight.get("citation_map") or {}
+    fact = extract_facts(db_path, doc_id, force=True, use_llm=use_llm, require_llm=False)
+    fact_report = fact.get("fact_report") or {}
+    return {
+        "doc_id": doc_id,
+        "mode": "llm" if use_llm else "rule",
+        "innovation_status": str(innovation.get("status") or "partial"),
+        "innovation_source": innovation.get("source") or "",
+        "innovation_count": len(innovation.get("items") or []),
+        "citation_reference_count": len(citation_map.get("references") or []),
+        "citation_relation_count": len(citation_map.get("relations") or []),
+        "fact_status": str(fact_report.get("status") or "partial"),
+        "source": fact_report.get("source") or "",
+        "llm_used": bool(fact_report.get("llm_used")),
+        "llm_error": fact_report.get("llm_error") or insight.get("llm_error") or "",
+        "claim_count": fact_report.get("claim_count", 0),
+        "entity_count": fact_report.get("entity_count", 0),
+        "relation_count": fact_report.get("relation_count", 0),
+        "noise_filtered_count": fact_report.get("noise_filtered_count", 0),
+        "long_claim_trimmed_count": fact_report.get("long_claim_trimmed_count", 0),
+        "warnings": _unique_strings([*innovation.get("warnings", []), *fact_report.get("warnings", [])]),
     }
 
 
@@ -385,37 +423,66 @@ def _eval_query(query: str, intent: str, doc_id: str, keywords: List[str]) -> Di
     }
 
 
-def _tree_search_baseline(db_path: Path, documents: List[Dict[str, Any]], *, top_k: int) -> Dict[str, Any]:
+def _tree_search_baseline(db_path: Path, documents: List[Dict[str, Any]], *, top_k: int, use_llm: bool) -> Dict[str, Any]:
     items = []
+    llm_items = []
+    comparisons = []
     warnings = []
     for doc in documents:
         doc_id = str(doc.get("doc_id") or "")
         title = str(doc.get("title") or doc_id)
         query = f"{title} 的方法设计和实验结果是什么？"
-        try:
-            trace = tree_search(db_path, doc_id, query, budget=top_k, use_llm=False, search_mode="hybrid")
-        except Exception as exc:
-            warnings.append(f"tree_search_failed:{doc_id}:{exc}")
-            items.append({"doc_id": doc_id, "status": "failed", "error": str(exc)})
-            continue
-        items.append(
-            {
-                "doc_id": doc_id,
-                "query": query,
-                "status": "completed",
-                "intent": (trace.get("query_profile") or {}).get("intent", ""),
-                "expanded_node_count": len(trace.get("expanded_nodes") or []),
-                "selected_path_count": len(trace.get("selected_paths") or []),
-                "evidence_count": len(trace.get("evidence") or []),
-                "fallback_reason": trace.get("fallback_reason") or "",
-                "warnings": trace.get("warnings") or [],
-            }
-        )
+        rule_item = _tree_search_item(db_path, doc_id, query, top_k=top_k, use_llm=False)
+        items.append(rule_item)
+        if rule_item.get("status") == "failed":
+            warnings.append(f"tree_search_failed:{doc_id}:{rule_item.get('error', '')}")
+        if use_llm:
+            llm_item = _tree_search_item(db_path, doc_id, query, top_k=top_k, use_llm=True)
+            llm_items.append(llm_item)
+            if llm_item.get("status") == "failed":
+                warnings.append(f"llm_tree_search_failed:{doc_id}:{llm_item.get('error', '')}")
+            comparisons.append(
+                {
+                    "doc_id": doc_id,
+                    "rule_evidence_count": rule_item.get("evidence_count", 0),
+                    "llm_evidence_count": llm_item.get("evidence_count", 0),
+                    "evidence_delta": int(llm_item.get("evidence_count", 0) or 0) - int(rule_item.get("evidence_count", 0) or 0),
+                    "rule_warning_count": len(rule_item.get("warnings") or []),
+                    "llm_warning_count": len(llm_item.get("warnings") or []),
+                    "llm_used": bool(llm_item.get("llm_used")),
+                    "fallback_reason": llm_item.get("fallback_reason") or "",
+                }
+            )
     return {
         "schema": "tree_search_baseline.v1",
+        "llm_enabled": use_llm,
         "doc_count": len(items),
         "items": items,
+        "llm_items": llm_items,
+        "comparison": comparisons,
         "warnings": _unique_strings(warnings),
+    }
+
+
+def _tree_search_item(db_path: Path, doc_id: str, query: str, *, top_k: int, use_llm: bool) -> Dict[str, Any]:
+    try:
+        trace = tree_search(db_path, doc_id, query, budget=top_k, use_llm=use_llm, require_llm=False, search_mode="hybrid")
+    except Exception as exc:
+        return {"doc_id": doc_id, "query": query, "status": "failed", "mode": "llm" if use_llm else "rule", "error": str(exc)}
+    return {
+        "doc_id": doc_id,
+        "query": query,
+        "mode": "llm" if use_llm else "rule",
+        "status": "completed",
+        "intent": (trace.get("query_profile") or {}).get("intent", ""),
+        "expanded_node_count": len(trace.get("expanded_nodes") or []),
+        "selected_path_count": len(trace.get("selected_paths") or []),
+        "evidence_count": len(trace.get("evidence") or []),
+        "llm_used": bool(trace.get("llm_used")),
+        "llm_selected_count": trace.get("llm_selected_count", 0),
+        "llm_warning_count": trace.get("llm_warning_count", 0),
+        "fallback_reason": trace.get("fallback_reason") or "",
+        "warnings": trace.get("warnings") or [],
     }
 
 
@@ -530,6 +597,72 @@ def _recommendations(
     return _unique_strings(items)
 
 
+def _llm_baseline_summary(
+    status: Dict[str, Any],
+    insights: Dict[str, Any],
+    tree: Dict[str, Any],
+    tasks: Dict[str, Any],
+    graph: Dict[str, Any],
+    *,
+    enabled: bool,
+) -> Dict[str, Any]:
+    if not enabled:
+        return {
+            "schema": "llm_quality_baseline.v1",
+            "status": "skipped",
+            "llm_status": status,
+            "tree_search": {"rule_doc_count": len(tree.get("items") or []), "llm_doc_count": 0, "llm_used_count": 0, "fallback_count": 0, "comparison": []},
+            "insights_and_facts": {"doc_count": len(insights.get("items") or []), "llm_doc_count": 0, "llm_used_count": 0, "llm_error_count": 0, "noise_filtered_count": 0, "long_claim_trimmed_count": 0},
+            "tasks": {},
+            "fact_conflict_count": graph.get("conflict_count", 0),
+            "warnings": [],
+        }
+    llm_items = tree.get("llm_items") or []
+    insight_items = insights.get("items") or []
+    llm_fact_items = [item for item in insight_items if isinstance(item, dict) and item.get("llm")]
+    compare = tasks.get("compare") or {}
+    review = tasks.get("review") or {}
+    warning_tags = []
+    if status.get("configured") and status.get("probe") and not status.get("reachable"):
+        warning_tags.append("llm_failed")
+    elif not status.get("configured"):
+        warning_tags.append("llm_skipped")
+    if any(item.get("fallback_reason") for item in llm_items if isinstance(item, dict)):
+        warning_tags.append("llm_tree_search_fallback")
+    if any((item.get("llm") or {}).get("llm_error") for item in llm_fact_items):
+        warning_tags.append("llm_fact_extraction_fallback")
+    return {
+        "schema": "llm_quality_baseline.v1",
+        "status": "completed" if status.get("reachable") or (status.get("configured") and status.get("reachable") is None) else "partial",
+        "llm_status": status,
+        "tree_search": {
+            "rule_doc_count": len(tree.get("items") or []),
+            "llm_doc_count": len(llm_items),
+            "llm_used_count": sum(1 for item in llm_items if isinstance(item, dict) and item.get("llm_used")),
+            "fallback_count": sum(1 for item in llm_items if isinstance(item, dict) and item.get("fallback_reason")),
+            "comparison": tree.get("comparison") or [],
+        },
+        "insights_and_facts": {
+            "doc_count": len(insight_items),
+            "llm_doc_count": len(llm_fact_items),
+            "llm_used_count": sum(1 for item in llm_fact_items if (item.get("llm") or {}).get("llm_used")),
+            "llm_error_count": sum(1 for item in llm_fact_items if (item.get("llm") or {}).get("llm_error")),
+            "noise_filtered_count": sum(int((item.get("llm") or {}).get("noise_filtered_count") or 0) for item in llm_fact_items),
+            "long_claim_trimmed_count": sum(int((item.get("llm") or {}).get("long_claim_trimmed_count") or 0) for item in llm_fact_items),
+        },
+        "tasks": {
+            "compare_status": compare.get("status") or "",
+            "compare_warning_count": compare.get("warning_count", 0),
+            "compare_llm_error": bool(compare.get("llm_error")),
+            "review_status": review.get("status") or "",
+            "review_warning_count": review.get("warning_count", 0),
+            "review_llm_error": bool(review.get("llm_error")),
+        },
+        "fact_conflict_count": graph.get("conflict_count", 0),
+        "warnings": _unique_strings(warning_tags),
+    }
+
+
 def _baseline_warnings(
     documents: List[Dict[str, Any]],
     parser_comparison: Dict[str, Any],
@@ -538,6 +671,7 @@ def _baseline_warnings(
     tasks: Dict[str, Any],
     memory: Dict[str, Any],
     graph: Dict[str, Any],
+    llm_baseline: Dict[str, Any],
 ) -> List[str]:
     warnings = []
     if not documents:
@@ -552,6 +686,7 @@ def _baseline_warnings(
     warnings.extend((tasks.get("review") or {}).get("warnings") or [])
     warnings.extend(memory.get("warnings") or [])
     warnings.extend(graph.get("warnings") or [])
+    warnings.extend(llm_baseline.get("warnings") or [])
     return _unique_strings(str(item) for item in warnings)
 
 
@@ -618,6 +753,8 @@ def _baseline_markdown(report: Dict[str, Any]) -> str:
         f"- doc_count: `{report.get('doc_count')}`",
         f"- pdf_count: `{report.get('pdf_count')}`",
         f"- best_search_mode: `{(report.get('benchmark') or {}).get('best_mode_by_score', '')}`",
+        f"- llm_baseline_status: `{(report.get('llm_baseline') or {}).get('status', '')}`",
+        f"- llm_reachable: `{(report.get('llm_status') or {}).get('reachable', '')}`",
         f"- real_embedding_status: `{(report.get('embedding') or {}).get('sentence_transformers', {}).get('status', '')}`",
         f"- warning_count: `{len(report.get('warnings') or [])}`",
         "",
@@ -643,6 +780,8 @@ def _baseline_html(report: Dict[str, Any]) -> str:
         ("PDFs", report.get("pdf_count", 0)),
         ("Warnings", len(report.get("warnings") or [])),
         ("Best Mode", (report.get("benchmark") or {}).get("best_mode_by_score", "")),
+        ("LLM Baseline", (report.get("llm_baseline") or {}).get("status", "")),
+        ("LLM Reachable", (report.get("llm_status") or {}).get("reachable", "")),
         ("Real Embedding", (report.get("embedding") or {}).get("sentence_transformers", {}).get("status", "")),
         ("Memory", (report.get("memory") or {}).get("status", "")),
         ("Graph Conflicts", (report.get("claim_graph") or {}).get("conflict_count", 0)),

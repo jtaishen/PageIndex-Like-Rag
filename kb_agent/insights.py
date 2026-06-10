@@ -239,11 +239,11 @@ def _normalize_innovation_payload(
             evidence = _normalize_item_evidence(raw_item.get("evidence"), selected_nodes, index)
             items.append(
                 {
-                    "title": _string_value(raw_item.get("title")) or f"创新点 {index + 1}",
+                    "title": _excerpt(_string_value(raw_item.get("title")), 80) or f"创新点 {index + 1}",
                     "type": _string_value(raw_item.get("type")) or "contribution",
-                    "claim": _string_value(raw_item.get("claim")),
-                    "problem": _string_value(raw_item.get("problem")),
-                    "approach": _string_value(raw_item.get("approach")),
+                    "claim": _excerpt(_string_value(raw_item.get("claim")), 220),
+                    "problem": _excerpt(_string_value(raw_item.get("problem")), 180),
+                    "approach": _excerpt(_string_value(raw_item.get("approach")), 180),
                     "evidence": evidence,
                     "confidence": _confidence(raw_item.get("confidence"), default=0.75),
                 }

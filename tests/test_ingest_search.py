@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -51,7 +52,7 @@ from kb_agent.knowledge_graph import (
     get_graph_neighborhood,
     get_graph_report,
 )
-from kb_agent.llm import LLMError
+from kb_agent.llm import LLMError, llm_status
 from kb_agent.memory import compact_memory, put_memory_gated, remember_task, resume_task, search_memory
 from kb_agent.models import ParsedBlock, ParsedDocument
 from kb_agent.query import classify_query
@@ -290,6 +291,42 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(innovation["items"][0]["confidence"], 0.82)
             self.assertIn("node_id", innovation["items"][0]["evidence"][0])
             self.assertIn("真实场景", innovation["limitations"][0])
+
+    def test_llm_status_probe_is_sanitized(self) -> None:
+        with mock.patch("kb_agent.config._ENV_LOADED", True), mock.patch.dict(
+            os.environ,
+            {
+                "DEEPSEEK_API_KEY": "sk-test-secret",
+                "DEEPSEEK_BASE_URL": "http://localhost:3000/v1",
+                "DEEPSEEK_MODEL": "deepseek_v4",
+                "DEEPSEEK_TEMPERATURE": "0",
+                "DEEPSEEK_MAX_TOKENS": "300",
+            },
+            clear=True,
+        ), mock.patch("kb_agent.llm._chat_completion_content", return_value="连接正常"):
+            status = llm_status(probe=True)
+
+        self.assertEqual(status["schema"], "llm_status.v1")
+        self.assertTrue(status["configured"])
+        self.assertTrue(status["reachable"])
+        self.assertTrue(status["insecure_http"])
+        self.assertEqual(status["model"], "deepseek_v4")
+        self.assertNotIn("sk-test-secret", json.dumps(status, ensure_ascii=False))
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), mock.patch("kb_agent.config._ENV_LOADED", True), mock.patch.dict(
+            os.environ,
+            {
+                "DEEPSEEK_API_KEY": "sk-test-secret",
+                "DEEPSEEK_BASE_URL": "http://localhost:3000/v1",
+                "DEEPSEEK_MODEL": "deepseek_v4",
+            },
+            clear=True,
+        ), mock.patch("kb_agent.llm._chat_completion_content", return_value="连接正常"):
+            cli_main(["llm-status", "--probe"])
+        output = stdout.getvalue()
+        self.assertIn("llm_status.v1", output)
+        self.assertNotIn("sk-test-secret", output)
 
     def test_extract_requires_llm_does_not_overwrite_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -709,6 +746,77 @@ class IngestSearchTest(unittest.TestCase):
                 cli_main(["latest-quality-baseline", "--limit", "1"])
             self.assertIn("quality_baseline_latest.v1", stdout.getvalue())
 
+    def test_quality_baseline_with_llm_records_sanitized_llm_comparison(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "robot.txt").write_text(
+                "摘要：本文研究服务机器人任务规划方法。\n"
+                "关键词：服务机器人；任务规划\n\n"
+                "1 方法\n本文提出大语言模型任务规划框架。\n\n"
+                "2 实验\n实验结果表明任务成功率提升。\n",
+                encoding="utf-8",
+            )
+            (papers / "agents.txt").write_text(
+                "摘要：本文研究多智能体分布式任务规划。\n"
+                "关键词：多智能体；任务分配\n\n"
+                "1 方法\n本文提出动态任务分配算法。\n\n"
+                "2 实验\n实验结果表明鲁棒性提升。\n",
+                encoding="utf-8",
+            )
+            status_payload = {
+                "schema": "llm_status.v1",
+                "provider": "deepseek",
+                "configured": True,
+                "reachable": True,
+                "probe": True,
+                "base_url": "http://localhost:3000/v1",
+                "model": "deepseek_v4",
+                "temperature": 0,
+                "max_tokens": 300,
+                "insecure_http": True,
+                "error": "",
+                "response_sample": "连接正常",
+            }
+            query_payload = {"intent": "experiment", "focus_terms": ["实验"], "preferred_node_types": ["paragraph"], "target_sections": ["实验"], "warnings": []}
+            insight_payload = {
+                "items": [{"title": "任务规划框架", "type": "method", "claim": "提出任务规划框架。", "evidence": ["N1"], "confidence": 0.8}],
+                "limitations": [],
+                "open_questions": [],
+                "warnings": [],
+            }
+            fact_payload = {
+                "claims": [{"type": "method", "text": "提出任务规划框架。", "evidence": ["N1"], "confidence": 0.8}],
+                "entities": [{"type": "method", "name": "任务规划框架", "evidence": ["N1"], "confidence": 0.8}],
+                "relations": [{"type": "uses", "subject": "任务规划框架", "object": "任务规划", "evidence": ["N1"], "confidence": 0.7}],
+                "warnings": [],
+            }
+            tree_payload = {"selected_node_ids": [], "rationale": ["使用规则候选即可。"], "warnings": []}
+
+            with mock.patch("kb_agent.quality_baseline.importlib.util.find_spec", return_value=None), mock.patch(
+                "kb_agent.quality_baseline.llm_status",
+                return_value=status_payload,
+            ), mock.patch("kb_agent.query.generate_json_object", return_value=query_payload), mock.patch(
+                "kb_agent.tree_search.generate_json_object",
+                return_value=tree_payload,
+            ), mock.patch("kb_agent.insights.generate_json_object", return_value=insight_payload), mock.patch(
+                "kb_agent.facts.generate_json_object",
+                return_value=fact_payload,
+            ), mock.patch("kb_agent.tasks.generate_json_object", return_value={"warnings": []}):
+                result = run_quality_baseline(db_path, papers, use_llm=True, top_k=2)
+
+            self.assertEqual(result["llm_baseline"]["schema"], "llm_quality_baseline.v1")
+            self.assertEqual(result["llm_baseline"]["status"], "completed")
+            self.assertEqual(result["llm_status"]["model"], "deepseek_v4")
+            self.assertEqual(result["tree_search"]["llm_enabled"], True)
+            self.assertEqual(len(result["tree_search"]["llm_items"]), 2)
+            self.assertGreaterEqual(result["llm_baseline"]["insights_and_facts"]["llm_used_count"], 1)
+            html = Path(result["html_path"]).read_text(encoding="utf-8")
+            self.assertNotIn("sk-", html)
+            self.assertNotIn("excerpt", html)
+
     def test_llm_fact_extraction_and_require_llm_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path, doc_id = _sync_insight_sample(Path(tmp))
@@ -720,6 +828,12 @@ class IngestSearchTest(unittest.TestCase):
                         "text": "提出动态角色发现机制以提升任务分解效率。",
                         "evidence": [node_id],
                         "confidence": 0.84,
+                    },
+                    {
+                        "type": "result",
+                        "text": "实验结果表明，" + "该方法能够提升任务完成率。" * 20,
+                        "evidence": [node_id],
+                        "confidence": 0.76,
                     }
                 ],
                 "entities": [
@@ -729,6 +843,12 @@ class IngestSearchTest(unittest.TestCase):
                         "aliases": ["动态角色"],
                         "evidence": [node_id],
                         "confidence": 0.82,
+                    },
+                    {
+                        "type": "noise",
+                        "name": "A",
+                        "evidence": [node_id],
+                        "confidence": 0.4,
                     }
                 ],
                 "relations": [
@@ -748,7 +868,11 @@ class IngestSearchTest(unittest.TestCase):
 
             self.assertEqual(result["fact_report"]["status"], "extracted")
             self.assertEqual(result["fact_report"]["source"], "llm")
+            self.assertTrue(result["fact_report"]["llm_used"])
+            self.assertEqual(result["fact_report"]["noise_filtered_count"], 1)
+            self.assertEqual(result["fact_report"]["long_claim_trimmed_count"], 1)
             self.assertEqual(result["claims"]["claims"][0]["confidence"], 0.84)
+            self.assertLessEqual(len(result["claims"]["claims"][1]["text"]), 225)
             self.assertEqual(result["entities"]["entities"][0]["aliases"], ["动态角色"])
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1367,19 +1491,34 @@ class IngestSearchTest(unittest.TestCase):
                 "rationale": ["实验查询应优先选择实验结果节点。"],
                 "warnings": [],
             }
-            with mock.patch("kb_agent.tree_search.generate_json_object", return_value=payload):
+            query_payload = {"intent": "experiment", "focus_terms": ["实验"], "preferred_node_types": ["paragraph"], "target_sections": ["实验"], "warnings": []}
+            with mock.patch("kb_agent.query.generate_json_object", return_value=query_payload), mock.patch(
+                "kb_agent.tree_search.generate_json_object",
+                return_value=payload,
+            ):
                 trace = tree_search(db_path, doc_id, "实验结果如何？", budget=3, use_llm=True)
 
             self.assertEqual(trace["evidence"][0]["node_id"], target_id)
             self.assertEqual(trace["llm_decisions"]["selected_node_ids"], [target_id])
+            self.assertTrue(trace["llm_used"])
+            self.assertEqual(trace["llm_selected_count"], 1)
+            self.assertEqual(trace["llm_warning_count"], 0)
             self.assertFalse(trace["llm_error"])
 
-            with mock.patch("kb_agent.tree_search.generate_json_object", side_effect=LLMError("boom")):
+            with mock.patch("kb_agent.query.generate_json_object", return_value=query_payload), mock.patch(
+                "kb_agent.tree_search.generate_json_object",
+                side_effect=LLMError("boom"),
+            ):
                 fallback = tree_search(db_path, doc_id, "实验结果如何？", budget=2, use_llm=True)
             self.assertIn("llm_unavailable:boom", fallback["warnings"])
+            self.assertFalse(fallback["llm_used"])
+            self.assertEqual(fallback["fallback_reason"], "llm_unavailable:boom")
             self.assertTrue(fallback["evidence"])
 
-            with mock.patch("kb_agent.tree_search.generate_json_object", side_effect=LLMError("boom")):
+            with mock.patch("kb_agent.query.generate_json_object", return_value=query_payload), mock.patch(
+                "kb_agent.tree_search.generate_json_object",
+                side_effect=LLMError("boom"),
+            ):
                 with self.assertRaises(LLMError):
                     tree_search(db_path, doc_id, "实验结果如何？", budget=2, use_llm=True, require_llm=True)
 

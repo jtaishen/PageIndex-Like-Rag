@@ -441,6 +441,7 @@ def _normalize_fact_payload(
 ) -> Dict[str, Any]:
     del card
     selected_by_ref = {f"N{index}": node for index, node in enumerate(selected_nodes, start=1)}
+    quality_stats = {"noise_filtered_count": 0, "long_claim_trimmed_count": 0}
     claims = []
     raw_claims = (payload.get("claims") if isinstance(payload, dict) else []) or []
     for index, item in enumerate(raw_claims):
@@ -451,7 +452,10 @@ def _normalize_fact_payload(
             warnings.append("claim_without_evidence_skipped")
             continue
         claim_type = _claim_type(str(item.get("type") or item.get("claim_type") or ""))
-        text = _excerpt(str(item.get("text") or item.get("claim") or ""), 420)
+        text = _clean_llm_claim_text(str(item.get("text") or item.get("claim") or ""), quality_stats)
+        if not text:
+            warnings.append("noisy_llm_claim_skipped")
+            continue
         claim = _claim_record(doc_id, version_id, claim_type, text, evidence_node, source, _confidence(item.get("confidence"), 0.75), index)
         if claim:
             claims.append(claim)
@@ -464,15 +468,24 @@ def _normalize_fact_payload(
         if not evidence_node:
             warnings.append("entity_without_evidence_skipped")
             continue
+        name = _clean_llm_entity_name(str(item.get("name") or ""), quality_stats)
+        if not name:
+            warnings.append("noisy_llm_entity_skipped")
+            continue
+        aliases = [
+            alias
+            for alias in (_clean_llm_entity_name(value, quality_stats, count_noise=False) for value in _string_list(item.get("aliases")))
+            if alias
+        ]
         entity = _entity_record(
             doc_id,
             version_id,
             str(item.get("type") or item.get("entity_type") or "term"),
-            str(item.get("name") or ""),
+            name,
             evidence_node,
             source,
             _confidence(item.get("confidence"), 0.7),
-            aliases=_string_list(item.get("aliases")),
+            aliases=aliases,
         )
         if entity:
             entities.append(entity)
@@ -485,12 +498,17 @@ def _normalize_fact_payload(
         if not evidence_node:
             warnings.append("relation_without_evidence_skipped")
             continue
+        subject = _clean_llm_relation_endpoint(str(item.get("subject") or item.get("subject_name") or ""), quality_stats)
+        obj = _clean_llm_relation_endpoint(str(item.get("object") or item.get("object_name") or ""), quality_stats)
+        if not subject or not obj:
+            warnings.append("noisy_llm_relation_skipped")
+            continue
         relation = _relation_record(
             doc_id,
             version_id,
             str(item.get("type") or item.get("relation_type") or "related_to"),
-            str(item.get("subject") or item.get("subject_name") or ""),
-            str(item.get("object") or item.get("object_name") or ""),
+            subject,
+            obj,
             evidence_node,
             source,
             _confidence(item.get("confidence"), 0.7),
@@ -501,9 +519,14 @@ def _normalize_fact_payload(
     if not claims:
         status = "partial"
         warnings.append("empty_llm_claims")
+    if quality_stats["noise_filtered_count"]:
+        warnings.append("llm_noise_filtered")
+    if quality_stats["long_claim_trimmed_count"]:
+        warnings.append("long_llm_claim_trimmed")
     normalized = _dedupe_facts({"claims": claims, "entities": entities, "relations": relation_rows})
     normalized["status"] = "extracted" if status == "extracted" and normalized["claims"] else "partial"
     normalized["source"] = source
+    normalized["quality_stats"] = quality_stats
     normalized["warnings"] = _unique_strings([*warnings, *_quality_warnings(quality)])
     return normalized
 
@@ -636,6 +659,7 @@ def _merge_table_facts(
     normalized = _dedupe_facts(merged)
     normalized["status"] = facts.get("status") or "partial"
     normalized["source"] = facts.get("source") or "rule"
+    normalized["quality_stats"] = facts.get("quality_stats") or {}
     normalized["warnings"] = _unique_strings([*(facts.get("warnings") or []), *table_facts["warnings"]])
     return normalized
 
@@ -829,6 +853,7 @@ def _build_fact_artifacts(
     entities = facts.get("entities") or []
     relations = facts.get("relations") or []
     warnings = _unique_strings(facts.get("warnings") or [])
+    quality_stats = facts.get("quality_stats") or {}
     low_confidence = sum(1 for item in [*claims, *entities, *relations] if float(item.get("confidence") or 0.0) < 0.5)
     no_evidence = sum(1 for item in [*claims, *entities, *relations] if not item.get("node_id"))
     table_backed = sum(1 for item in [*claims, *entities, *relations] if _is_table_source(str(item.get("source") or "")))
@@ -883,6 +908,9 @@ def _build_fact_artifacts(
         "version_id": version_id,
         "title": card.get("title") or "",
         "source": facts.get("source") or "rule",
+        "llm_used": (facts.get("source") == "llm" and not llm_error),
+        "noise_filtered_count": int(quality_stats.get("noise_filtered_count") or 0),
+        "long_claim_trimmed_count": int(quality_stats.get("long_claim_trimmed_count") or 0),
         "claim_count": len(claims),
         "entity_count": len(entities),
         "relation_count": len(relations),
@@ -1258,6 +1286,52 @@ def _graph_edges(relations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def _replace_long_text(value: str) -> str:
     return _excerpt(compact_whitespace(value), 420)
+
+
+def _clean_llm_claim_text(value: str, stats: Dict[str, int]) -> str:
+    text = compact_whitespace(value)
+    if len(text) < 8:
+        stats["noise_filtered_count"] = stats.get("noise_filtered_count", 0) + 1
+        return ""
+    if re.search(r"(node_id|page_range|evidence packet|证据包)\s*[:：]", text, re.IGNORECASE):
+        stats["noise_filtered_count"] = stats.get("noise_filtered_count", 0) + 1
+        return ""
+    if len(text) > 220:
+        stats["long_claim_trimmed_count"] = stats.get("long_claim_trimmed_count", 0) + 1
+        text = _excerpt(text, 220)
+    return text
+
+
+def _clean_llm_entity_name(value: str, stats: Dict[str, int], *, count_noise: bool = True) -> str:
+    text = compact_whitespace(value).strip(" ,，.。;；:：()（）[]【】")
+    if len(text) < 2:
+        if count_noise:
+            stats["noise_filtered_count"] = stats.get("noise_filtered_count", 0) + 1
+        return ""
+    if len(text) > 48 or re.search(r"[。！？!?；;\n]", text):
+        if count_noise:
+            stats["noise_filtered_count"] = stats.get("noise_filtered_count", 0) + 1
+        return ""
+    if re.fullmatch(r"[A-Za-z]", text):
+        if count_noise:
+            stats["noise_filtered_count"] = stats.get("noise_filtered_count", 0) + 1
+        return ""
+    if len(text) > 28 and not re.search(r"(方法|算法|模型|框架|系统|平台|数据集|指标|任务|场景|机制)$", text):
+        if count_noise:
+            stats["noise_filtered_count"] = stats.get("noise_filtered_count", 0) + 1
+        return ""
+    return text
+
+
+def _clean_llm_relation_endpoint(value: str, stats: Dict[str, int]) -> str:
+    text = compact_whitespace(value).strip(" ,，.。;；:：()（）[]【】")
+    if len(text) < 2:
+        stats["noise_filtered_count"] = stats.get("noise_filtered_count", 0) + 1
+        return ""
+    if len(text) > 80:
+        stats["noise_filtered_count"] = stats.get("noise_filtered_count", 0) + 1
+        return ""
+    return text
 
 
 def _claim_sentences(text: str) -> List[str]:

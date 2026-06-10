@@ -37,6 +37,7 @@ from .facts import extract_facts, fact_search, get_claims, get_entities, get_fac
 from .feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from .ingest import sync_directory
 from .insights import extract_doc_insights
+from .llm import llm_status
 from .knowledge_graph import build_knowledge_graph, export_knowledge_graph, get_graph_neighborhood, get_graph_report
 from .memory import compact_memory, put_memory_gated, remember_task, resume_task, search_memory
 from .quality_baseline import latest_quality_baseline, run_quality_baseline
@@ -80,6 +81,9 @@ def main(argv: Any = None) -> None:
     embed_parser.add_argument("--model", default=None)
     embed_parser.add_argument("--batch-size", type=int, default=16)
     embed_parser.add_argument("--status", action="store_true", help="Only show semantic index status")
+
+    llm_status_parser = subparsers.add_parser("llm-status", help="Show sanitized DeepSeek configuration and connectivity")
+    llm_status_parser.add_argument("--probe", action="store_true", help="Call the configured chat endpoint with a short connectivity probe")
 
     report_parser = subparsers.add_parser("search-report", help="Explain hybrid search candidates and scores")
     report_parser.add_argument("query")
@@ -485,6 +489,8 @@ def main(argv: Any = None) -> None:
         )
     elif args.command == "latest-quality-baseline":
         _print_json(latest_quality_baseline(limit=args.limit))
+    elif args.command == "llm-status":
+        _print_json(llm_status(probe=args.probe))
     elif args.command == "eval-suite":
         if args.suite_command == "create":
             _print_json(
@@ -1081,6 +1087,8 @@ def _quality_baseline_cli_summary(result: dict) -> dict:
     benchmark = result.get("benchmark") or {}
     embedding = result.get("embedding") or {}
     real_embedding = embedding.get("sentence_transformers") or {}
+    llm_status = result.get("llm_status") or {}
+    llm_baseline = result.get("llm_baseline") or {}
     return {
         "schema": result.get("schema"),
         "baseline_id": result.get("baseline_id"),
@@ -1093,6 +1101,11 @@ def _quality_baseline_cli_summary(result: dict) -> dict:
         "best_search_mode": benchmark.get("best_mode_by_score"),
         "best_mode_by_node_recall": benchmark.get("best_mode_by_node_recall"),
         "real_embedding_status": real_embedding.get("status", ""),
+        "llm_baseline_status": llm_baseline.get("status", ""),
+        "llm_reachable": llm_status.get("reachable"),
+        "llm_tree_used": ((llm_baseline.get("tree_search") or {}).get("llm_used_count")),
+        "llm_tree_fallback": ((llm_baseline.get("tree_search") or {}).get("fallback_count")),
+        "llm_fact_used": ((llm_baseline.get("insights_and_facts") or {}).get("llm_used_count")),
         "compare_task_id": ((result.get("tasks") or {}).get("compare") or {}).get("task_id", ""),
         "review_task_id": ((result.get("tasks") or {}).get("review") or {}).get("task_id", ""),
         "claim_graph_id": (result.get("claim_graph") or {}).get("graph_id", ""),

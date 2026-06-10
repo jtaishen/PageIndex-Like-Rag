@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from .config import (
     deepseek_api_key,
@@ -41,6 +42,65 @@ def get_llm_settings() -> Optional[LLMSettings]:
         temperature=deepseek_temperature(),
         max_tokens=deepseek_max_tokens(),
     )
+
+
+def llm_status(*, probe: bool = False) -> Dict[str, Any]:
+    """Return sanitized DeepSeek configuration and optional connectivity state."""
+    started = time.time()
+    resolved = get_llm_settings()
+    if resolved is None:
+        return {
+            "schema": "llm_status.v1",
+            "provider": "deepseek",
+            "configured": False,
+            "reachable": False if probe else None,
+            "probe": probe,
+            "base_url": deepseek_base_url(),
+            "model": deepseek_model(),
+            "temperature": deepseek_temperature(),
+            "max_tokens": deepseek_max_tokens(),
+            "insecure_http": deepseek_base_url().startswith("http://"),
+            "error": "DEEPSEEK_API_KEY is not configured." if probe else "",
+            "response_sample": "",
+            "latency_ms": round((time.time() - started) * 1000, 3),
+        }
+
+    result: Dict[str, Any] = {
+        "schema": "llm_status.v1",
+        "provider": "deepseek",
+        "configured": True,
+        "reachable": None,
+        "probe": probe,
+        "base_url": resolved.base_url,
+        "model": resolved.model,
+        "temperature": resolved.temperature,
+        "max_tokens": resolved.max_tokens,
+        "insecure_http": resolved.base_url.startswith("http://"),
+        "error": "",
+        "response_sample": "",
+    }
+    if not probe:
+        result["latency_ms"] = round((time.time() - started) * 1000, 3)
+        return result
+
+    try:
+        body = _chat_body(
+            resolved,
+            [
+                {"role": "system", "content": "你是一个连接探针。只回复连接状态。"},
+                {"role": "user", "content": "你好，请回复连接正常"},
+            ],
+        )
+        body["temperature"] = 0
+        body["max_tokens"] = min(resolved.max_tokens, 300)
+        content = _chat_completion_content(body, resolved, timeout=30)
+        result["reachable"] = True
+        result["response_sample"] = first_words(compact_whitespace(content), 30)
+    except LLMError as exc:
+        result["reachable"] = False
+        result["error"] = str(exc)
+    result["latency_ms"] = round((time.time() - started) * 1000, 3)
+    return result
 
 
 def generate_grounded_answer(
@@ -105,7 +165,7 @@ def _chat_body(resolved: LLMSettings, messages: List[Dict[str, str]]) -> Dict[st
     return body
 
 
-def _chat_completion_content(body: Dict[str, object], resolved: LLMSettings) -> str:
+def _chat_completion_content(body: Dict[str, object], resolved: LLMSettings, *, timeout: int = 90) -> str:
     request = urllib.request.Request(
         url=f"{resolved.base_url}/chat/completions",
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -117,7 +177,7 @@ def _chat_completion_content(body: Dict[str, object], resolved: LLMSettings) -> 
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=90) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -147,11 +207,11 @@ def _parse_json_object(content: str) -> Dict[str, object]:
         start = text.find("{")
         end = text.rfind("}")
         if start < 0 or end <= start:
-            raise LLMError(f"DeepSeek did not return a JSON object: {content[:200]}")
+            raise LLMError("DeepSeek did not return a JSON object.")
         try:
             payload = json.loads(text[start : end + 1])
         except json.JSONDecodeError as exc:
-            raise LLMError(f"DeepSeek returned invalid JSON: {content[:200]}") from exc
+            raise LLMError("DeepSeek returned invalid JSON.") from exc
     if not isinstance(payload, dict):
         raise LLMError("DeepSeek JSON response is not an object.")
     return payload

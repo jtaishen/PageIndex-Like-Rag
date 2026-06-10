@@ -33,6 +33,7 @@ from .facts import extract_facts, fact_search, get_claims, get_entities, get_fac
 from .feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from .ingest import sync_directory
 from .insights import extract_doc_insights
+from .llm import llm_status
 from .knowledge_graph import (
     build_knowledge_graph,
     export_knowledge_graph,
@@ -103,6 +104,11 @@ if FastMCP is not None:
             model=model,
             batch_size=batch_size,
         )
+
+    @mcp.tool()
+    def kb_get_llm_status(probe: bool = False) -> Dict[str, Any]:
+        """Return sanitized DeepSeek configuration and optional connectivity state."""
+        return llm_status(probe=probe)
 
     @mcp.tool()
     def kb_eval_search(
