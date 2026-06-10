@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -21,7 +22,8 @@ from .parsers import (
     table_warning_count,
 )
 from .tree import build_document_tree, tree_to_dict
-from .utils import first_words, sha256_file, stable_id, write_json, write_jsonl
+from .llm import LLMError, generate_json_object, get_llm_settings
+from .utils import sha256_file, stable_id, write_json, write_jsonl
 
 
 def discover_files(root: Path) -> List[Path]:
@@ -35,7 +37,13 @@ def discover_files(root: Path) -> List[Path]:
     return sorted(files)
 
 
-def sync_directory(path: Path, db_path: Path, force: bool = False, pdf_parser: Optional[str] = None) -> Dict[str, object]:
+def sync_directory(
+    path: Path,
+    db_path: Path,
+    force: bool = False,
+    pdf_parser: Optional[str] = None,
+    doc_card_use_llm: bool = True,
+) -> Dict[str, object]:
     ensure_data_dirs()
     root = path.expanduser().resolve()
     files = discover_files(root)
@@ -51,7 +59,13 @@ def sync_directory(path: Path, db_path: Path, force: bool = False, pdf_parser: O
     db.init_db(conn)
     try:
         for file_path in files:
-            result, error = _sync_file(conn, file_path, force=force, pdf_parser=pdf_parser)
+            result, error = _sync_file(
+                conn,
+                file_path,
+                force=force,
+                pdf_parser=pdf_parser,
+                doc_card_use_llm=doc_card_use_llm,
+            )
             report[result] = int(report[result]) + 1  # type: ignore[arg-type]
             if error:
                 report["errors"].append({"path": str(file_path), "error": error})  # type: ignore[union-attr]
@@ -61,7 +75,13 @@ def sync_directory(path: Path, db_path: Path, force: bool = False, pdf_parser: O
     return report
 
 
-def _sync_file(conn, file_path: Path, force: bool = False, pdf_parser: Optional[str] = None) -> tuple[str, str]:  # type: ignore[no-untyped-def]
+def _sync_file(
+    conn,
+    file_path: Path,
+    force: bool = False,
+    pdf_parser: Optional[str] = None,
+    doc_card_use_llm: bool = True,
+) -> tuple[str, str]:  # type: ignore[no-untyped-def]
     file_hash = sha256_file(file_path)
     stat = file_path.stat()
     parser_name, parser_version = parser_identity_for_path(file_path, pdf_parser=pdf_parser)
@@ -107,7 +127,16 @@ def _sync_file(conn, file_path: Path, force: bool = False, pdf_parser: Optional[
         )
         db.upsert_document(conn, record)
         db.insert_nodes(conn, nodes)
-        artifacts = _write_artifacts(doc_id, version_id, artifact_dir, file_path, file_hash, parsed, nodes)
+        artifacts = _write_artifacts(
+            doc_id,
+            version_id,
+            artifact_dir,
+            file_path,
+            file_hash,
+            parsed,
+            nodes,
+            doc_card_use_llm=doc_card_use_llm,
+        )
         db.insert_document_version(
             conn,
             version_id=version_id,
@@ -152,7 +181,16 @@ def _sync_file(conn, file_path: Path, force: bool = False, pdf_parser: Optional[
         return "failed", error
 
 
-def _write_artifacts(doc_id: str, version_id: str, base: Path, source_path: Path, file_hash: str, parsed, nodes) -> Dict[str, object]:  # type: ignore[no-untyped-def]
+def _write_artifacts(
+    doc_id: str,
+    version_id: str,
+    base: Path,
+    source_path: Path,
+    file_hash: str,
+    parsed,
+    nodes,
+    doc_card_use_llm: bool = True,
+) -> Dict[str, object]:  # type: ignore[no-untyped-def]
     base.mkdir(parents=True, exist_ok=True)
     (base / "raw_text.txt").write_text(parsed.raw_text, encoding="utf-8")
     (base / "body.md").write_text(parsed.body_md, encoding="utf-8")
@@ -225,7 +263,16 @@ def _write_artifacts(doc_id: str, version_id: str, base: Path, source_path: Path
     )
     write_json(base / "tree.json", tree_to_dict(nodes))
     write_jsonl(base / "node_index.jsonl", [asdict(node) for node in nodes])
-    doc_card = _build_doc_card(doc_id, version_id, base, source_path, file_hash, parsed, nodes)
+    doc_card = _build_doc_card(
+        doc_id,
+        version_id,
+        base,
+        source_path,
+        file_hash,
+        parsed,
+        nodes,
+        doc_card_use_llm=doc_card_use_llm,
+    )
     write_json(base / "doc_card.json", doc_card)
     write_json(base / "innovation.json", {"schema": "innovation.v0", "status": "not_extracted", "items": []})
     write_json(
@@ -283,7 +330,16 @@ def _write_failure_report(
     )
 
 
-def _build_doc_card(doc_id: str, version_id: str, base: Path, source_path: Path, file_hash: str, parsed, nodes) -> Dict[str, object]:  # type: ignore[no-untyped-def]
+def _build_doc_card(
+    doc_id: str,
+    version_id: str,
+    base: Path,
+    source_path: Path,
+    file_hash: str,
+    parsed,
+    nodes,
+    doc_card_use_llm: bool = True,
+) -> Dict[str, object]:  # type: ignore[no-untyped-def]
     layout_blocks = _layout_blocks_from(parsed)
     tables = _tables_from(parsed)
     table_content = _table_content_from(parsed, tables, layout_blocks)
@@ -358,7 +414,8 @@ def _build_doc_card(doc_id: str, version_id: str, base: Path, source_path: Path,
         }
         for node in section_nodes[:80]
     ]
-    description = _doc_description(parsed)
+    summaries = _doc_card_summaries(parsed, use_llm=doc_card_use_llm)
+    description = str(summaries.get("description") or _doc_description(parsed))
     return {
         "schema": "doc_card.v0",
         "doc_id": doc_id,
@@ -369,6 +426,11 @@ def _build_doc_card(doc_id: str, version_id: str, base: Path, source_path: Path,
         "file_hash": file_hash,
         "summary": description,
         "description": description,
+        "method_summary": summaries.get("method_summary", ""),
+        "innovation_summary": summaries.get("innovation_summary", ""),
+        "limitation_summary": summaries.get("limitation_summary", ""),
+        "summary_source": summaries.get("summary_source", "rule"),
+        "summary_warnings": summaries.get("summary_warnings", []),
         "authors": parsed.metadata.get("authors") or [],
         "year": parsed.metadata.get("year"),
         "venue": parsed.metadata.get("venue") or "",
@@ -537,6 +599,150 @@ def _doc_description(parsed) -> str:  # type: ignore[no-untyped-def]
     if keywords:
         return _text_excerpt(f"{parsed.title}。关键词：{'、'.join(str(item) for item in keywords)}", 500)
     return _text_excerpt(parsed.raw_text, 500)
+
+
+def _doc_card_summaries(parsed, *, use_llm: bool = True) -> Dict[str, object]:  # type: ignore[no-untyped-def]
+    fallback = _rule_doc_card_summaries(parsed)
+    if not use_llm:
+        return {
+            **fallback,
+            "summary_source": "rule",
+            "summary_warnings": ["deepseek_summary_skipped:disabled"],
+        }
+    if get_llm_settings() is None:
+        return {
+            **fallback,
+            "summary_source": "rule",
+            "summary_warnings": ["deepseek_summary_skipped:not_configured"],
+        }
+    try:
+        payload = generate_json_object(
+            "你是论文知识库的文档卡片摘要器。只返回 JSON object，不要输出正文、证据长摘录或 prompt。",
+            _doc_card_summary_prompt(parsed, fallback),
+            timeout_seconds=20,
+            retry_count=1,
+            operation="doc_card_summary",
+            stage="ingest",
+        )
+    except LLMError as exc:
+        return {
+            **fallback,
+            "summary_source": "rule",
+            "summary_warnings": [f"deepseek_summary_failed:{exc.error_type}"],
+        }
+
+    summaries: Dict[str, object] = dict(fallback)
+    used_llm = False
+    for field, max_chars in _DOC_CARD_SUMMARY_LIMITS.items():
+        value = _short_summary(payload.get(field), max_chars)
+        if value:
+            summaries[field] = value
+            used_llm = True
+    if not used_llm:
+        return {
+            **fallback,
+            "summary_source": "rule",
+            "summary_warnings": ["deepseek_summary_failed:empty_summary"],
+        }
+    summaries["summary_source"] = "deepseek"
+    summaries["summary_warnings"] = []
+    return summaries
+
+
+_DOC_CARD_SUMMARY_LIMITS = {
+    "description": 180,
+    "method_summary": 220,
+    "innovation_summary": 220,
+    "limitation_summary": 220,
+}
+
+
+def _rule_doc_card_summaries(parsed) -> Dict[str, object]:  # type: ignore[no-untyped-def]
+    return {
+        "description": _text_excerpt(_doc_description(parsed), _DOC_CARD_SUMMARY_LIMITS["description"]),
+        "method_summary": _section_excerpt(
+            parsed,
+            ("method", "approach", "方法", "方法设计", "框架", "模型", "算法", "系统设计"),
+            _DOC_CARD_SUMMARY_LIMITS["method_summary"],
+        ),
+        "innovation_summary": _section_excerpt(
+            parsed,
+            ("contribution", "innovation", "novel", "贡献", "创新", "提出", "研究内容"),
+            _DOC_CARD_SUMMARY_LIMITS["innovation_summary"],
+        ),
+        "limitation_summary": _section_excerpt(
+            parsed,
+            ("limitation", "future", "局限", "不足", "未来", "结论"),
+            _DOC_CARD_SUMMARY_LIMITS["limitation_summary"],
+        ),
+        "summary_source": "rule",
+        "summary_warnings": [],
+    }
+
+
+def _doc_card_summary_prompt(parsed, fallback: Dict[str, object]) -> str:  # type: ignore[no-untyped-def]
+    payload = {
+        "instruction": "生成短字段：description、method_summary、innovation_summary、limitation_summary。每项不超过 80 个中文字或 50 个英文词。",
+        "title": parsed.title,
+        "abstract": _text_excerpt(str(parsed.metadata.get("abstract") or ""), 700),
+        "keywords": [str(item) for item in (parsed.metadata.get("keywords") or [])][:12],
+        "section_signals": _section_signals(parsed, limit=10),
+        "fallback": {field: fallback.get(field, "") for field in _DOC_CARD_SUMMARY_LIMITS},
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _section_signals(parsed, limit: int) -> List[Dict[str, str]]:  # type: ignore[no-untyped-def]
+    signals: List[Dict[str, str]] = []
+    current_heading = ""
+    for block in parsed.blocks:
+        heading = str(getattr(block, "heading", "") or "")
+        text = str(getattr(block, "text", "") or "")
+        kind = str(getattr(block, "kind", "") or "")
+        if kind == "heading" and heading:
+            current_heading = heading
+            continue
+        if not text.strip():
+            continue
+        if current_heading or kind in {"abstract", "paragraph"}:
+            signals.append(
+                {
+                    "heading": current_heading or kind,
+                    "text": _text_excerpt(text, 240),
+                }
+            )
+        if len(signals) >= limit:
+            break
+    return signals
+
+
+def _section_excerpt(parsed, heading_terms: Iterable[str], max_chars: int) -> str:  # type: ignore[no-untyped-def]
+    terms = [term.lower() for term in heading_terms]
+    current_heading = ""
+    matched: List[str] = []
+    for block in parsed.blocks:
+        heading = str(getattr(block, "heading", "") or "")
+        text = str(getattr(block, "text", "") or "")
+        kind = str(getattr(block, "kind", "") or "")
+        if kind == "heading" and heading:
+            current_heading = heading
+            continue
+        haystack = f"{current_heading} {text}".lower()
+        if text.strip() and any(term and term in haystack for term in terms):
+            matched.append(text)
+        if matched and len(" ".join(matched)) >= max_chars:
+            break
+    return _text_excerpt(" ".join(matched), max_chars)
+
+
+def _short_summary(value: object, max_chars: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = _text_excerpt(value, max_chars)
+    banned_markers = ("```", "prompt", "原文：", "正文：")
+    if any(marker.lower() in cleaned.lower() for marker in banned_markers):
+        return ""
+    return cleaned
 
 
 def _text_excerpt(text: str, max_chars: int) -> str:

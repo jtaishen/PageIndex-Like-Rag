@@ -34,7 +34,7 @@ from .utils import compact_whitespace, read_json as _read_json, stable_id, uniqu
 
 
 BASELINE_SCHEMA = "quality_baseline.v1"
-CODE_VERSION = "v0.34"
+CODE_VERSION = "v0.35"
 BASELINE_FEATURE_FLAGS = {
     "review_draft_baseline": True,
     "baseline_staleness": True,
@@ -42,6 +42,9 @@ BASELINE_FEATURE_FLAGS = {
     "evidence_first_review_draft": True,
     "baseline_llm_fast_path": True,
     "blocker_limitation_split": True,
+    "parser_quality_comparison": True,
+    "doc_card_summary_fields": True,
+    "document_routing_explanations": True,
 }
 BASELINE_DIR = DATA_DIR / "eval"
 EVAL_SET_DIR = DATA_DIR / "eval_sets"
@@ -79,12 +82,12 @@ def run_quality_baseline(
     if not files:
         warnings.append("empty_corpus")
 
-    primary_sync = sync_directory(root, db_path, force=force, pdf_parser="pypdf")
+    primary_sync = sync_directory(root, db_path, force=force, pdf_parser="pypdf", doc_card_use_llm=False)
     doc_ids = _doc_ids_for_corpus(db_path, root)
     llm_doc_ids = llm_runtime.limit_doc_ids(doc_ids)
     corpus_meta = _corpus_metadata(root, files)
     doc_reports = [_doc_quality_summary(db_path, doc_id) for doc_id in doc_ids]
-    parser_comparison = _parser_comparison(root, pdf_files, primary_sync)
+    parser_comparison = _parser_comparison(root, pdf_files, primary_sync, doc_reports)
     llm = _baseline_llm_probe(llm_runtime)
     fact_audit_before = fact_audit_summary(db_path, doc_ids=doc_ids) if doc_ids else {}
     insights = _prepare_insights_and_facts(
@@ -561,16 +564,29 @@ def _doc_quality_summary(db_path: Path, doc_id: str) -> Dict[str, Any]:
     }
 
 
-def _parser_comparison(root: Path, pdf_files: List[Path], primary_sync: Dict[str, Any]) -> Dict[str, Any]:
+PARSER_QUALITY_METRICS = ["metadata", "abstract", "section", "reference", "table", "figure", "warning"]
+
+
+def _parser_comparison(
+    root: Path,
+    pdf_files: List[Path],
+    primary_sync: Dict[str, Any],
+    primary_documents: List[Dict[str, Any]],
+) -> Dict[str, Any]:
     statuses = pdf_adapter_statuses()
     providers = []
     for provider in ("pypdf", "docling", "grobid"):
-        providers.append(_parser_provider_result(root, pdf_files, provider, statuses, primary_sync))
+        providers.append(_parser_provider_result(root, pdf_files, provider, statuses, primary_sync, primary_documents))
     return {
         "schema": "parser_comparison.v1",
         "pdf_count": len(pdf_files),
+        "quality_metrics": PARSER_QUALITY_METRICS,
         "adapter_statuses": statuses,
         "providers": providers,
+        "summary_by_provider": {
+            str(provider.get("provider")): provider.get("quality_summary", {})
+            for provider in providers
+        },
     }
 
 
@@ -580,23 +596,26 @@ def _parser_provider_result(
     provider: str,
     statuses: Dict[str, Any],
     primary_sync: Dict[str, Any],
+    primary_documents: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     if not pdf_files:
-        return {"provider": provider, "status": "skipped", "reason": "no_pdf_files", "documents": []}
+        return _skipped_parser_provider(provider, "no_pdf_files")
     if provider == "docling" and not (statuses.get("docling") or {}).get("available"):
-        return {"provider": provider, "status": "skipped", "reason": "docling_not_installed", "documents": []}
+        return _skipped_parser_provider(provider, "docling_not_installed")
     if provider == "grobid" and not os.environ.get("GROBID_URL", "").strip():
-        return {"provider": provider, "status": "skipped", "reason": "GROBID_URL_not_configured", "documents": []}
+        return _skipped_parser_provider(provider, "GROBID_URL_not_configured")
     if provider == "pypdf":
+        status = "completed" if int(primary_sync.get("failed") or 0) == 0 else "partial"
         return {
             "provider": provider,
-            "status": "completed" if int(primary_sync.get("failed") or 0) == 0 else "partial",
+            "status": status,
             "sync": _sync_summary(primary_sync),
-            "documents": [],
+            "documents": primary_documents,
+            "quality_summary": _parser_quality_summary(primary_documents, status=status),
         }
     with tempfile.TemporaryDirectory(prefix=f"kb_baseline_{provider}_") as tmp:
         temp_db = Path(tmp) / "kb.sqlite"
-        report = sync_directory(root, temp_db, force=True, pdf_parser=provider)
+        report = sync_directory(root, temp_db, force=True, pdf_parser=provider, doc_card_use_llm=False)
         doc_ids = _doc_ids_for_corpus(temp_db, root)
         documents = [_doc_quality_summary(temp_db, doc_id) for doc_id in doc_ids]
     status = "completed" if int(report.get("failed") or 0) == 0 else "partial"
@@ -605,7 +624,100 @@ def _parser_provider_result(
         "status": status,
         "sync": _sync_summary(report),
         "documents": documents,
+        "quality_summary": _parser_quality_summary(documents, status=status),
     }
+
+
+def _skipped_parser_provider(provider: str, reason: str) -> Dict[str, Any]:
+    return {
+        "provider": provider,
+        "status": "skipped",
+        "reason": reason,
+        "documents": [],
+        "quality_summary": _parser_quality_summary([], status="skipped", reason=reason),
+    }
+
+
+def _parser_quality_summary(
+    documents: List[Dict[str, Any]],
+    *,
+    status: str,
+    reason: str = "",
+) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "schema": "parser_quality_summary.v1",
+        "status": status,
+        "reason": reason,
+        "document_count": len(documents),
+        "metadata": {
+            "avg_score": _avg_metric(documents, "metadata_score"),
+            "min_score": _min_metric(documents, "metadata_score"),
+        },
+        "abstract": {
+            "present_count": sum(1 for doc in documents if not doc.get("missing_abstract")),
+            "missing_count": sum(1 for doc in documents if doc.get("missing_abstract")),
+        },
+        "section": {
+            "total_count": sum(int(doc.get("section_count") or 0) for doc in documents),
+            "avg_count": _avg_metric(documents, "section_count"),
+            "page_only_tree_count": sum(1 for doc in documents if doc.get("page_only_tree")),
+        },
+        "reference": {
+            "total_count": sum(int(doc.get("reference_count") or 0) for doc in documents),
+            "avg_count": _avg_metric(documents, "reference_count"),
+            "avg_score": _avg_metric(documents, "reference_score"),
+        },
+        "table": {
+            "total_count": sum(int(doc.get("table_count") or 0) for doc in documents),
+            "content_count": sum(int(doc.get("table_content_count") or 0) for doc in documents),
+            "avg_parse_score": _avg_metric(documents, "table_parse_score"),
+        },
+        "figure": {
+            "total_count": sum(int(doc.get("figure_count") or 0) for doc in documents),
+            "avg_count": _avg_metric(documents, "figure_count"),
+        },
+        "warning": {
+            "total_count": sum(int(doc.get("warning_count") or 0) for doc in documents),
+            "documents_with_warnings": sum(1 for doc in documents if int(doc.get("warning_count") or 0) > 0),
+            "items": _parser_warning_items(documents),
+        },
+    }
+    return summary
+
+
+def _avg_metric(documents: List[Dict[str, Any]], field: str) -> float:
+    values = [_numeric_metric(doc.get(field)) for doc in documents]
+    values = [value for value in values if value is not None]
+    if not values:
+        return 0.0
+    return round(sum(values) / len(values), 3)
+
+
+def _min_metric(documents: List[Dict[str, Any]], field: str) -> float:
+    values = [_numeric_metric(doc.get(field)) for doc in documents]
+    values = [value for value in values if value is not None]
+    if not values:
+        return 0.0
+    return round(min(values), 3)
+
+
+def _numeric_metric(value: object) -> Optional[float]:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _parser_warning_items(documents: List[Dict[str, Any]]) -> List[str]:
+    items: List[str] = []
+    seen = set()
+    for doc in documents:
+        for warning in doc.get("warnings") or []:
+            text = str(warning)
+            if text and text not in seen:
+                seen.add(text)
+                items.append(text)
+    return items[:12]
 
 
 def _baseline_llm_probe(runtime: LLMBaselineRuntime) -> Dict[str, Any]:

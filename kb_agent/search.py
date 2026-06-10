@@ -97,8 +97,12 @@ def search_documents(
         if mode == "hybrid":
             rows = _search_documents_hybrid_conn(conn, query, top_k)
             if rows:
-                return _tag_auto_docs(rows, auto_resolution)
-        return _tag_auto_docs([dict(row) for row in _search_documents_fts_conn(conn, query, top_k)], auto_resolution)
+                return _tag_auto_docs(
+                    _augment_documents_with_routing(conn, rows, query, top_k=top_k),
+                    auto_resolution,
+                )
+        docs = [dict(row) for row in _search_documents_fts_conn(conn, query, top_k)]
+        return _tag_auto_docs(_augment_documents_with_routing(conn, docs, query, top_k=top_k), auto_resolution)
     finally:
         conn.close()
 
@@ -122,6 +126,8 @@ def build_search_report(
         trace = tree_search_for_query(db_path, query, doc_id=doc_id, top_k=top_k, use_llm=False, search_mode="hybrid")
         trace["auto_resolution"] = auto_resolution or {}
         trace["resolved_search_mode"] = mode
+        docs = trace.get("routed_documents", []) or _docs_from_tree_results(trace.get("results", []))
+        docs, routing = _augment_documents_with_routing_path(db_path, docs, query, top_k=top_k, doc_id=doc_id)
         return {
             "schema": "search_report.v1",
             "query": query,
@@ -133,7 +139,8 @@ def build_search_report(
             "warnings": _unique_strings([*trace.get("warnings", []), *((auto_resolution or {}).get("warnings") or [])]),
             "auto_resolution": auto_resolution or {},
             "embedding_status": _safe_embedding_status(db_path),
-            "documents": trace.get("routed_documents", []) or _docs_from_tree_results(trace.get("results", [])),
+            "documents": docs,
+            "document_routing": routing,
             "results": trace.get("results", []),
             "tree_search_trace": trace,
             "fact_matches": _fact_matches(db_path, query, doc_id, top_k=5),
@@ -144,6 +151,8 @@ def build_search_report(
         results = _search_nodes_conn(conn, query, doc_id=doc_id, top_k=top_k, search_mode=mode)
         warnings = _search_report_warnings(results, mode, db_path)
         docs = _docs_for_results(conn, results)
+        docs = _augment_documents_with_routing(conn, docs, query, top_k=top_k, doc_id=doc_id, results=results)
+        routing = _document_routing_report(docs)
     finally:
         conn.close()
     return {
@@ -158,6 +167,7 @@ def build_search_report(
         "auto_resolution": auto_resolution or {},
         "embedding_status": _safe_embedding_status(db_path),
         "documents": docs,
+        "document_routing": routing,
         "results": [result.__dict__ for result in results],
         "fact_matches": _fact_matches(db_path, query, doc_id, top_k=5),
     }
@@ -629,6 +639,270 @@ def _docs_for_results(conn, results: List[SearchResult]) -> List[Dict[str, objec
     for result in results:
         matches[result.doc_id] += 1
     return [{**dict(row), "node_matches": matches.get(row["doc_id"], 0)} for row in rows]
+
+
+ROUTING_FIELD_WEIGHTS = {
+    "title": 3.0,
+    "abstract": 2.5,
+    "keywords": 2.0,
+    "description": 1.6,
+    "method_summary": 1.4,
+    "innovation_summary": 1.2,
+    "limitation_summary": 1.0,
+}
+
+
+def _augment_documents_with_routing_path(
+    db_path: Path,
+    docs: List[Dict[str, object]],
+    query: str,
+    *,
+    top_k: int,
+    doc_id: Optional[str] = None,
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+    conn = db.connect(db_path)
+    db.init_db(conn)
+    try:
+        augmented = _augment_documents_with_routing(conn, docs, query, top_k=top_k, doc_id=doc_id)
+        return augmented, _document_routing_report(augmented)
+    finally:
+        conn.close()
+
+
+def _augment_documents_with_routing(
+    conn,
+    docs: List[Dict[str, object]],
+    query: str,
+    *,
+    top_k: int,
+    doc_id: Optional[str] = None,
+    results: Optional[List[SearchResult]] = None,
+) -> List[Dict[str, object]]:  # type: ignore[no-untyped-def]
+    existing: Dict[str, Dict[str, object]] = {}
+    existing_rank: Dict[str, int] = {}
+    for rank, doc in enumerate(docs, start=1):
+        current = dict(doc)
+        current_doc_id = str(current.get("doc_id") or "")
+        if not current_doc_id:
+            continue
+        existing[current_doc_id] = current
+        existing_rank[current_doc_id] = rank
+
+    node_signals = _node_route_signals(results or [])
+    route_rows = _doc_card_route_rows(conn, doc_id=doc_id)
+    routed: Dict[str, Dict[str, object]] = {}
+    for row in route_rows:
+        current_doc_id = str(row.get("doc_id") or "")
+        if not current_doc_id:
+            continue
+        base = existing.get(current_doc_id, dict(row))
+        card = _json_dict(row.get("card_json"))
+        merged = _merge_doc_card_fields(base, card)
+        route = _document_route_explanation(merged, query, node_signals.get(current_doc_id))
+        if current_doc_id not in existing and route["routing_score"] <= 0:
+            continue
+        merged.update(route)
+        routed[current_doc_id] = merged
+
+    for current_doc_id, doc in existing.items():
+        if current_doc_id in routed:
+            continue
+        route = _document_route_explanation(doc, query, node_signals.get(current_doc_id))
+        doc.update(route)
+        routed[current_doc_id] = doc
+
+    items = list(routed.values())
+    items.sort(
+        key=lambda item: (
+            -float(item.get("routing_score") or 0.0),
+            existing_rank.get(str(item.get("doc_id") or ""), 10_000),
+            str(item.get("title") or ""),
+        )
+    )
+    return items[:top_k]
+
+
+def _doc_card_route_rows(conn, doc_id: Optional[str] = None) -> List[Dict[str, object]]:  # type: ignore[no-untyped-def]
+    params: List[object] = []
+    doc_filter = ""
+    if doc_id:
+        doc_filter = "AND d.doc_id = ?"
+        params.append(doc_id)
+    rows = conn.execute(
+        f"""
+        SELECT d.doc_id, d.title, d.path, d.file_type, d.summary, d.abstract, d.keywords,
+               c.card_json
+        FROM documents d
+        LEFT JOIN doc_cards c ON c.doc_id = d.doc_id
+        WHERE d.status = 'ready' {doc_filter}
+        """,
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _merge_doc_card_fields(doc: Dict[str, object], card: Dict[str, object]) -> Dict[str, object]:
+    merged = dict(doc)
+    merged.pop("card_json", None)
+    for field in ("description", "method_summary", "innovation_summary", "limitation_summary", "summary_source"):
+        value = card.get(field)
+        if value and not merged.get(field):
+            merged[field] = value
+    if card.get("keywords") and not merged.get("keywords"):
+        merged["keywords"] = card.get("keywords")
+    if card.get("abstract") and not merged.get("abstract"):
+        merged["abstract"] = card.get("abstract")
+    return merged
+
+
+def _document_route_explanation(
+    doc: Dict[str, object],
+    query: str,
+    node_signal: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    terms = _routing_terms(query)
+    fields = _routing_fields(doc)
+    field_hits: Dict[str, List[str]] = {}
+    score = 0.0
+    for field, text in fields.items():
+        hits = _matching_terms(text, terms)
+        if not hits:
+            continue
+        field_hits[field] = hits
+        score += ROUTING_FIELD_WEIGHTS.get(field, 1.0) * max(1, len(hits))
+
+    selection_reasons = [f"field:{field}" for field in field_hits]
+    node_matches = 0
+    if node_signal:
+        node_matches = int(node_signal.get("node_matches") or 0)
+        if node_matches:
+            score += min(3.0, 0.7 * node_matches)
+            reason = str(node_signal.get("rank_reason") or "node_match")
+            selection_reasons.append(f"node:{reason}")
+        hybrid_score = _optional_float(node_signal.get("hybrid_score") or node_signal.get("score"))
+        if hybrid_score is not None and hybrid_score > 0:
+            score += min(2.0, hybrid_score * 40.0)
+
+    fallback_reason = ""
+    if field_hits and not node_matches:
+        fallback_reason = "doc_card_field_match"
+    elif node_matches and not field_hits:
+        fallback_reason = "node_match_without_doc_card_hit"
+    elif not field_hits and not node_matches:
+        fallback_reason = "no_route_signal"
+
+    return {
+        "field_hits": field_hits,
+        "routing_score": round(score, 3),
+        "selection_reasons": _unique_strings(selection_reasons),
+        "fallback_reason": fallback_reason,
+    }
+
+
+def _document_routing_report(docs: List[Dict[str, object]]) -> Dict[str, object]:
+    return {
+        "schema": "document_routing.v1",
+        "count": len(docs),
+        "items": [
+            {
+                "doc_id": item.get("doc_id", ""),
+                "title": item.get("title", ""),
+                "field_hits": item.get("field_hits") or {},
+                "routing_score": item.get("routing_score", 0.0),
+                "selection_reasons": item.get("selection_reasons") or [],
+                "fallback_reason": item.get("fallback_reason", ""),
+                "node_matches": item.get("node_matches", 0),
+                "rank_reason": item.get("rank_reason", ""),
+            }
+            for item in docs
+        ],
+    }
+
+
+def _node_route_signals(results: List[SearchResult]) -> Dict[str, Dict[str, object]]:
+    signals: Dict[str, Dict[str, object]] = {}
+    for result in results:
+        item = signals.setdefault(
+            result.doc_id,
+            {
+                "node_matches": 0,
+                "rank_reason": result.rank_reason,
+                "score": result.score,
+                "hybrid_score": result.hybrid_score,
+            },
+        )
+        item["node_matches"] = int(item["node_matches"]) + 1
+        current_score = _optional_float(item.get("hybrid_score") or item.get("score")) or 0.0
+        next_score = _optional_float(result.hybrid_score or result.score) or 0.0
+        if next_score >= current_score:
+            item["rank_reason"] = result.rank_reason
+            item["score"] = result.score
+            item["hybrid_score"] = result.hybrid_score
+    return signals
+
+
+def _routing_fields(doc: Dict[str, object]) -> Dict[str, str]:
+    return {
+        "title": str(doc.get("title") or ""),
+        "abstract": str(doc.get("abstract") or ""),
+        "keywords": _keywords_text(doc.get("keywords")),
+        "description": str(doc.get("description") or doc.get("summary") or ""),
+        "method_summary": str(doc.get("method_summary") or ""),
+        "innovation_summary": str(doc.get("innovation_summary") or ""),
+        "limitation_summary": str(doc.get("limitation_summary") or ""),
+    }
+
+
+def _routing_terms(query: str) -> List[str]:
+    terms = list(_fallback_terms(query))
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,}", query):
+        terms.append(token)
+        if re.fullmatch(r"[\u4e00-\u9fff]{3,}", token):
+            terms.extend(token[index : index + 2] for index in range(0, len(token) - 1))
+    result: List[str] = []
+    seen = set()
+    for term in terms:
+        cleaned = term.strip().lower()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        result.append(cleaned)
+    return result
+
+
+def _matching_terms(text: str, terms: List[str]) -> List[str]:
+    haystack = text.lower()
+    matches = []
+    for term in terms:
+        if term and term in haystack:
+            matches.append(term)
+    return matches[:6]
+
+
+def _keywords_text(value: object) -> str:
+    if isinstance(value, list):
+        return " ".join(str(item) for item in value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return value
+        if isinstance(parsed, list):
+            return " ".join(str(item) for item in parsed)
+        return value
+    return ""
+
+
+def _json_dict(value: object) -> Dict[str, object]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _docs_from_tree_results(results: object) -> List[Dict[str, object]]:

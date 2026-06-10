@@ -873,6 +873,24 @@ uv run python -m compileall -q kb_agent
 git diff --check
 ```
 
+## v0.35 解析质量与文档路由增强
+
+v0.35 不新增数据库 schema，不接真实 embedding，也不改前端。`quality-baseline` 的 `parser_comparison` 现在为 `pypdf`、`docling`、`grobid` 输出统一的 `parser_quality_summary.v1`，覆盖 metadata、abstract、section、reference、table、figure、warning 指标；Docling 未安装或 `GROBID_URL` 未配置时只记录 skipped reason。
+
+`doc_card.json` 新增短字段 `method_summary`、`innovation_summary`、`limitation_summary`、`summary_source` 和 `summary_warnings`。DeepSeek 可用时生成短摘要；不可用、超时或返回异常时保留规则摘要，不保存 prompt、长 evidence 或模型原文。
+
+`search`/`docs`/`search-report` 的文档选择会综合 title、abstract、keywords、description、方法/创新/局限摘要以及 FTS/hybrid 节点信号。`search-report` 新增 `document_routing`，展示字段命中、路由分数、入选原因和 fallback reason，方便定位“为什么选这篇文档”。
+
+验证：
+
+```bash
+uv run python -m unittest discover -s tests
+uv run python -m compileall -q kb_agent
+git diff --check
+uv run --extra pdf python -m kb_agent.cli quality-baseline articles --top-k 3
+uv run python -m kb_agent.cli latest-quality-baseline --real-only --limit 1
+```
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：

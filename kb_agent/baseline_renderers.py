@@ -54,7 +54,16 @@ def baseline_markdown(report: Dict[str, Any]) -> str:
         )
     lines.extend(["", "## Parser Comparison"])
     for provider in (report.get("parser_comparison") or {}).get("providers") or []:
-        lines.append(f"- `{provider.get('provider')}` status=`{provider.get('status')}` reason=`{provider.get('reason', '')}`")
+        summary = provider.get("quality_summary") or {}
+        lines.append(
+            f"- `{provider.get('provider')}` status=`{provider.get('status')}` reason=`{provider.get('reason', '')}` "
+            f"docs=`{summary.get('document_count', 0)}` metadata_avg=`{(summary.get('metadata') or {}).get('avg_score', 0.0)}` "
+            f"sections=`{(summary.get('section') or {}).get('total_count', 0)}` "
+            f"refs=`{(summary.get('reference') or {}).get('total_count', 0)}` "
+            f"tables=`{(summary.get('table') or {}).get('total_count', 0)}` "
+            f"figures=`{(summary.get('figure') or {}).get('total_count', 0)}` "
+            f"warnings=`{(summary.get('warning') or {}).get('total_count', 0)}`"
+        )
     lines.extend(["", "## LLM Runtime"])
     for name, stage in ((report.get("llm_baseline") or {}).get("stage_summary") or {}).items():
         if not isinstance(stage, dict):
@@ -141,9 +150,20 @@ def baseline_html(report: Dict[str, Any]) -> str:
     )
     parser_html = html_table(
         "Parser Comparison",
-        ["Provider", "Status", "Reason"],
+        ["Provider", "Status", "Reason", "Docs", "Metadata", "Sections", "Refs", "Tables", "Figures", "Warnings"],
         [
-            [item.get("provider", ""), item.get("status", ""), item.get("reason", "")]
+            [
+                item.get("provider", ""),
+                item.get("status", ""),
+                item.get("reason", ""),
+                (item.get("quality_summary") or {}).get("document_count", 0),
+                ((item.get("quality_summary") or {}).get("metadata") or {}).get("avg_score", 0.0),
+                ((item.get("quality_summary") or {}).get("section") or {}).get("total_count", 0),
+                ((item.get("quality_summary") or {}).get("reference") or {}).get("total_count", 0),
+                ((item.get("quality_summary") or {}).get("table") or {}).get("total_count", 0),
+                ((item.get("quality_summary") or {}).get("figure") or {}).get("total_count", 0),
+                ((item.get("quality_summary") or {}).get("warning") or {}).get("total_count", 0),
+            ]
             for item in (report.get("parser_comparison") or {}).get("providers") or []
         ],
     )

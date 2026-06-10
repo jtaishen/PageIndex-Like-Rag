@@ -123,6 +123,10 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(card["title"], "Agent Memory")
             self.assertIn("artifact_dir", card)
             self.assertGreater(card["node_count"], 0)
+            self.assertIn("method_summary", card)
+            self.assertIn("innovation_summary", card)
+            self.assertIn("limitation_summary", card)
+            self.assertIn(card["summary_source"], {"rule", "deepseek"})
 
             listing = list_artifacts(db_path, str(doc_id))
             names = {item["name"] for item in listing["artifacts"]}
@@ -784,7 +788,7 @@ class IngestSearchTest(unittest.TestCase):
                 result = run_quality_baseline(db_path, papers, use_llm=False, top_k=3)
 
             self.assertEqual(result["schema"], "quality_baseline.v1")
-            self.assertEqual(result["code_version"], "v0.34")
+            self.assertEqual(result["code_version"], "v0.35")
             self.assertTrue(result["git_commit"])
             self.assertTrue(result["feature_flags"]["review_draft_baseline"])
             self.assertTrue(result["is_current_code_baseline"])
@@ -813,6 +817,26 @@ class IngestSearchTest(unittest.TestCase):
             providers = {item["provider"]: item for item in result["parser_comparison"]["providers"]}
             self.assertEqual(providers["docling"]["status"], "skipped")
             self.assertEqual(providers["grobid"]["status"], "skipped")
+            self.assertEqual(result["parser_comparison"]["quality_metrics"], [
+                "metadata",
+                "abstract",
+                "section",
+                "reference",
+                "table",
+                "figure",
+                "warning",
+            ])
+            pypdf_summary = providers["pypdf"]["quality_summary"]
+            self.assertEqual(pypdf_summary["schema"], "parser_quality_summary.v1")
+            self.assertEqual(pypdf_summary["status"], "skipped")
+            self.assertEqual(pypdf_summary["reason"], "no_pdf_files")
+            self.assertEqual(pypdf_summary["document_count"], 0)
+            for metric_name in ("metadata", "abstract", "section", "reference", "table", "figure", "warning"):
+                self.assertIn(metric_name, pypdf_summary)
+            self.assertEqual(providers["docling"]["quality_summary"]["status"], "skipped")
+            self.assertEqual(providers["docling"]["quality_summary"]["reason"], "no_pdf_files")
+            self.assertEqual(providers["grobid"]["quality_summary"]["status"], "skipped")
+            self.assertEqual(providers["grobid"]["quality_summary"]["reason"], "no_pdf_files")
 
             html = Path(result["html_path"]).read_text(encoding="utf-8")
             self.assertIn("Quality Baseline", html)
@@ -860,6 +884,105 @@ class IngestSearchTest(unittest.TestCase):
             self.assertIn("run_kind", latest_stdout)
             self.assertIn("llm_stage_status", latest_stdout)
 
+    def test_quality_baseline_parser_comparison_summarizes_pdf_providers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "paper.pdf").write_bytes(b"%PDF fake")
+
+            with mock.patch("kb_agent.parsers._parse_pypdf_pdf", return_value=_fake_pdf_document("pypdf")), mock.patch(
+                "kb_agent.quality_baseline.importlib.util.find_spec", return_value=None
+            ), mock.patch.dict(os.environ, {"GROBID_URL": ""}):
+                result = run_quality_baseline(db_path, papers, use_llm=False, top_k=2)
+
+            providers = {item["provider"]: item for item in result["parser_comparison"]["providers"]}
+            pypdf_summary = providers["pypdf"]["quality_summary"]
+            self.assertEqual(providers["pypdf"]["status"], "completed")
+            self.assertEqual(pypdf_summary["schema"], "parser_quality_summary.v1")
+            self.assertEqual(pypdf_summary["document_count"], 1)
+            self.assertEqual(pypdf_summary["abstract"]["present_count"], 1)
+            self.assertGreaterEqual(pypdf_summary["section"]["total_count"], 1)
+            self.assertGreaterEqual(pypdf_summary["reference"]["total_count"], 1)
+            self.assertGreaterEqual(pypdf_summary["table"]["total_count"], 1)
+            self.assertGreaterEqual(pypdf_summary["figure"]["total_count"], 1)
+            self.assertIn("warning", pypdf_summary)
+            self.assertEqual(providers["docling"]["quality_summary"]["reason"], "docling_not_installed")
+            self.assertEqual(providers["grobid"]["quality_summary"]["reason"], "GROBID_URL_not_configured")
+
+    def test_doc_card_uses_deepseek_short_summaries_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "summary.txt").write_text(
+                "# Summary Agent\n\n"
+                "摘要：本文研究文档卡片摘要增强。\n\n"
+                "关键词：文档卡片；摘要增强\n\n"
+                "## Method\n\n"
+                "The method builds concise card summaries from structured paper signals.\n\n"
+                "## Limitation\n\n"
+                "It still needs broader parser coverage.\n",
+                encoding="utf-8",
+            )
+            llm_payload = {
+                "description": "研究文档卡片摘要增强的短描述。",
+                "method_summary": "用结构化论文信号生成短方法摘要。",
+                "innovation_summary": "将方法、创新和局限压缩进可路由字段。",
+                "limitation_summary": "仍需覆盖更多解析器。",
+            }
+
+            with mock.patch("kb_agent.ingest.get_llm_settings", return_value=object()), mock.patch(
+                "kb_agent.ingest.generate_json_object", return_value=llm_payload
+            ) as generate:
+                report = sync_directory(papers, db_path)
+
+            self.assertEqual(report["indexed"], 1)
+            doc_id = str(search_documents(db_path, "摘要增强", top_k=1)[0]["doc_id"])
+            card = get_doc_card(db_path, doc_id)
+            self.assertEqual(card["description"], llm_payload["description"])
+            self.assertEqual(card["method_summary"], llm_payload["method_summary"])
+            self.assertEqual(card["innovation_summary"], llm_payload["innovation_summary"])
+            self.assertEqual(card["limitation_summary"], llm_payload["limitation_summary"])
+            self.assertEqual(card["summary_source"], "deepseek")
+            self.assertEqual(card["summary_warnings"], [])
+            serialized = json.dumps(card, ensure_ascii=False)
+            self.assertNotIn("prompt", serialized.lower())
+            self.assertNotIn("model_raw", serialized.lower())
+            self.assertLessEqual(len(card["description"]), 180)
+            generate.assert_called_once()
+
+    def test_doc_card_falls_back_to_rule_summary_when_deepseek_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "fallback.txt").write_text(
+                "# Fallback Agent\n\n"
+                "摘要：本文研究规则兜底的文档卡片摘要。\n\n"
+                "关键词：文档卡片；规则兜底\n\n"
+                "## 方法设计\n\n"
+                "系统在模型失败时保留规则摘要。\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch("kb_agent.ingest.get_llm_settings", return_value=object()), mock.patch(
+                "kb_agent.ingest.generate_json_object",
+                side_effect=LLMError("DeepSeek API request failed.", error_type="request_failed"),
+            ):
+                report = sync_directory(papers, db_path)
+
+            self.assertEqual(report["indexed"], 1)
+            doc_id = str(search_documents(db_path, "规则兜底", top_k=1)[0]["doc_id"])
+            card = get_doc_card(db_path, doc_id)
+            self.assertIn("规则兜底", card["description"])
+            self.assertEqual(card["summary_source"], "rule")
+            self.assertIn("deepseek_summary_failed:request_failed", card["summary_warnings"])
+            self.assertIn("模型失败", card["method_summary"])
+
     def test_latest_quality_baseline_marks_old_reports_stale(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -894,7 +1017,7 @@ class IngestSearchTest(unittest.TestCase):
                     {
                         "schema": "quality_baseline.v1",
                         "baseline_id": "older-commit",
-                        "code_version": "v0.34",
+                        "code_version": "v0.35",
                         "git_commit": "0000000000000000000000000000000000000000",
                         "feature_flags": {"review_draft_baseline": True},
                         "corpus_path": str((Path.cwd() / "articles").resolve()),
@@ -2228,6 +2351,65 @@ class IngestSearchTest(unittest.TestCase):
             fts_results = search_nodes(db_path, "动态角色", top_k=3, search_mode="fts")
             self.assertGreaterEqual(len(fts_results), 1)
             self.assertEqual(fts_results[0].doc_id, doc_id)
+
+    def test_search_report_explains_doc_card_routing_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "abstract_hit.txt").write_text(
+                "# Abstract Hit\n\n"
+                "摘要：本文研究路由钩子在摘要字段中的召回能力。\n\n"
+                "关键词：摘要命中；路由\n\n"
+                "## 方法\n\n"
+                "系统使用常规节点检索返回证据。\n",
+                encoding="utf-8",
+            )
+            (papers / "card_hit.txt").write_text(
+                "# Card Hit\n\n"
+                "摘要：本文研究普通文档选择。\n\n"
+                "关键词：文档选择\n\n"
+                "## 方法\n\n"
+                "系统使用普通字段描述候选文档。\n",
+                encoding="utf-8",
+            )
+            report = sync_directory(papers, db_path)
+            self.assertEqual(report["indexed"], 2)
+
+            conn = db.connect(db_path)
+            db.init_db(conn)
+            try:
+                rows = conn.execute("SELECT doc_id, path FROM documents").fetchall()
+                card_doc_id = next(str(row["doc_id"]) for row in rows if str(row["path"]).endswith("card_hit.txt"))
+                version = db.get_document_version(conn, card_doc_id)
+                self.assertIsNotNone(version)
+                card = db.get_doc_card(conn, card_doc_id)
+                self.assertIsNotNone(card)
+                card = dict(card or {})
+                card["description"] = "路由钩子只出现在 Doc Card 描述字段。"
+                card["method_summary"] = "通过文档卡片摘要补足候选路由。"
+                db.upsert_doc_card(conn, card_doc_id, str(version["version_id"]), card)
+                conn.commit()
+            finally:
+                conn.close()
+
+            docs = search_documents(db_path, "路由钩子", top_k=5, search_mode="hybrid")
+            self.assertIn(card_doc_id, {str(item["doc_id"]) for item in docs})
+            routed_card_doc = next(item for item in docs if str(item["doc_id"]) == card_doc_id)
+            self.assertGreater(routed_card_doc["routing_score"], 0)
+            self.assertIn("description", routed_card_doc["field_hits"])
+
+            search_report = build_search_report(db_path, "路由钩子", top_k=5, search_mode="hybrid")
+            self.assertIn("document_routing", search_report)
+            routing_items = {str(item["doc_id"]): item for item in search_report["document_routing"]["items"]}
+            self.assertIn(card_doc_id, routing_items)
+            card_route = routing_items[card_doc_id]
+            self.assertIn("description", card_route["field_hits"])
+            self.assertIn("method_summary", card_route["field_hits"])
+            self.assertGreater(card_route["routing_score"], 0)
+            self.assertTrue(card_route["selection_reasons"])
+            self.assertIn("fallback_reason", card_route)
 
     def test_hybrid_search_uses_vector_candidates(self) -> None:
         class FakeProvider:
