@@ -784,6 +784,31 @@ uv run python -m kb_agent.cli eval-dashboard --format html
 
 `draft-review` 入口现在会再次压缩并均衡 section evidence：同一 `doc_id/node_id`、重复 `node_path + summary` 的证据只保留最高质量项，并优先保留跨文档证据。`small_corpus` 仍作为两篇论文验收集的背景限制展示，不会被伪装成代码失败。
 
+## v0.30 综述草稿证据覆盖修复与当前 Commit 基线复验
+
+v0.30 继续修真实 baseline 暴露的草稿质量问题，不新增大模块。`code_version` 升级为 `v0.30`；`draft-review` 的 LLM prompt 明确要求每个自然段至少包含一个 `[E#]` 证据标记，无法由 evidence 支撑的内容必须进入 `unsupported_claims`，不能留在正文里。生成后还会做一次正文归一化：无证据长段落会被移出正文，写入 `paragraph_support_report` 和 warning，不会自动伪造引用。
+
+推荐真实验收：
+
+```bash
+uv run --extra pdf python -m kb_agent.cli quality-baseline articles --with-llm --top-k 3 --llm-timeout-seconds 20 --llm-stage-timeout-seconds 60 --llm-max-docs 2
+uv run python -m kb_agent.cli latest-quality-baseline --real-only --limit 1
+uv run python -m kb_agent.cli eval-dashboard --format html
+```
+
+重点查看：
+
+- `baseline_git_commit_short`
+- `current_git_commit_short`
+- `is_current_code_baseline`
+- `baseline_stale_reason`
+- `unsupported_paragraph_count`
+- `removed_paragraph_count`
+- `optional_unused_evidence_count`
+- `citation_coverage_score`
+
+提交代码后需要重新跑一次真实 baseline。因为 `quality-baseline` 会记录运行时的 `git_commit`，如果先跑 baseline 再提交，`latest-quality-baseline --real-only` 会正确显示 `baseline_stale_reason=older_git_commit`，这表示报告来自旧 commit，不能代表当前提交。v0.30 还会把未使用 evidence 区分为硬阻塞和 `optional_unused_evidence`：没有缺引用、没有无证据段落时，冗余 evidence 只作为可选清理项，不再进入 `top_review_blockers`。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：

@@ -1168,6 +1168,8 @@ def _quality_baseline_cli_summary(result: dict) -> dict:
         "citation_coverage_score": review_draft.get("citation_coverage_score", 0.0),
         "missing_ref_count": review_draft.get("missing_ref_count", 0),
         "unsupported_paragraph_count": review_draft.get("unsupported_paragraph_count", 0),
+        "optional_unused_evidence_count": review_draft.get("optional_unused_evidence_count", 0),
+        "removed_paragraph_count": (review_draft.get("paragraph_support_report") or {}).get("removed_paragraph_count", 0),
         "drafted_section_count": review_draft.get("drafted_section_count", 0),
         "skipped_section_count": review_draft.get("skipped_section_count", 0),
         "review_draft_path": review_draft.get("review_draft_path", ""),

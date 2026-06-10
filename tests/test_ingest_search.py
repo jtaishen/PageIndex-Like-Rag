@@ -784,7 +784,7 @@ class IngestSearchTest(unittest.TestCase):
                 result = run_quality_baseline(db_path, papers, use_llm=False, top_k=3)
 
             self.assertEqual(result["schema"], "quality_baseline.v1")
-            self.assertEqual(result["code_version"], "v0.29")
+            self.assertEqual(result["code_version"], "v0.30")
             self.assertTrue(result["git_commit"])
             self.assertTrue(result["feature_flags"]["review_draft_baseline"])
             self.assertTrue(result["is_current_code_baseline"])
@@ -834,6 +834,8 @@ class IngestSearchTest(unittest.TestCase):
             self.assertIn("llm_compare_dimension_success_rate", filtered_latest["items"][0])
             self.assertIn("hybrid_embedding_provider", filtered_latest["items"][0])
             self.assertIn("real_embedding_node_coverage", filtered_latest["items"][0])
+            self.assertIn("baseline_git_commit_short", filtered_latest["items"][0])
+            self.assertIn("current_git_commit_short", filtered_latest["items"][0])
             self.assertTrue(filtered_latest["items"][0]["is_current_code_baseline"])
             self.assertEqual(filtered_latest["items"][0]["baseline_stale_reason"], "")
             real_filtered = latest_quality_baseline(limit=1, corpus=papers, real_only=True)
@@ -882,6 +884,32 @@ class IngestSearchTest(unittest.TestCase):
             self.assertFalse(item["is_current_code_baseline"])
             self.assertEqual(item["baseline_stale_reason"], "missing_review_draft_baseline")
             self.assertIn("review_draft_skipped", item["top_review_blockers"])
+
+            older_commit_path = eval_dir / "quality_baseline_older_commit.json"
+            older_commit_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "quality_baseline.v1",
+                        "baseline_id": "older-commit",
+                        "code_version": "v0.30",
+                        "git_commit": "0000000000000000000000000000000000000000",
+                        "feature_flags": {"review_draft_baseline": True},
+                        "corpus_path": str((Path.cwd() / "articles").resolve()),
+                        "is_real_corpus": True,
+                        "tasks": {"review_draft": {"status": "partial"}},
+                        "created_at": time.time() + 1,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch("kb_agent.quality_baseline.BASELINE_DIR", eval_dir):
+                latest = latest_quality_baseline(limit=1, real_only=True)
+            item = latest["items"][0]
+            self.assertFalse(item["is_current_code_baseline"])
+            self.assertEqual(item["baseline_stale_reason"], "older_git_commit")
+            self.assertEqual(item["baseline_git_commit_short"], "0000000")
+            self.assertTrue(item["current_git_commit_short"])
 
     def test_quality_baseline_with_llm_records_sanitized_llm_comparison(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1532,6 +1560,90 @@ class IngestSearchTest(unittest.TestCase):
             self.assertNotIn("excerpt:", captured["user"])
             self.assertFalse(result["citation_check"]["missing_refs"])
             self.assertEqual(result["citation_check"]["sections"][0]["coverage_score"], 1.0)
+
+    def test_llm_review_draft_removes_unsupported_paragraphs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+            task = generate_review_plan(
+                db_path,
+                "任务规划方法研究综述",
+                doc_ids=doc_ids,
+                use_llm=False,
+            )
+            unsupported = "这一段提出了没有证据支持的额外判断，长度足够长，因此应该从正文移出而不是留下来。"
+            payload = {
+                "claim_plan": [{"claim": "任务规划需要处理动态约束。", "evidence": ["E1"]}],
+                "body_markdown": (
+                    "服务机器人和多智能体论文都把任务规划放在动态约束场景下讨论。[E1]\n\n"
+                    f"{unsupported}"
+                ),
+                "unsupported_claims": [],
+                "warnings": [],
+            }
+
+            with mock.patch("kb_agent.review.generate_json_object", return_value=payload):
+                result = draft_review(
+                    db_path,
+                    task["task_id"],
+                    section_ids=["background_problem"],
+                    use_llm=True,
+                )
+
+            draft = result["section_drafts"][0]
+            self.assertEqual(draft["status"], "partial")
+            self.assertNotIn(unsupported, draft["body_markdown"])
+            self.assertTrue(any(unsupported[:20] in item for item in draft["unsupported_claims"]))
+            self.assertIn("unsupported_paragraphs_removed", draft["warnings"])
+            self.assertEqual(draft["paragraph_support_report"]["removed_paragraph_count"], 1)
+            self.assertEqual(result["citation_check"]["unsupported_paragraph_count"], 0)
+            self.assertEqual(result["review_report"]["paragraph_support_report"]["removed_paragraph_count"], 1)
+
+    def test_review_unused_evidence_can_be_optional_after_supported_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+            task = generate_review_plan(
+                db_path,
+                "任务规划方法研究综述",
+                doc_ids=doc_ids,
+                use_llm=False,
+            )
+            section_path = db_path.parent / ".kb_state" / task["task_id"] / "section_evidence" / "background_problem.json"
+            payload = json.loads(section_path.read_text(encoding="utf-8"))
+            payload["evidence"] = [
+                {
+                    "doc_id": doc_ids[index % 2],
+                    "node_id": f"node_{index}",
+                    "node_path": f"章节 {index}",
+                    "title": f"论文 {index}",
+                    "evidence_summary": f"证据 {index} 说明任务规划的不同侧面。",
+                    "tree_score": 1.0 - index * 0.05,
+                }
+                for index in range(6)
+            ]
+            section_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            llm_payload = {
+                "claim_plan": [{"claim": "任务规划存在共同背景。", "evidence": ["E1"]}],
+                "body_markdown": "本节只使用最关键的一条证据说明共同背景。[E1]",
+                "unsupported_claims": [],
+                "warnings": [],
+            }
+
+            with mock.patch("kb_agent.review.generate_json_object", return_value=llm_payload):
+                result = draft_review(
+                    db_path,
+                    task["task_id"],
+                    section_ids=["background_problem"],
+                    use_llm=True,
+                )
+
+            draft = result["section_drafts"][0]
+            self.assertEqual(len(draft["evidence"]), 5)
+            self.assertEqual({item["doc_id"] for item in draft["evidence"]}, set(doc_ids))
+            self.assertEqual(result["citation_check"]["unused_evidence_count"], 0)
+            self.assertGreaterEqual(result["citation_check"]["optional_unused_evidence_count"], 1)
+            self.assertNotIn("unused_evidence", result["citation_check"]["warnings"])
+            section_actions = result["review_report"]["section_revision_actions"][0]
+            self.assertIn("optional_unused_evidence", section_actions["quality_reasons"])
 
     def test_draft_review_falls_back_per_section_and_continues(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

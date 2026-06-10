@@ -33,11 +33,12 @@ from .utils import compact_whitespace, stable_id, write_json
 
 
 BASELINE_SCHEMA = "quality_baseline.v1"
-CODE_VERSION = "v0.29"
+CODE_VERSION = "v0.30"
 BASELINE_FEATURE_FLAGS = {
     "review_draft_baseline": True,
     "baseline_staleness": True,
     "section_budgeted_review_draft": True,
+    "evidence_first_review_draft": True,
 }
 BASELINE_DIR = DATA_DIR / "eval"
 EVAL_SET_DIR = DATA_DIR / "eval_sets"
@@ -425,6 +426,9 @@ def latest_quality_baseline(
                 "baseline_id": payload.get("baseline_id") or "",
                 "code_version": payload.get("code_version") or "",
                 "git_commit": payload.get("git_commit") or "",
+                "baseline_git_commit_short": _short_commit(payload.get("git_commit") or ""),
+                "current_git_commit": current_commit,
+                "current_git_commit_short": _short_commit(current_commit),
                 "feature_flags": payload.get("feature_flags") or {},
                 "is_current_code_baseline": not bool(stale_reason),
                 "baseline_stale_reason": stale_reason,
@@ -455,6 +459,8 @@ def latest_quality_baseline(
                 "citation_coverage_score": review_draft.get("citation_coverage_score", 0.0),
                 "missing_ref_count": review_draft.get("missing_ref_count", 0),
                 "unsupported_paragraph_count": review_draft.get("unsupported_paragraph_count", 0),
+                "optional_unused_evidence_count": review_draft.get("optional_unused_evidence_count", 0),
+                "removed_paragraph_count": (review_draft.get("paragraph_support_report") or {}).get("removed_paragraph_count", 0),
                 "drafted_section_count": review_draft.get("drafted_section_count", 0),
                 "skipped_section_count": review_draft.get("skipped_section_count", 0),
                 "review_draft_path": review_draft.get("review_draft_path", ""),
@@ -509,6 +515,11 @@ def _current_git_commit() -> str:
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return ""
     return completed.stdout.strip()
+
+
+def _short_commit(value: str) -> str:
+    text = str(value or "").strip()
+    return text[:7] if text else ""
 
 
 def _baseline_stale_reason(payload: Dict[str, Any], current_commit: str = "") -> str:
@@ -1550,6 +1561,8 @@ def _llm_baseline_summary(
             "citation_coverage_score": review_draft.get("citation_coverage_score", 0.0),
             "missing_ref_count": review_draft.get("missing_ref_count", 0),
             "unsupported_paragraph_count": review_draft.get("unsupported_paragraph_count", 0),
+            "optional_unused_evidence_count": review_draft.get("optional_unused_evidence_count", 0),
+            "removed_paragraph_count": (review_draft.get("paragraph_support_report") or {}).get("removed_paragraph_count", 0),
             "drafted_section_count": review_draft.get("drafted_section_count", 0),
             "skipped_section_count": review_draft.get("skipped_section_count", 0),
             "review_draft_path": review_draft.get("review_draft_path", ""),
@@ -1634,6 +1647,8 @@ def _review_draft_summary(result: Dict[str, Any]) -> Dict[str, Any]:
         "missing_ref_count": len(citation_check.get("missing_refs") or []),
         "unused_evidence_count": len(citation_check.get("unused_evidence") or []),
         "unsupported_paragraph_count": len(citation_check.get("unsupported_paragraphs") or []),
+        "optional_unused_evidence_count": len(citation_check.get("optional_unused_evidence") or []),
+        "paragraph_support_report": report.get("paragraph_support_report") or {},
         "review_draft_path": artifacts.get("review_draft", ""),
         "citation_check_path": artifacts.get("citation_check", ""),
         "review_report_path": artifacts.get("review_report", ""),
@@ -1661,6 +1676,8 @@ def _review_draft_skip_summary(reason: str) -> Dict[str, Any]:
         "missing_ref_count": 0,
         "unused_evidence_count": 0,
         "unsupported_paragraph_count": 0,
+        "optional_unused_evidence_count": 0,
+        "paragraph_support_report": {},
         "review_draft_path": "",
         "citation_check_path": "",
         "review_report_path": "",
@@ -1751,6 +1768,8 @@ def _baseline_markdown(report: Dict[str, Any]) -> str:
         f"- review_draft_skip_reason: `{((report.get('tasks') or {}).get('review_draft') or {}).get('review_draft_skip_reason', '')}`",
         f"- review_draft_quality_level: `{((report.get('tasks') or {}).get('review_draft') or {}).get('draft_quality_level', '')}`",
         f"- skipped_section_count: `{((report.get('tasks') or {}).get('review_draft') or {}).get('skipped_section_count', 0)}`",
+        f"- removed_paragraph_count: `{(((report.get('tasks') or {}).get('review_draft') or {}).get('paragraph_support_report') or {}).get('removed_paragraph_count', 0)}`",
+        f"- optional_unused_evidence_count: `{((report.get('tasks') or {}).get('review_draft') or {}).get('optional_unused_evidence_count', 0)}`",
         f"- citation_coverage_score: `{((report.get('tasks') or {}).get('review_draft') or {}).get('citation_coverage_score', 0.0)}`",
         f"- real_embedding_status: `{(report.get('embedding') or {}).get('sentence_transformers', {}).get('status', '')}`",
         f"- real_embedding_model: `{(report.get('embedding') or {}).get('real_embedding_model', '')}`",
@@ -1820,6 +1839,8 @@ def _baseline_html(report: Dict[str, Any]) -> str:
         ("Draft Skip", review_draft.get("review_draft_skip_reason", "")),
         ("Draft Quality", review_draft.get("draft_quality_level", "")),
         ("Skipped Sections", review_draft.get("skipped_section_count", 0)),
+        ("Removed Paragraphs", (review_draft.get("paragraph_support_report") or {}).get("removed_paragraph_count", 0)),
+        ("Optional Unused", review_draft.get("optional_unused_evidence_count", 0)),
         ("Citation Coverage", review_draft.get("citation_coverage_score", 0.0)),
         ("Real Embedding", (embedding.get("sentence_transformers") or {}).get("status", "")),
         ("Embedding Model", embedding.get("real_embedding_model", "")),

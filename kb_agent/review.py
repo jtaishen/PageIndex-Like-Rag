@@ -12,7 +12,7 @@ from .utils import compact_whitespace, stable_id, write_json
 
 
 EVIDENCE_REF_RE = re.compile(r"\[E(\d+)\]")
-MAX_PROMPT_EVIDENCE = 8
+MAX_PROMPT_EVIDENCE = 5
 MAX_PROMPT_SUMMARY_CHARS = 240
 
 
@@ -368,7 +368,8 @@ def _draft_section_with_llm(
 ) -> Dict[str, object]:
     system_prompt = (
         "你是严谨的中文论文综述写作助手。只能基于给定 evidence 写章节草稿。"
-        "正文中每个关键观点必须使用 [E1]、[E2] 这样的证据标记。"
+        "正文中每个自然段至少必须包含一个 [E1]、[E2] 这样的证据标记。"
+        "不能被证据支持的内容必须放入 unsupported_claims，不允许写入正文。"
         "不要编造论文内容。必须返回 JSON object，不要返回 Markdown 代码块。"
     )
     user_prompt = "\n".join(
@@ -446,20 +447,29 @@ def _normalize_llm_section_draft(
 ) -> Dict[str, Any]:
     body = _body_value(payload.get("body_markdown") or payload.get("body") or payload.get("draft"))
     warnings = _string_list(payload.get("warnings"))
+    unsupported_claims = _string_list(payload.get("unsupported_claims"))
+    cleanup_report = {"removed_paragraph_count": 0, "removed_paragraphs": []}
     if not body:
         warnings.append("empty_llm_body")
         body = _fallback_body(section, evidence)
+    else:
+        body, cleanup_report = _clean_unsupported_body(body)
+        if cleanup_report.get("removed_paragraph_count"):
+            warnings.append("unsupported_paragraphs_removed")
+            unsupported_claims.extend(cleanup_report.get("removed_paragraphs") or [])
+    status = "partial" if "empty_llm_body" in warnings or "unsupported_paragraphs_removed" in warnings else "drafted"
     return _section_draft(
         task_id,
         section,
         evidence,
         body,
         source="llm",
-        status="partial" if "empty_llm_body" in warnings else "drafted",
+        status=status,
         claim_plan=_normalize_claim_plan(payload.get("claim_plan")),
-        unsupported_claims=_string_list(payload.get("unsupported_claims")),
+        unsupported_claims=unsupported_claims,
         warnings=warnings,
         llm_diagnostics=llm_diagnostics,
+        paragraph_cleanup=cleanup_report,
     )
 
 
@@ -531,9 +541,11 @@ def _section_draft(
     unsupported_claims: List[str],
     warnings: List[str],
     llm_diagnostics: Dict[str, Any],
+    paragraph_cleanup: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     refs = _body_refs(body)
     used_evidence = [item for item in evidence if item.get("ref_id") in refs]
+    paragraph_support = _paragraph_support_report(body, evidence, cleanup=paragraph_cleanup)
     return {
         "schema": "section_draft.v1",
         "task_id": task_id,
@@ -547,6 +559,7 @@ def _section_draft(
         "evidence": evidence,
         "used_evidence": used_evidence,
         "unsupported_claims": unsupported_claims,
+        "paragraph_support_report": paragraph_support,
         "llm_diagnostics": llm_diagnostics,
         "evidence_compaction": llm_diagnostics.get("compaction") or {},
         "warnings": _unique_strings(warnings),
@@ -571,6 +584,60 @@ def _fallback_body(section: Dict[str, Any], evidence: List[Dict[str, Any]]) -> s
         path = item.get("node_path") or ""
         lines.append(f"- 《{source}》在“{path}”中提供了相关证据：{excerpt} [{item['ref_id']}]")
     return "\n".join(lines)
+
+
+def _clean_unsupported_body(body: str) -> tuple[str, Dict[str, Any]]:
+    kept: List[str] = []
+    removed: List[str] = []
+    for raw in re.split(r"\n\s*\n+", body.strip()):
+        paragraph = raw.strip()
+        if not paragraph:
+            continue
+        if _paragraph_requires_evidence(paragraph) and not EVIDENCE_REF_RE.search(paragraph):
+            removed.append(_excerpt(paragraph, 180))
+            continue
+        kept.append(paragraph)
+    return "\n\n".join(kept).strip(), {
+        "schema": "paragraph_support_cleanup.v1",
+        "removed_paragraph_count": len(removed),
+        "removed_paragraphs": removed,
+    }
+
+
+def _paragraph_support_report(
+    body: str,
+    evidence: List[Dict[str, Any]],
+    *,
+    cleanup: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    cleanup = cleanup or {}
+    paragraphs = _checkable_paragraphs(body)
+    supported = [paragraph for paragraph in paragraphs if EVIDENCE_REF_RE.search(paragraph)]
+    evidence_refs = {str(item.get("ref_id") or "") for item in evidence if item.get("ref_id")}
+    body_refs = set(_body_refs(body))
+    unused_refs = sorted(ref for ref in evidence_refs if ref not in body_refs)
+    return {
+        "schema": "paragraph_support_report.v1",
+        "paragraph_count": len(paragraphs),
+        "supported_paragraph_count": len(supported),
+        "unsupported_paragraph_count": max(0, len(paragraphs) - len(supported)),
+        "removed_paragraph_count": int(cleanup.get("removed_paragraph_count") or 0),
+        "removed_paragraphs": cleanup.get("removed_paragraphs") or [],
+        "unused_evidence_count": len(unused_refs),
+        "unused_evidence_refs": unused_refs,
+        "coverage_score": _coverage_score(len(supported), len(paragraphs), 0),
+    }
+
+
+def _paragraph_requires_evidence(paragraph: str) -> bool:
+    text = compact_whitespace(paragraph)
+    if not text:
+        return False
+    if text.startswith("#") or text.startswith("- "):
+        return False
+    if len(text) < 25:
+        return False
+    return True
 
 
 def _write_section_draft(task_dir: Path, draft: Dict[str, Any]) -> Dict[str, str]:
@@ -639,6 +706,7 @@ def _build_citation_check(task_id: str, drafts: List[Dict[str, Any]]) -> Dict[st
     sections = []
     missing_refs = []
     unused_evidence = []
+    optional_unused_evidence = []
     unsupported_paragraphs = []
     scores = []
     skipped_sections = []
@@ -650,12 +718,20 @@ def _build_citation_check(task_id: str, drafts: List[Dict[str, Any]]) -> Dict[st
         section_missing = sorted(ref for ref in body_refs if ref not in evidence_refs)
         section_unused = sorted(ref for ref in evidence_refs if ref not in body_refs)
         section_unsupported = _unsupported_paragraphs(section_id, body)
+        hard_unused_count = 0
+        optional_unused_count = 0
         missing_refs.extend({"section_id": section_id, "ref_id": ref} for ref in section_missing)
         if draft.get("status") == "skipped":
             skipped_sections.append(section_id)
             section_unused = []
         else:
-            unused_evidence.extend({"section_id": section_id, "ref_id": ref} for ref in section_unused)
+            is_optional_unused = not section_unsupported and not section_missing
+            target = optional_unused_evidence if is_optional_unused else unused_evidence
+            target.extend({"section_id": section_id, "ref_id": ref} for ref in section_unused)
+            if is_optional_unused:
+                optional_unused_count = len(section_unused)
+            else:
+                hard_unused_count = len(section_unused)
         unsupported_paragraphs.extend(section_unsupported)
         paragraphs = _checkable_paragraphs(body)
         supported_count = max(0, len(paragraphs) - len(section_unsupported))
@@ -669,7 +745,8 @@ def _build_citation_check(task_id: str, drafts: List[Dict[str, Any]]) -> Dict[st
                 "evidence_count": len(evidence_refs),
                 "body_ref_count": len(body_refs),
                 "missing_ref_count": len(section_missing),
-                "unused_evidence_count": len(section_unused),
+                "unused_evidence_count": hard_unused_count,
+                "optional_unused_evidence_count": optional_unused_count,
                 "unsupported_paragraph_count": len(section_unsupported),
                 "coverage_score": score,
             }
@@ -694,10 +771,12 @@ def _build_citation_check(task_id: str, drafts: List[Dict[str, Any]]) -> Dict[st
         "sections": sections,
         "missing_refs": missing_refs,
         "unused_evidence": unused_evidence,
+        "optional_unused_evidence": optional_unused_evidence,
         "unsupported_paragraphs": unsupported_paragraphs,
         "skipped_sections": skipped_sections,
         "missing_ref_count": len(missing_refs),
         "unused_evidence_count": len(unused_evidence),
+        "optional_unused_evidence_count": len(optional_unused_evidence),
         "unsupported_paragraph_count": len(unsupported_paragraphs),
         "skipped_section_count": len(skipped_sections),
         "warnings": warnings,
@@ -736,6 +815,8 @@ def _build_review_report(
         next_actions.append("修正文中无法映射的证据编号。")
     if citation_check.get("unused_evidence"):
         next_actions.append("删除未使用证据，或把关键证据补充到正文对应观点。")
+    if citation_check.get("optional_unused_evidence") and not citation_check.get("unused_evidence"):
+        next_actions.append("存在可选未使用证据；可删除冗余证据，或保留为人工复核参考。")
     if citation_check.get("unsupported_paragraphs"):
         next_actions.append("为缺少证据标记的段落补充引用，或删除无证据观点。")
     if missing_sections:
@@ -757,6 +838,8 @@ def _build_review_report(
         "missing_sections": missing_sections,
         "skipped_sections": skipped_sections,
         "citation_coverage_score": citation_check.get("coverage_score", 0.0),
+        "paragraph_support_report": _review_paragraph_support_report(drafts),
+        "optional_unused_evidence_count": len(citation_check.get("optional_unused_evidence") or []),
         "section_statuses": [
             {
                 "section_id": draft.get("section_id") or "",
@@ -808,6 +891,10 @@ def _section_revision_actions(
         if int(check.get("unused_evidence_count") or 0) > 0:
             actions.append("删除未使用证据，或把关键证据写入正文。")
             reasons.append("unused_evidence")
+        optional_unused = _optional_unused_count(section_id, citation_check)
+        if optional_unused and int(check.get("unused_evidence_count") or 0) == 0:
+            actions.append("本节有可选未使用证据；可删除冗余证据或保留给人工复核。")
+            reasons.append("optional_unused_evidence")
         if float(check.get("coverage_score") or 0.0) < 0.8:
             actions.append("重写低覆盖段落，提升证据覆盖。")
             reasons.append("low_evidence_coverage")
@@ -831,6 +918,53 @@ def _section_revision_actions(
             }
         )
     return result
+
+
+def _optional_unused_count(section_id: str, citation_check: Dict[str, Any]) -> int:
+    count = 0
+    for item in citation_check.get("optional_unused_evidence") or []:
+        if isinstance(item, dict) and str(item.get("section_id") or "") == section_id:
+            count += 1
+    return count
+
+
+def _review_paragraph_support_report(drafts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    section_reports = []
+    paragraph_count = 0
+    supported_count = 0
+    unsupported_count = 0
+    removed_count = 0
+    unused_count = 0
+    for draft in drafts:
+        report = draft.get("paragraph_support_report") or {}
+        if not isinstance(report, dict):
+            report = _paragraph_support_report(str(draft.get("body_markdown") or ""), draft.get("evidence") or [])
+        paragraph_count += int(report.get("paragraph_count") or 0)
+        supported_count += int(report.get("supported_paragraph_count") or 0)
+        unsupported_count += int(report.get("unsupported_paragraph_count") or 0)
+        removed_count += int(report.get("removed_paragraph_count") or 0)
+        unused_count += int(report.get("unused_evidence_count") or 0)
+        section_reports.append(
+            {
+                "section_id": draft.get("section_id") or "",
+                "paragraph_count": int(report.get("paragraph_count") or 0),
+                "supported_paragraph_count": int(report.get("supported_paragraph_count") or 0),
+                "unsupported_paragraph_count": int(report.get("unsupported_paragraph_count") or 0),
+                "removed_paragraph_count": int(report.get("removed_paragraph_count") or 0),
+                "unused_evidence_count": int(report.get("unused_evidence_count") or 0),
+                "coverage_score": float(report.get("coverage_score") or 0.0),
+            }
+        )
+    return {
+        "schema": "review_paragraph_support_report.v1",
+        "paragraph_count": paragraph_count,
+        "supported_paragraph_count": supported_count,
+        "unsupported_paragraph_count": unsupported_count,
+        "removed_paragraph_count": removed_count,
+        "unused_evidence_count": unused_count,
+        "coverage_score": _coverage_score(supported_count, paragraph_count, 0),
+        "sections": section_reports,
+    }
 
 
 def _section_quality_level(section_id: str, citation_check: Dict[str, Any], draft: Dict[str, Any]) -> str:
