@@ -846,6 +846,19 @@ uv run python -m unittest discover -s tests
 git diff --check
 ```
 
+## v0.33 Quality Baseline Runtime 与报告渲染拆分
+
+v0.33 聚焦 `quality_baseline.py` 的低风险结构拆分，不改变 baseline 阶段执行、CLI 参数、数据库 schema 或报告字段。LLM 阶段预算与调用统计移动到 `kb_agent.baseline_runtime`，Markdown/HTML 报告渲染移动到 `kb_agent.baseline_renderers`。
+
+本次拆分保留 `run_quality_baseline()` 和 `latest_quality_baseline()` 的公开入口，为后续继续拆分 embedding、tree search、task baseline 和 latest report 逻辑降低风险。
+
+验证：
+
+```bash
+uv run python -m unittest discover -s tests
+git diff --check
+```
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
