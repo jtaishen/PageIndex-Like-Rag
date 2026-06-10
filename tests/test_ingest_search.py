@@ -784,6 +784,11 @@ class IngestSearchTest(unittest.TestCase):
                 result = run_quality_baseline(db_path, papers, use_llm=False, top_k=3)
 
             self.assertEqual(result["schema"], "quality_baseline.v1")
+            self.assertEqual(result["code_version"], "v0.28")
+            self.assertTrue(result["git_commit"])
+            self.assertTrue(result["feature_flags"]["review_draft_baseline"])
+            self.assertTrue(result["is_current_code_baseline"])
+            self.assertEqual(result["baseline_stale_reason"], "")
             self.assertEqual(result["doc_count"], 2)
             self.assertEqual(result["run_kind"], "test_fixture")
             self.assertFalse(result["is_real_corpus"])
@@ -829,6 +834,8 @@ class IngestSearchTest(unittest.TestCase):
             self.assertIn("llm_compare_dimension_success_rate", filtered_latest["items"][0])
             self.assertIn("hybrid_embedding_provider", filtered_latest["items"][0])
             self.assertIn("real_embedding_node_coverage", filtered_latest["items"][0])
+            self.assertTrue(filtered_latest["items"][0]["is_current_code_baseline"])
+            self.assertEqual(filtered_latest["items"][0]["baseline_stale_reason"], "")
             real_filtered = latest_quality_baseline(limit=1, corpus=papers, real_only=True)
             self.assertEqual(real_filtered["count"], 0)
 
@@ -847,6 +854,34 @@ class IngestSearchTest(unittest.TestCase):
             self.assertIn("quality_baseline_latest.v1", latest_stdout)
             self.assertIn("run_kind", latest_stdout)
             self.assertIn("llm_stage_status", latest_stdout)
+
+    def test_latest_quality_baseline_marks_old_reports_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            eval_dir = root / "eval"
+            eval_dir.mkdir()
+            report_path = eval_dir / "quality_baseline_old.json"
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "quality_baseline.v1",
+                        "baseline_id": "old",
+                        "corpus_path": str((Path.cwd() / "articles").resolve()),
+                        "is_real_corpus": True,
+                        "tasks": {"review_draft": {}},
+                        "created_at": time.time(),
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch("kb_agent.quality_baseline.BASELINE_DIR", eval_dir):
+                latest = latest_quality_baseline(limit=1, real_only=True)
+            self.assertEqual(latest["count"], 1)
+            item = latest["items"][0]
+            self.assertFalse(item["is_current_code_baseline"])
+            self.assertEqual(item["baseline_stale_reason"], "missing_review_draft_baseline")
+            self.assertIn("review_draft_skipped", item["top_review_blockers"])
 
     def test_quality_baseline_with_llm_records_sanitized_llm_comparison(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -940,7 +975,11 @@ class IngestSearchTest(unittest.TestCase):
             self.assertIn("review_draft_status", result["llm_baseline"]["tasks"])
             self.assertIn("review_draft_quality_level", result["llm_baseline"]["tasks"])
             self.assertIn("citation_coverage_score", result["llm_baseline"]["tasks"])
+            self.assertIn("review_draft_skip_reason", result["llm_baseline"]["tasks"])
+            self.assertIn("section_revision_actions", result["llm_baseline"]["tasks"])
             self.assertTrue(result["tasks"]["review_draft"].get("review_report_path"))
+            self.assertIn("section_statuses", result["tasks"]["review_draft"])
+            self.assertIn("section_revision_actions", result["tasks"]["review_draft"])
             self.assertIn("llm_diagnostics", result["tasks"]["review"])
             self.assertIn("comparison_summary", result["tree_search"])
             html = Path(result["html_path"]).read_text(encoding="utf-8")
@@ -1446,6 +1485,9 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(citation_check["content"]["schema"], "citation_check.v1")
             report = get_task_artifact(db_path, task["task_id"], "review_report.json")
             self.assertEqual(report["content"]["schema"], "review_report.v1")
+            self.assertIn("section_revision_actions", report["content"])
+            self.assertEqual(len(report["content"]["section_revision_actions"]), 5)
+            self.assertIn("draft_quality_level", report["content"]["section_statuses"][0])
 
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
@@ -1541,6 +1583,9 @@ class IngestSearchTest(unittest.TestCase):
             self.assertIn(result["review_report"]["draft_quality_level"], {"usable", "weak"})
             self.assertIn("missing_refs", result["review_report"]["quality_reasons"])
             self.assertTrue(result["review_report"]["revision_actions"])
+            self.assertTrue(result["review_report"]["section_revision_actions"])
+            section_actions = result["review_report"]["section_revision_actions"][0]["actions"]
+            self.assertTrue(any("证据编号" in item for item in section_actions))
 
             assembled = assemble_review(db_path, task["task_id"])
             self.assertIn("review_draft", assembled["artifact_paths"])
@@ -2482,8 +2527,24 @@ class IngestSearchTest(unittest.TestCase):
             profile_dir = root / "profiles"
             active_profile_path = profile_dir / "active.json"
             db_path, doc_id = _sync_insight_sample(root)
+            baseline_payload = {
+                "items": [
+                    {
+                        "baseline_id": "real-v028",
+                        "path": "/tmp/quality_baseline.json",
+                        "is_current_code_baseline": False,
+                        "baseline_stale_reason": "missing_review_draft_baseline",
+                        "review_draft_status": "skipped",
+                        "review_draft_quality_level": "",
+                        "citation_coverage_score": 0.0,
+                        "review_draft_path": "",
+                        "top_review_blockers": ["review_draft_skipped"],
+                    }
+                ]
+            }
             with mock.patch("kb_agent.search_profile.PROFILE_DIR", profile_dir), \
-                mock.patch("kb_agent.search_profile.ACTIVE_PROFILE_PATH", active_profile_path):
+                mock.patch("kb_agent.search_profile.ACTIVE_PROFILE_PATH", active_profile_path), \
+                mock.patch("kb_agent.quality_baseline.latest_quality_baseline", return_value=baseline_payload):
                 report = build_search_report(db_path, "动态角色任务规划", top_k=2, search_mode="auto")
                 self.assertEqual(report["requested_search_mode"], "auto")
                 self.assertEqual(report["resolved_search_mode"], "hybrid")
@@ -2503,6 +2564,9 @@ class IngestSearchTest(unittest.TestCase):
                 self.assertTrue(Path(dashboard["html_path"]).exists())
                 html = Path(dashboard["html_path"]).read_text(encoding="utf-8")
                 self.assertIn("KB Eval Dashboard", html)
+                self.assertIn("Latest Quality Baseline", html)
+                self.assertIn("missing_review_draft_baseline", html)
+                self.assertIn("Draft Quality", html)
                 self.assertIn("missing_evidence", html)
                 self.assertNotIn("这是一段论文正文", html)
                 self.assertNotIn("excerpt=", html)

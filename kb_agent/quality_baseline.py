@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -32,6 +33,11 @@ from .utils import compact_whitespace, stable_id, write_json
 
 
 BASELINE_SCHEMA = "quality_baseline.v1"
+CODE_VERSION = "v0.28"
+BASELINE_FEATURE_FLAGS = {
+    "review_draft_baseline": True,
+    "baseline_staleness": True,
+}
 BASELINE_DIR = DATA_DIR / "eval"
 EVAL_SET_DIR = DATA_DIR / "eval_sets"
 
@@ -322,8 +328,14 @@ def run_quality_baseline(
     recommendations = _recommendations(doc_reports, parser_comparison, embedding, benchmark, tree, tasks, memory, graph)
     warnings.extend(_baseline_warnings(doc_reports, parser_comparison, embedding, benchmark, tasks, memory, graph, llm_baseline))
     baseline_id = stable_id("quality_baseline", str(root), ",".join(doc_ids), started, length=12)
+    git_commit = _current_git_commit()
     report = {
         "schema": BASELINE_SCHEMA,
+        "code_version": CODE_VERSION,
+        "git_commit": git_commit,
+        "feature_flags": dict(BASELINE_FEATURE_FLAGS),
+        "is_current_code_baseline": True,
+        "baseline_stale_reason": "",
         "baseline_id": baseline_id,
         **corpus_meta,
         "corpus_path": str(root),
@@ -353,6 +365,7 @@ def run_quality_baseline(
         "created_at": started,
         "duration_ms": round((time.time() - started) * 1000, 3),
     }
+    report["top_review_blockers"] = _top_review_blockers(report)
     json_path = BASELINE_DIR / f"quality_baseline_{baseline_id}.json"
     md_path = BASELINE_DIR / f"quality_baseline_{baseline_id}.md"
     html_path = BASELINE_DIR / f"quality_baseline_{baseline_id}.html"
@@ -378,6 +391,7 @@ def latest_quality_baseline(
 ) -> Dict[str, Any]:
     BASELINE_DIR.mkdir(parents=True, exist_ok=True)
     corpus_path = _resolve_corpus_filter(corpus) if corpus is not None else None
+    current_commit = _current_git_commit()
     items = []
     paths = sorted(
         BASELINE_DIR.glob("quality_baseline_*.json"),
@@ -403,10 +417,16 @@ def latest_quality_baseline(
         llm_facts = llm_baseline.get("insights_and_facts") or {}
         llm_tasks = llm_baseline.get("tasks") or {}
         review_draft = ((payload.get("tasks") or {}).get("review_draft") or {})
+        stale_reason = _baseline_stale_reason(payload, current_commit)
         items.append(
             {
                 "path": str(path),
                 "baseline_id": payload.get("baseline_id") or "",
+                "code_version": payload.get("code_version") or "",
+                "git_commit": payload.get("git_commit") or "",
+                "feature_flags": payload.get("feature_flags") or {},
+                "is_current_code_baseline": not bool(stale_reason),
+                "baseline_stale_reason": stale_reason,
                 "run_kind": payload.get("run_kind") or "",
                 "corpus_name": payload.get("corpus_name") or "",
                 "corpus_fingerprint": payload.get("corpus_fingerprint") or "",
@@ -429,12 +449,15 @@ def latest_quality_baseline(
                 "review_fallback_mode": review_diagnostics.get("mode") or "",
                 "review_partial_reasons": review.get("review_partial_reasons") or [],
                 "review_draft_status": review_draft.get("status", ""),
+                "review_draft_skip_reason": review_draft.get("review_draft_skip_reason", "") or review_draft.get("reason", ""),
                 "review_draft_quality_level": review_draft.get("draft_quality_level", ""),
                 "citation_coverage_score": review_draft.get("citation_coverage_score", 0.0),
                 "missing_ref_count": review_draft.get("missing_ref_count", 0),
                 "unsupported_paragraph_count": review_draft.get("unsupported_paragraph_count", 0),
                 "drafted_section_count": review_draft.get("drafted_section_count", 0),
                 "review_draft_path": review_draft.get("review_draft_path", ""),
+                "section_revision_actions": review_draft.get("section_revision_actions") or [],
+                "top_review_blockers": _top_review_blockers(payload),
                 "duplicate_evidence_removed": review.get("duplicate_evidence_removed", 0),
                 "citation_gap_count_before": fact_delta.get("citation_gap_count_before", 0),
                 "citation_gap_count_after": fact_delta.get("citation_gap_count_after", 0),
@@ -469,6 +492,78 @@ def _corpus_metadata(root: Path, files: List[Path]) -> Dict[str, Any]:
         "corpus_fingerprint": _corpus_fingerprint(root, files),
         "is_real_corpus": is_real,
     }
+
+
+def _current_git_commit() -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return ""
+    return completed.stdout.strip()
+
+
+def _baseline_stale_reason(payload: Dict[str, Any], current_commit: str = "") -> str:
+    flags = payload.get("feature_flags") or {}
+    if not isinstance(flags, dict) or not flags.get("review_draft_baseline"):
+        return "missing_review_draft_baseline"
+    if payload.get("code_version") != CODE_VERSION:
+        return "older_code_version"
+    baseline_commit = str(payload.get("git_commit") or "")
+    if not baseline_commit:
+        return "missing_git_commit"
+    if current_commit and baseline_commit != current_commit:
+        return "older_git_commit"
+    return ""
+
+
+def _top_review_blockers(payload: Dict[str, Any]) -> List[str]:
+    tasks = payload.get("tasks") or {}
+    review = tasks.get("review") or {}
+    review_draft = tasks.get("review_draft") or {}
+    llm = payload.get("llm_baseline") or {}
+    blockers: List[str] = []
+    blockers.extend(review.get("review_partial_reasons") or [])
+    blockers.extend(review_draft.get("quality_reasons") or [])
+    if not review_draft or review_draft.get("status") in {"", "skipped"}:
+        blockers.append("review_draft_skipped")
+    if review_draft.get("status") == "partial":
+        blockers.append("review_draft_partial")
+    if review_draft.get("review_draft_skip_reason") or review_draft.get("reason"):
+        blockers.append(str(review_draft.get("review_draft_skip_reason") or review_draft.get("reason")))
+    if int(review_draft.get("missing_ref_count") or 0) > 0:
+        blockers.append("missing_refs")
+    if int(review_draft.get("unsupported_paragraph_count") or 0) > 0:
+        blockers.append("unsupported_paragraphs")
+    if review_draft.get("status") and float(review_draft.get("citation_coverage_score") or 0.0) < 0.8:
+        blockers.append("low_evidence_coverage")
+    if int(llm.get("timeout_count") or 0) > 0:
+        blockers.append("llm_timeout")
+    if llm.get("budget_exhausted"):
+        blockers.append("baseline_llm_budget_exhausted")
+    if int(payload.get("doc_count") or 0) < 3:
+        blockers.append("small_corpus")
+    if (payload.get("embedding") or {}).get("real_embedding_status") == "skipped":
+        blockers.append("real_embedding_not_enabled")
+    priority = [
+        "missing_refs",
+        "unsupported_paragraphs",
+        "low_evidence_coverage",
+        "llm_timeout",
+        "baseline_llm_budget_exhausted",
+        "review_draft_skipped",
+        "review_draft_partial",
+        "small_corpus",
+        "real_embedding_not_enabled",
+    ]
+    unique = _unique_strings(blockers)
+    return sorted(unique, key=lambda item: priority.index(item) if item in priority else len(priority))[:8]
 
 
 def _corpus_fingerprint(root: Path, files: List[Path]) -> str:
@@ -1158,7 +1253,7 @@ def _task_baseline(
             stage.status = "skipped"
             stage.reason = "skip_llm_tasks"
             stage.warnings.append("llm_tasks_skipped")
-        result["review_draft"] = {"status": "skipped", "reason": "skip_llm_tasks"}
+        result["review_draft"] = _review_draft_skip_summary("skip_llm_tasks")
     task_doc_ids = list(llm_doc_ids or doc_ids)
     if len(task_doc_ids) < 2:
         task_doc_ids = list(doc_ids[:2])
@@ -1251,12 +1346,9 @@ def _task_baseline(
                 stage_ctx = runtime.stage("llm_review_draft") if runtime else _null_stage("llm_review_draft")
                 with stage_ctx as stage:
                     if not stage.allowed:
-                        result["review_draft"] = {"status": "skipped", "reason": stage.reason or "llm_review_draft_skipped"}
+                        result["review_draft"] = _review_draft_skip_summary(stage.reason or "llm_review_draft_skipped")
                     elif not stage.can_continue():
-                        result["review_draft"] = {
-                            "status": "skipped",
-                            "reason": "llm_review_draft_skipped:baseline_llm_budget_exhausted",
-                        }
+                        result["review_draft"] = _review_draft_skip_summary("llm_review_draft_skipped:baseline_llm_budget_exhausted")
                     else:
                         draft = draft_review(
                             db_path,
@@ -1270,10 +1362,10 @@ def _task_baseline(
                         if result["review_draft"].get("status") == "partial":
                             stage.mark_warning("review_draft_partial")
             except Exception as exc:
-                result["review_draft"] = {"status": "failed", "error": str(exc)}
+                result["review_draft"] = _review_draft_failed_summary(str(exc))
                 result["warnings"].append(f"review_draft_failed:{exc}")
         else:
-            result["review_draft"] = {"status": "skipped", "reason": "missing_review_task_id"}
+            result["review_draft"] = _review_draft_skip_summary("missing_review_task_id")
     try:
         case = generate_case_study(db_path, "真实论文集方法与实验评测对比", doc_ids=doc_ids, compare_modes=["hybrid", "tree"], top_k=5)
         result["case_study"] = {
@@ -1443,12 +1535,14 @@ def _llm_baseline_summary(
             "review_partial_reasons": review.get("review_partial_reasons") or [],
             "duplicate_evidence_removed": review.get("duplicate_evidence_removed", 0),
             "review_draft_status": review_draft.get("status", ""),
+            "review_draft_skip_reason": review_draft.get("review_draft_skip_reason", "") or review_draft.get("reason", ""),
             "review_draft_quality_level": review_draft.get("draft_quality_level", ""),
             "citation_coverage_score": review_draft.get("citation_coverage_score", 0.0),
             "missing_ref_count": review_draft.get("missing_ref_count", 0),
             "unsupported_paragraph_count": review_draft.get("unsupported_paragraph_count", 0),
             "drafted_section_count": review_draft.get("drafted_section_count", 0),
             "review_draft_path": review_draft.get("review_draft_path", ""),
+            "section_revision_actions": review_draft.get("section_revision_actions") or [],
         },
         "fact_conflict_count": graph.get("conflict_count", 0),
         "warnings": _unique_strings(warning_tags),
@@ -1519,6 +1613,7 @@ def _review_draft_summary(result: Dict[str, Any]) -> Dict[str, Any]:
         "schema": "review_draft_baseline_summary.v1",
         "task_id": result.get("task_id") or "",
         "status": result.get("status") or report.get("status") or "",
+        "review_draft_skip_reason": "",
         "draft_quality_level": report.get("draft_quality_level") or "",
         "quality_reasons": report.get("quality_reasons") or [],
         "drafted_section_count": result.get("drafted_section_count") or report.get("drafted_section_count", 0),
@@ -1530,9 +1625,50 @@ def _review_draft_summary(result: Dict[str, Any]) -> Dict[str, Any]:
         "review_draft_path": artifacts.get("review_draft", ""),
         "citation_check_path": artifacts.get("citation_check", ""),
         "review_report_path": artifacts.get("review_report", ""),
+        "section_statuses": report.get("section_statuses") or [],
+        "section_revision_actions": report.get("section_revision_actions") or [],
         "warning_count": len(report.get("warnings") or []),
         "warnings": report.get("warnings") or [],
         "llm_error": result.get("llm_error", ""),
+    }
+
+
+def _review_draft_skip_summary(reason: str) -> Dict[str, Any]:
+    return {
+        "schema": "review_draft_baseline_summary.v1",
+        "task_id": "",
+        "status": "skipped",
+        "review_draft_skip_reason": reason,
+        "reason": reason,
+        "draft_quality_level": "",
+        "quality_reasons": ["review_draft_skipped"],
+        "drafted_section_count": 0,
+        "section_count": 0,
+        "citation_coverage_score": 0.0,
+        "missing_ref_count": 0,
+        "unused_evidence_count": 0,
+        "unsupported_paragraph_count": 0,
+        "review_draft_path": "",
+        "citation_check_path": "",
+        "review_report_path": "",
+        "section_statuses": [],
+        "section_revision_actions": [],
+        "warning_count": 1,
+        "warnings": [reason],
+        "llm_error": "",
+    }
+
+
+def _review_draft_failed_summary(error: str) -> Dict[str, Any]:
+    return {
+        **_review_draft_skip_summary("review_draft_failed"),
+        "status": "failed",
+        "review_draft_skip_reason": "",
+        "reason": "",
+        "draft_quality_level": "failed",
+        "quality_reasons": ["review_draft_failed"],
+        "warnings": ["review_draft_failed"],
+        "llm_error": error,
     }
 
 
@@ -1582,6 +1718,9 @@ def _baseline_markdown(report: Dict[str, Any]) -> str:
         "# Quality Baseline",
         "",
         f"- schema: `{report.get('schema')}`",
+        f"- code_version: `{report.get('code_version')}`",
+        f"- git_commit: `{report.get('git_commit')}`",
+        f"- is_current_code_baseline: `{report.get('is_current_code_baseline')}`",
         f"- baseline_id: `{report.get('baseline_id')}`",
         f"- run_kind: `{report.get('run_kind')}`",
         f"- corpus_fingerprint: `{report.get('corpus_fingerprint')}`",
@@ -1596,6 +1735,7 @@ def _baseline_markdown(report: Dict[str, Any]) -> str:
         f"- llm_facts_success_rate: `{((report.get('llm_baseline') or {}).get('insights_and_facts') or {}).get('llm_facts_success_rate', 0.0)}`",
         f"- llm_compare_dimension_success_rate: `{((report.get('llm_baseline') or {}).get('tasks') or {}).get('llm_compare_dimension_success_rate', 0.0)}`",
         f"- review_draft_status: `{((report.get('tasks') or {}).get('review_draft') or {}).get('status', '')}`",
+        f"- review_draft_skip_reason: `{((report.get('tasks') or {}).get('review_draft') or {}).get('review_draft_skip_reason', '')}`",
         f"- review_draft_quality_level: `{((report.get('tasks') or {}).get('review_draft') or {}).get('draft_quality_level', '')}`",
         f"- citation_coverage_score: `{((report.get('tasks') or {}).get('review_draft') or {}).get('citation_coverage_score', 0.0)}`",
         f"- real_embedding_status: `{(report.get('embedding') or {}).get('sentence_transformers', {}).get('status', '')}`",
@@ -1604,6 +1744,7 @@ def _baseline_markdown(report: Dict[str, Any]) -> str:
         f"- hybrid_embedding_provider: `{(report.get('embedding') or {}).get('hybrid_embedding_provider', '')}`",
         f"- embedding_rebuild_needed: `{(report.get('embedding') or {}).get('embedding_rebuild_needed', False)}`",
         f"- review_partial_reasons: `{', '.join(((report.get('tasks') or {}).get('review') or {}).get('review_partial_reasons') or [])}`",
+        f"- top_review_blockers: `{', '.join(report.get('top_review_blockers') or [])}`",
         f"- warning_count: `{len(report.get('warnings') or [])}`",
         "",
         "## Documents",
@@ -1624,6 +1765,13 @@ def _baseline_markdown(report: Dict[str, Any]) -> str:
             f"- `{name}` status=`{stage.get('status')}` calls=`{stage.get('call_count', 0)}` "
             f"timeouts=`{stage.get('timeout_count', 0)}` fallback=`{stage.get('fallback_count', 0)}`"
         )
+    lines.extend(["", "## Review Draft Actions"])
+    for item in (((report.get("tasks") or {}).get("review_draft") or {}).get("section_revision_actions") or []):
+        actions = "; ".join(item.get("actions") or [])
+        lines.append(
+            f"- section=`{item.get('section_id', '')}` quality=`{item.get('draft_quality_level', '')}` "
+            f"actions=`{actions}`"
+        )
     lines.extend(["", "## Recommendations"])
     for item in report.get("recommendations") or []:
         lines.append(f"- {item}")
@@ -1642,6 +1790,8 @@ def _baseline_html(report: Dict[str, Any]) -> str:
     cards = [
         ("Docs", report.get("doc_count", 0)),
         ("PDFs", report.get("pdf_count", 0)),
+        ("Code Version", report.get("code_version", "")),
+        ("Current Code", report.get("is_current_code_baseline", "")),
         ("Run Kind", report.get("run_kind", "")),
         ("Warnings", len(report.get("warnings") or [])),
         ("Best Mode", (report.get("benchmark") or {}).get("best_mode_by_score", "")),
@@ -1653,6 +1803,7 @@ def _baseline_html(report: Dict[str, Any]) -> str:
         ("Facts LLM Rate", llm_facts.get("llm_facts_success_rate", 0.0)),
         ("Compare LLM Rate", llm_tasks.get("llm_compare_dimension_success_rate", 0.0)),
         ("Draft Status", review_draft.get("status", "")),
+        ("Draft Skip", review_draft.get("review_draft_skip_reason", "")),
         ("Draft Quality", review_draft.get("draft_quality_level", "")),
         ("Citation Coverage", review_draft.get("citation_coverage_score", 0.0)),
         ("Real Embedding", (embedding.get("sentence_transformers") or {}).get("status", "")),
@@ -1722,6 +1873,18 @@ def _baseline_html(report: Dict[str, Any]) -> str:
     )
     recs = _list_section("Recommendations", report.get("recommendations") or [])
     partial_reasons = _list_section("Review Partial Reasons", review.get("review_partial_reasons") or [])
+    review_actions = _table(
+        "Review Draft Actions",
+        ["Section", "Quality", "Actions"],
+        [
+            [
+                item.get("section_id", ""),
+                item.get("draft_quality_level", ""),
+                "; ".join(item.get("actions") or []),
+            ]
+            for item in review_draft.get("section_revision_actions") or []
+        ],
+    )
     warnings = _list_section("Warnings", report.get("warnings") or [])
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -1757,6 +1920,7 @@ def _baseline_html(report: Dict[str, Any]) -> str:
     {links}
     {recs}
     {partial_reasons}
+    {review_actions}
     {warnings}
   </main>
 </body>

@@ -734,6 +734,31 @@ uv run python -m kb_agent.cli latest-quality-baseline --real-only --limit 1
 
 `draft-review` 现在会使用压缩后的 section evidence。每节 evidence 会写入 `compaction_report`，LLM prompt 只包含短 `summary`、章节路径、页码和证据编号，不直接塞入长 excerpt。每个 `section_drafts/*.json` 会记录 `llm_diagnostics`，用于判断该节是 DeepSeek 生成、规则回退、超时还是部分成功。
 
+## v0.28 真实 baseline 复跑与综述草稿质量闭环
+
+v0.28 不继续扩展新模块，而是让真实验收结果可判断、可复现。`quality-baseline` 会写入 `code_version`、`git_commit` 和 `feature_flags.review_draft_baseline=true`；`latest-quality-baseline --real-only` 会判断最新真实报告是否来自当前代码，并在旧报告缺少草稿字段或 commit 不一致时给出 `baseline_stale_reason`。
+
+推荐真实验收：
+
+```bash
+uv run --extra pdf python -m kb_agent.cli quality-baseline articles --with-llm --top-k 3 --llm-timeout-seconds 20 --llm-stage-timeout-seconds 60 --llm-max-docs 2
+uv run python -m kb_agent.cli latest-quality-baseline --real-only --limit 1
+uv run python -m kb_agent.cli eval-dashboard --format html
+```
+
+重点查看：
+
+- `is_current_code_baseline`
+- `baseline_stale_reason`
+- `review_draft_status`
+- `review_draft_skip_reason`
+- `review_draft_quality_level`
+- `citation_coverage_score`
+- `section_revision_actions`
+- `top_review_blockers`
+
+`review_report.json` 现在会按章节输出 `section_revision_actions`，用于判断每一节需要补证据、修引用、重写段落还是人工确认。`eval-dashboard` 会展示最新真实 baseline 的草稿质量、引用覆盖、stale warning 和草稿工件路径；报告仍只展示 ID、指标、路径、短 warning 和动作建议，不包含论文正文、长 evidence、完整 prompt 或综述正文。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：

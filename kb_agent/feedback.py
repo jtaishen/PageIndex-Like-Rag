@@ -241,6 +241,7 @@ def eval_dashboard(db_path: Path, *, since_days: Optional[float] = None, output_
     from .fact_audit import latest_fact_audit_report
     from .facts import fact_coverage_summary
     from .knowledge_graph import latest_graph_reports
+    from .quality_baseline import latest_quality_baseline
     from .search_profile import latest_search_tuning_reports, list_search_profiles
 
     created_at = time.time()
@@ -254,9 +255,19 @@ def eval_dashboard(db_path: Path, *, since_days: Optional[float] = None, output_
     latest_failures = latest_failure_analyses(limit=5)
     latest_cases = latest_case_studies(limit=5)
     latest_graphs = latest_graph_reports(db_path, limit=5)
+    latest_baseline_items = latest_quality_baseline(limit=1, real_only=True, exclude_temp=True).get("items") or []
+    latest_baseline = latest_baseline_items[0] if latest_baseline_items else {}
     tuning_reports = latest_search_tuning_reports(limit=5)
     profiles = list_search_profiles()
-    recommendations = _dashboard_recommendations(stats, feedback, fact_coverage, latest_failures, latest_fact_audit, latest_graphs)
+    recommendations = _dashboard_recommendations(
+        stats,
+        feedback,
+        fact_coverage,
+        latest_failures,
+        latest_fact_audit,
+        latest_graphs,
+        latest_baseline,
+    )
     dashboard = {
         "schema": "eval_dashboard.v1",
         "since_days": since_days,
@@ -272,6 +283,7 @@ def eval_dashboard(db_path: Path, *, since_days: Optional[float] = None, output_
         "latest_case_studies": latest_cases,
         "latest_claim_graphs": latest_graphs,
         "latest_claim_graph": latest_graphs[0] if latest_graphs else {},
+        "latest_quality_baseline": latest_baseline,
         "latest_search_tuning": tuning_reports,
         "search_profiles": profiles,
         "recommendations": recommendations,
@@ -426,6 +438,7 @@ def _dashboard_recommendations(
     failure_reports: Optional[List[Dict[str, Any]]] = None,
     fact_audit_reports: Optional[List[Dict[str, Any]]] = None,
     graph_reports: Optional[List[Dict[str, Any]]] = None,
+    latest_baseline: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     recommendations = []
     if stats.get("no_evidence_rate", 0) > 0:
@@ -451,6 +464,13 @@ def _dashboard_recommendations(
     latest_graph = (graph_reports or [{}])[0] if graph_reports else {}
     if latest_graph.get("conflict_count", 0) > 0 or latest_graph.get("isolated_fact_count", 0) > 0:
         recommendations.append("Claim Graph 存在冲突或孤立事实；建议运行 graph-neighborhood 查看相关证据链，再决定是否重抽取事实。")
+    baseline = latest_baseline or {}
+    if baseline.get("baseline_stale_reason"):
+        recommendations.append("最新真实 baseline 已过期；建议重跑 quality-baseline articles --with-llm 后再判断当前质量。")
+    if baseline.get("review_draft_status") in {"", "skipped", "failed"}:
+        recommendations.append("最新真实 baseline 未完成综述草稿阶段；建议检查 review_draft_skip_reason 或重跑 v0.28 验收命令。")
+    if baseline.get("top_review_blockers"):
+        recommendations.append("综述草稿存在阻塞项；优先处理 latest-quality-baseline 中的 top_review_blockers。")
     return recommendations
 
 
@@ -465,6 +485,7 @@ def _dashboard_markdown(dashboard: Dict[str, Any]) -> str:
     failures = dashboard.get("latest_failure_analyses") or []
     cases = dashboard.get("latest_case_studies") or []
     graph = dashboard.get("latest_claim_graph") or {}
+    baseline = dashboard.get("latest_quality_baseline") or {}
     lines = [
         "# KB Eval Dashboard",
         "",
@@ -492,6 +513,12 @@ def _dashboard_markdown(dashboard: Dict[str, Any]) -> str:
         f"- latest_claim_graph_conflicts: `{graph.get('conflict_count', 0)}`",
         f"- latest_claim_graph_isolated_facts: `{graph.get('isolated_fact_count', 0)}`",
         f"- latest_claim_graph_evidence_coverage: `{graph.get('evidence_coverage_rate', 0.0)}`",
+        f"- latest_baseline_stale_reason: `{baseline.get('baseline_stale_reason', '')}`",
+        f"- latest_review_draft_status: `{baseline.get('review_draft_status', '')}`",
+        f"- latest_review_draft_quality: `{baseline.get('review_draft_quality_level', '')}`",
+        f"- latest_citation_coverage: `{baseline.get('citation_coverage_score', 0.0)}`",
+        f"- latest_review_draft_path: `{baseline.get('review_draft_path', '')}`",
+        f"- latest_top_review_blockers: `{', '.join(baseline.get('top_review_blockers') or [])}`",
         "",
         "## Feedback Labels",
     ]
@@ -518,6 +545,17 @@ def _dashboard_markdown(dashboard: Dict[str, Any]) -> str:
             f"isolated=`{report.get('isolated_fact_count')}` coverage=`{report.get('evidence_coverage_rate')}` "
             f"path=`{report.get('path')}`"
         )
+    if baseline:
+        lines.extend(
+            [
+                "",
+                "## Latest Quality Baseline",
+                f"- baseline=`{baseline.get('baseline_id', '')}` current=`{baseline.get('is_current_code_baseline', '')}` "
+                f"stale=`{baseline.get('baseline_stale_reason', '')}` path=`{baseline.get('path', '')}`",
+                f"- review_draft=`{baseline.get('review_draft_status', '')}` quality=`{baseline.get('review_draft_quality_level', '')}` "
+                f"coverage=`{baseline.get('citation_coverage_score', 0.0)}` draft_path=`{baseline.get('review_draft_path', '')}`",
+            ]
+        )
     lines.extend(["", "## Search Tuning"])
     for report in dashboard.get("latest_search_tuning") or []:
         lines.append(f"- default=`{report.get('default_mode')}` path=`{report.get('path')}`")
@@ -540,6 +578,7 @@ def _dashboard_html(dashboard: Dict[str, Any]) -> str:
     failures = dashboard.get("latest_failure_analyses") or []
     cases = dashboard.get("latest_case_studies") or []
     graph = dashboard.get("latest_claim_graph") or {}
+    baseline = dashboard.get("latest_quality_baseline") or {}
     profiles = dashboard.get("search_profiles") or {}
     active = profiles.get("active") or {}
     cards = [
@@ -565,6 +604,10 @@ def _dashboard_html(dashboard: Dict[str, Any]) -> str:
         ("Claim Graph Conflicts", graph.get("conflict_count", 0)),
         ("Claim Graph Isolated", graph.get("isolated_fact_count", 0)),
         ("Claim Graph Coverage", graph.get("evidence_coverage_rate", 0.0)),
+        ("Baseline Current", baseline.get("is_current_code_baseline", "")),
+        ("Baseline Stale", baseline.get("baseline_stale_reason", "")),
+        ("Draft Quality", baseline.get("review_draft_quality_level", "")),
+        ("Citation Coverage", baseline.get("citation_coverage_score", 0.0)),
     ]
     card_html = "\n".join(
         f"<section class='card'><div class='label'>{escape(str(label))}</div><div class='value'>{escape(str(value))}</div></section>"
@@ -615,6 +658,18 @@ def _dashboard_html(dashboard: Dict[str, Any]) -> str:
             for item in dashboard.get("latest_claim_graphs") or []
         ],
     )
+    baseline_html = _list_section(
+        "Latest Quality Baseline",
+        [
+            f"baseline={baseline.get('baseline_id', '')} current={baseline.get('is_current_code_baseline', '')} "
+            f"stale={baseline.get('baseline_stale_reason', '')} path={baseline.get('path', '')}",
+            f"review_draft={baseline.get('review_draft_status', '')} quality={baseline.get('review_draft_quality_level', '')} "
+            f"coverage={baseline.get('citation_coverage_score', 0.0)} draft_path={baseline.get('review_draft_path', '')}",
+            f"top_blockers={', '.join(baseline.get('top_review_blockers') or [])}",
+        ]
+        if baseline
+        else [],
+    )
     recommendations_html = _list_section("Recommendations", dashboard.get("recommendations") or [])
     active_html = ""
     if active:
@@ -662,6 +717,7 @@ def _dashboard_html(dashboard: Dict[str, Any]) -> str:
       {failure_html}
       {case_html}
       {graph_html}
+      {baseline_html}
       {recommendations_html}
     </div>
   </main>

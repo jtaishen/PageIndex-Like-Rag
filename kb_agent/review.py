@@ -534,6 +534,7 @@ def _build_review_report(
         warnings.append("missing_section_drafts")
     quality_reasons = _draft_quality_reasons(outline_sections, drafts, citation_check, missing_sections, warnings)
     draft_quality_level = _draft_quality_level(citation_check, missing_sections, quality_reasons)
+    section_revision_actions = _section_revision_actions(outline_sections, drafts, citation_check)
     next_actions = []
     if citation_check.get("missing_refs"):
         next_actions.append("修正文中无法映射的证据编号。")
@@ -564,15 +565,89 @@ def _build_review_report(
                 "title": draft.get("title") or "",
                 "status": draft.get("status") or "",
                 "source": draft.get("source") or "",
+                "draft_quality_level": _section_quality_level(str(draft.get("section_id") or ""), citation_check, draft),
                 "warning_count": len(draft.get("warnings") or []),
+                "warnings": draft.get("warnings") or [],
             }
             for draft in drafts
         ],
         "warnings": _unique_strings(warnings),
         "next_actions": next_actions,
         "revision_actions": next_actions,
+        "section_revision_actions": section_revision_actions,
         "created_at": time.time(),
     }
+
+
+def _section_revision_actions(
+    outline_sections: List[Dict[str, Any]],
+    drafts: List[Dict[str, Any]],
+    citation_check: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    draft_map = {str(draft.get("section_id") or ""): draft for draft in drafts}
+    check_map = {str(item.get("section_id") or ""): item for item in citation_check.get("sections") or [] if isinstance(item, dict)}
+    result = []
+    for section in outline_sections:
+        section_id = str(section.get("section_id") or "")
+        if not section_id:
+            continue
+        draft = draft_map.get(section_id, {})
+        check = check_map.get(section_id, {})
+        actions = []
+        reasons = []
+        if not draft:
+            actions.append("为本节运行 draft-review。")
+            reasons.append("section_draft_missing")
+        if int(check.get("missing_ref_count") or 0) > 0:
+            actions.append("修正文中无法映射的证据编号。")
+            reasons.append("missing_refs")
+        if int(check.get("unsupported_paragraph_count") or 0) > 0:
+            actions.append("为无证据段落补充 [E#]，或删除无证据观点。")
+            reasons.append("unsupported_paragraphs")
+        if int(check.get("unused_evidence_count") or 0) > 0:
+            actions.append("删除未使用证据，或把关键证据写入正文。")
+            reasons.append("unused_evidence")
+        if float(check.get("coverage_score") or 0.0) < 0.8:
+            actions.append("重写低覆盖段落，提升证据覆盖。")
+            reasons.append("low_evidence_coverage")
+        draft_warnings = draft.get("warnings") or []
+        if any(str(warning).startswith("llm_unavailable") for warning in draft_warnings):
+            actions.append("检查 DeepSeek 回退原因，必要时重跑本节草稿。")
+            reasons.append("llm_unavailable")
+        if "rule_based_section_draft" in [str(warning) for warning in draft_warnings]:
+            actions.append("人工润色规则版草稿，补足章节衔接。")
+            reasons.append("rule_based_section_draft")
+        if not actions:
+            actions.append("人工通读本节，检查表达、衔接和引用格式。")
+        result.append(
+            {
+                "section_id": section_id,
+                "title": section.get("title") or section_id,
+                "status": draft.get("status") or ("missing" if not draft else ""),
+                "draft_quality_level": _section_quality_level(section_id, citation_check, draft),
+                "quality_reasons": _unique_strings(reasons),
+                "actions": _unique_strings(actions),
+            }
+        )
+    return result
+
+
+def _section_quality_level(section_id: str, citation_check: Dict[str, Any], draft: Dict[str, Any]) -> str:
+    if not draft:
+        return "failed"
+    section_check = {}
+    for item in citation_check.get("sections") or []:
+        if isinstance(item, dict) and str(item.get("section_id") or "") == section_id:
+            section_check = item
+            break
+    coverage = float(section_check.get("coverage_score") or 0.0)
+    if int(section_check.get("missing_ref_count") or 0) > 0:
+        return "weak"
+    if int(section_check.get("unsupported_paragraph_count") or 0) > 0 or coverage < 0.5:
+        return "weak"
+    if draft.get("warnings") or int(section_check.get("unused_evidence_count") or 0) > 0 or coverage < 0.9:
+        return "usable"
+    return "good"
 
 
 def _body_refs(body: str) -> List[str]:
