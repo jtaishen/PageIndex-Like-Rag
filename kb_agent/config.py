@@ -83,6 +83,36 @@ def deepseek_max_tokens() -> int:
         return 1200
 
 
+def _env_int(name: str, default: int) -> int:
+    load_env_file()
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def deepseek_timeout_seconds() -> int:
+    return _env_int("DEEPSEEK_TIMEOUT_SECONDS", 45)
+
+
+def deepseek_probe_timeout_seconds() -> int:
+    return _env_int("DEEPSEEK_PROBE_TIMEOUT_SECONDS", 15)
+
+
+def deepseek_json_retry_count() -> int:
+    return _env_int("DEEPSEEK_JSON_RETRY_COUNT", 1)
+
+
+def baseline_llm_timeout_seconds() -> int:
+    return _env_int("KB_BASELINE_LLM_TIMEOUT_SECONDS", 420)
+
+
+def baseline_llm_stage_timeout_seconds() -> int:
+    return _env_int("KB_BASELINE_LLM_STAGE_TIMEOUT_SECONDS", 120)
+
+
 def ensure_data_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "parsed").mkdir(parents=True, exist_ok=True)

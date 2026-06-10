@@ -217,6 +217,10 @@ if FastMCP is not None:
         top_k: int = 5,
         use_llm: bool = False,
         embedding_model: Optional[str] = None,
+        llm_timeout_seconds: Optional[int] = None,
+        llm_stage_timeout_seconds: Optional[int] = None,
+        llm_max_docs: Optional[int] = None,
+        skip_llm_tasks: bool = False,
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run a real-corpus quality baseline across parsing, embeddings, retrieval, tasks, memory, and graph risks."""
@@ -227,6 +231,10 @@ if FastMCP is not None:
             top_k=top_k,
             use_llm=use_llm,
             embedding_model=embedding_model,
+            llm_timeout_seconds=llm_timeout_seconds,
+            llm_stage_timeout_seconds=llm_stage_timeout_seconds,
+            llm_max_docs=llm_max_docs,
+            skip_llm_tasks=skip_llm_tasks,
         )
 
     @mcp.tool()

@@ -3,18 +3,24 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 from .config import (
     deepseek_api_key,
     deepseek_base_url,
+    deepseek_json_retry_count,
     deepseek_max_tokens,
     deepseek_model,
+    deepseek_probe_timeout_seconds,
     deepseek_temperature,
+    deepseek_timeout_seconds,
 )
 from .utils import compact_whitespace, first_words
 
@@ -38,6 +44,47 @@ class LLMSettings:
     max_tokens: int
 
 
+@dataclass(frozen=True)
+class LLMRuntimeOptions:
+    timeout_seconds: Optional[int] = None
+    retry_count: Optional[int] = None
+    operation: str = ""
+    stage: str = ""
+
+
+LLMEventCollector = Callable[[Dict[str, Any]], None]
+
+
+_RUNTIME_OPTIONS: ContextVar[LLMRuntimeOptions] = ContextVar("kb_llm_runtime_options", default=LLMRuntimeOptions())
+_EVENT_COLLECTOR: ContextVar[Optional[LLMEventCollector]] = ContextVar("kb_llm_event_collector", default=None)
+
+
+@contextmanager
+def llm_runtime_options(
+    *,
+    timeout_seconds: Optional[int] = None,
+    retry_count: Optional[int] = None,
+    operation: str = "",
+    stage: str = "",
+    event_collector: Optional[LLMEventCollector] = None,
+) -> Iterator[None]:
+    """Temporarily annotate LLM calls with runtime limits and sanitized telemetry."""
+    previous = _RUNTIME_OPTIONS.get()
+    options = LLMRuntimeOptions(
+        timeout_seconds=timeout_seconds if timeout_seconds is not None else previous.timeout_seconds,
+        retry_count=retry_count if retry_count is not None else previous.retry_count,
+        operation=operation or previous.operation,
+        stage=stage or previous.stage,
+    )
+    options_token = _RUNTIME_OPTIONS.set(options)
+    collector_token = _EVENT_COLLECTOR.set(event_collector if event_collector is not None else _EVENT_COLLECTOR.get())
+    try:
+        yield
+    finally:
+        _EVENT_COLLECTOR.reset(collector_token)
+        _RUNTIME_OPTIONS.reset(options_token)
+
+
 def get_llm_settings() -> Optional[LLMSettings]:
     api_key = deepseek_api_key()
     if not api_key:
@@ -51,7 +98,7 @@ def get_llm_settings() -> Optional[LLMSettings]:
     )
 
 
-def llm_status(*, probe: bool = False) -> Dict[str, Any]:
+def llm_status(*, probe: bool = False, timeout_seconds: Optional[int] = None) -> Dict[str, Any]:
     """Return sanitized DeepSeek configuration and optional connectivity state."""
     started = time.time()
     resolved = get_llm_settings()
@@ -100,7 +147,13 @@ def llm_status(*, probe: bool = False) -> Dict[str, Any]:
         )
         body["temperature"] = 0
         body["max_tokens"] = min(resolved.max_tokens, 300)
-        content = _chat_completion_content(body, resolved, timeout=30)
+        content = _chat_completion_content(
+            body,
+            resolved,
+            timeout=timeout_seconds or deepseek_probe_timeout_seconds(),
+            operation="llm_status",
+            stage="probe",
+        )
         result["reachable"] = True
         result["response_sample"] = first_words(compact_whitespace(content), 30)
     except LLMError as exc:
@@ -114,6 +167,10 @@ def generate_grounded_answer(
     query: str,
     evidence: List[Dict[str, object]],
     settings: Optional[LLMSettings] = None,
+    *,
+    timeout_seconds: Optional[int] = None,
+    operation: str = "",
+    stage: str = "",
 ) -> str:
     resolved = settings or get_llm_settings()
     if resolved is None:
@@ -135,13 +192,25 @@ def generate_grounded_answer(
             {"role": "user", "content": build_grounded_prompt(query, evidence)},
         ],
     )
-    return _chat_completion_content(body, resolved)
+    options = _resolve_runtime_options(timeout_seconds=timeout_seconds, operation=operation, stage=stage)
+    return _chat_completion_content(
+        body,
+        resolved,
+        timeout=options.timeout_seconds or deepseek_timeout_seconds(),
+        operation=options.operation,
+        stage=options.stage,
+    )
 
 
 def generate_json_object(
     system_prompt: str,
     user_prompt: str,
     settings: Optional[LLMSettings] = None,
+    *,
+    timeout_seconds: Optional[int] = None,
+    retry_count: Optional[int] = None,
+    operation: str = "",
+    stage: str = "",
 ) -> Dict[str, object]:
     resolved = settings or get_llm_settings()
     if resolved is None:
@@ -150,13 +219,54 @@ def generate_json_object(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
+    options = _resolve_runtime_options(
+        timeout_seconds=timeout_seconds,
+        retry_count=retry_count,
+        operation=operation,
+        stage=stage,
+    )
+    timeout = options.timeout_seconds or deepseek_timeout_seconds()
+    retries = max(0, options.retry_count if options.retry_count is not None else deepseek_json_retry_count())
+    started = time.time()
     body = _chat_body(resolved, messages)
-    content = _chat_completion_content(body, resolved)
+    try:
+        content = _chat_completion_content(body, resolved, timeout=timeout, operation=options.operation, stage=options.stage)
+    except LLMError as exc:
+        raise LLMError(
+            str(exc),
+            error_type=exc.error_type,
+            metadata=_llm_error_metadata(
+                exc,
+                retry_count=0,
+                operation=options.operation,
+                stage=options.stage,
+                started=started,
+            ),
+        ) from exc
     try:
         payload, metadata = _parse_json_object(content)
-        payload[LLM_METADATA_KEY] = {**metadata, "retry_count": 0, "error_type": ""}
+        payload[LLM_METADATA_KEY] = {
+            **metadata,
+            "retry_count": 0,
+            "error_type": "",
+            "operation": options.operation,
+            "stage": options.stage,
+            "duration_ms": round((time.time() - started) * 1000, 3),
+        }
         return payload
     except LLMError as first_error:
+        if retries <= 0:
+            raise LLMError(
+                f"DeepSeek JSON parse failed: {first_error.error_type}",
+                error_type=first_error.error_type,
+                metadata=_llm_error_metadata(
+                    first_error,
+                    retry_count=0,
+                    operation=options.operation,
+                    stage=options.stage,
+                    started=started,
+                ),
+            ) from first_error
         retry_messages = [
             *messages,
             {
@@ -167,26 +277,43 @@ def generate_json_object(
                 ),
             },
         ]
-        retry_body = _chat_body(resolved, retry_messages)
-        retry_content = _chat_completion_content(retry_body, resolved)
-        try:
-            payload, metadata = _parse_json_object(retry_content)
-        except LLMError as retry_error:
+        retry_error: Optional[LLMError] = None
+        for retry_index in range(1, retries + 1):
+            retry_body = _chat_body(resolved, retry_messages)
+            try:
+                retry_content = _chat_completion_content(
+                    retry_body,
+                    resolved,
+                    timeout=timeout,
+                    operation=options.operation,
+                    stage=options.stage,
+                )
+                payload, metadata = _parse_json_object(retry_content)
+                break
+            except LLMError as exc:
+                retry_error = exc
+        else:
+            error = retry_error or first_error
             raise LLMError(
-                f"DeepSeek JSON parse failed: {retry_error.error_type}",
-                error_type=retry_error.error_type,
-                metadata={
-                    "retry_count": 1,
-                    "repair_used": False,
-                    "first_error_type": first_error.error_type,
-                    "error_type": retry_error.error_type,
-                },
-            ) from retry_error
+                f"DeepSeek JSON parse failed: {error.error_type}",
+                error_type=error.error_type,
+                metadata=_llm_error_metadata(
+                    error,
+                    retry_count=retries,
+                    operation=options.operation,
+                    stage=options.stage,
+                    started=started,
+                    first_error_type=first_error.error_type,
+                ),
+            ) from error
         payload[LLM_METADATA_KEY] = {
             **metadata,
-            "retry_count": 1,
+            "retry_count": retry_index,
             "first_error_type": first_error.error_type,
             "error_type": "",
+            "operation": options.operation,
+            "stage": options.stage,
+            "duration_ms": round((time.time() - started) * 1000, 3),
         }
         return payload
 
@@ -206,7 +333,15 @@ def _chat_body(resolved: LLMSettings, messages: List[Dict[str, str]]) -> Dict[st
     return body
 
 
-def _chat_completion_content(body: Dict[str, object], resolved: LLMSettings, *, timeout: int = 90) -> str:
+def _chat_completion_content(
+    body: Dict[str, object],
+    resolved: LLMSettings,
+    *,
+    timeout: int,
+    operation: str = "",
+    stage: str = "",
+) -> str:
+    started = time.time()
     request = urllib.request.Request(
         url=f"{resolved.base_url}/chat/completions",
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -221,25 +356,171 @@ def _chat_completion_content(body: Dict[str, object], resolved: LLMSettings, *, 
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise LLMError(f"DeepSeek API HTTP {exc.code}: {detail}") from exc
+        _record_llm_event(
+            operation=operation,
+            stage=stage,
+            status="failed",
+            error_type="http_error",
+            started=started,
+            timeout=timeout,
+        )
+        raise LLMError(
+            f"DeepSeek API HTTP {exc.code}.",
+            error_type="http_error",
+            metadata={"http_status": exc.code, "operation": operation, "stage": stage},
+        ) from exc
     except urllib.error.URLError as exc:
-        raise LLMError(f"DeepSeek API request failed: {exc}", error_type="request_failed") from exc
-    except TimeoutError as exc:
-        raise LLMError("DeepSeek API request timed out.", error_type="request_timeout") from exc
+        error_type = "request_timeout" if _url_error_is_timeout(exc) else "request_failed"
+        _record_llm_event(
+            operation=operation,
+            stage=stage,
+            status="timeout" if error_type == "request_timeout" else "failed",
+            error_type=error_type,
+            started=started,
+            timeout=timeout,
+        )
+        message = "DeepSeek API request timed out." if error_type == "request_timeout" else "DeepSeek API request failed."
+        raise LLMError(message, error_type=error_type, metadata={"operation": operation, "stage": stage}) from exc
+    except (TimeoutError, socket.timeout) as exc:
+        _record_llm_event(
+            operation=operation,
+            stage=stage,
+            status="timeout",
+            error_type="request_timeout",
+            started=started,
+            timeout=timeout,
+        )
+        raise LLMError(
+            "DeepSeek API request timed out.",
+            error_type="request_timeout",
+            metadata={"operation": operation, "stage": stage},
+        ) from exc
+    except json.JSONDecodeError as exc:
+        _record_llm_event(
+            operation=operation,
+            stage=stage,
+            status="failed",
+            error_type="invalid_response_json",
+            started=started,
+            timeout=timeout,
+        )
+        raise LLMError(
+            "DeepSeek API returned invalid response JSON.",
+            error_type="invalid_response_json",
+            metadata={"operation": operation, "stage": stage},
+        ) from exc
 
     try:
         content = payload["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise LLMError(f"Unexpected DeepSeek API response: {payload}") from exc
+        _record_llm_event(
+            operation=operation,
+            stage=stage,
+            status="failed",
+            error_type="unexpected_response",
+            started=started,
+            timeout=timeout,
+        )
+        raise LLMError(
+            "Unexpected DeepSeek API response.",
+            error_type="unexpected_response",
+            metadata={"operation": operation, "stage": stage},
+        ) from exc
     if not content:
-        raise LLMError("DeepSeek API returned an empty answer.")
+        _record_llm_event(
+            operation=operation,
+            stage=stage,
+            status="failed",
+            error_type="empty_response",
+            started=started,
+            timeout=timeout,
+        )
+        raise LLMError(
+            "DeepSeek API returned an empty answer.",
+            error_type="empty_response",
+            metadata={"operation": operation, "stage": stage},
+        )
+    _record_llm_event(
+        operation=operation,
+        stage=stage,
+        status="completed",
+        error_type="",
+        started=started,
+        timeout=timeout,
+    )
     return str(content).strip()
 
 
 def llm_payload_metadata(payload: Dict[str, object]) -> Dict[str, Any]:
     metadata = payload.get(LLM_METADATA_KEY) if isinstance(payload, dict) else None
     return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _resolve_runtime_options(
+    *,
+    timeout_seconds: Optional[int] = None,
+    retry_count: Optional[int] = None,
+    operation: str = "",
+    stage: str = "",
+) -> LLMRuntimeOptions:
+    current = _RUNTIME_OPTIONS.get()
+    return LLMRuntimeOptions(
+        timeout_seconds=timeout_seconds if timeout_seconds is not None else current.timeout_seconds,
+        retry_count=retry_count if retry_count is not None else current.retry_count,
+        operation=operation or current.operation,
+        stage=stage or current.stage,
+    )
+
+
+def _llm_error_metadata(
+    error: LLMError,
+    *,
+    retry_count: int,
+    operation: str,
+    stage: str,
+    started: float,
+    first_error_type: str = "",
+) -> Dict[str, Any]:
+    return {
+        "retry_count": retry_count,
+        "repair_used": False,
+        "first_error_type": first_error_type,
+        "error_type": error.error_type,
+        "operation": operation,
+        "stage": stage,
+        "duration_ms": round((time.time() - started) * 1000, 3),
+    }
+
+
+def _record_llm_event(
+    *,
+    operation: str,
+    stage: str,
+    status: str,
+    error_type: str,
+    started: float,
+    timeout: int,
+) -> None:
+    collector = _EVENT_COLLECTOR.get()
+    if collector is None:
+        return
+    collector(
+        {
+            "operation": operation,
+            "stage": stage,
+            "status": status,
+            "error_type": error_type,
+            "duration_ms": round((time.time() - started) * 1000, 3),
+            "timeout_seconds": timeout,
+        }
+    )
+
+
+def _url_error_is_timeout(exc: urllib.error.URLError) -> bool:
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return True
+    return "timed out" in str(reason).lower()
 
 
 def _parse_json_object(content: str) -> tuple[Dict[str, object], Dict[str, Any]]:

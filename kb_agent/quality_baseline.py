@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from . import db
 from .artifacts import get_doc_card, get_parse_quality, get_parse_report
 from .benchmark import create_eval_suite, generate_case_study, run_benchmark
-from .config import DATA_DIR, PROJECT_ROOT
+from .config import DATA_DIR, PROJECT_ROOT, baseline_llm_stage_timeout_seconds, baseline_llm_timeout_seconds, deepseek_timeout_seconds
 from .embeddings import EmbeddingError, build_semantic_index, semantic_index_status
 from .eval import eval_memory
 from .fact_audit import fact_audit_summary
@@ -21,7 +21,7 @@ from .facts import extract_facts
 from .ingest import discover_files, sync_directory
 from .insights import extract_doc_insights
 from .knowledge_graph import graph_summary
-from .llm import llm_status
+from .llm import llm_runtime_options, llm_status
 from .parsers import pdf_adapter_statuses
 from .tasks import compare_papers, generate_review_plan
 from .tree_search import tree_search
@@ -33,6 +33,210 @@ BASELINE_DIR = DATA_DIR / "eval"
 EVAL_SET_DIR = DATA_DIR / "eval_sets"
 
 
+class _LLMBaselineRuntime:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        timeout_seconds: int,
+        total_timeout_seconds: int,
+        stage_timeout_seconds: int,
+        max_docs: int,
+        skip_tasks: bool,
+    ) -> None:
+        self.enabled = enabled
+        self.timeout_seconds = timeout_seconds
+        self.total_timeout_seconds = total_timeout_seconds
+        self.stage_timeout_seconds = stage_timeout_seconds
+        self.max_docs = max_docs
+        self.skip_tasks = skip_tasks
+        self.started = time.time()
+        self.budget_exhausted = False
+        self._stages: Dict[str, _LLMStageRuntime] = {}
+
+    def limit_doc_ids(self, doc_ids: List[str]) -> List[str]:
+        if not self.enabled:
+            return []
+        if self.max_docs <= 0:
+            return list(doc_ids)
+        return list(doc_ids[: self.max_docs])
+
+    def stage(self, name: str) -> "_LLMStageRuntime":
+        stage = self._stages.get(name)
+        if stage is None:
+            stage = _LLMStageRuntime(self, name)
+            self._stages[name] = stage
+        return stage
+
+    def elapsed_ms(self) -> float:
+        return round((time.time() - self.started) * 1000, 3)
+
+    def budget_remaining(self) -> bool:
+        if not self.enabled:
+            return False
+        if self.budget_exhausted:
+            return False
+        if time.time() - self.started > self.total_timeout_seconds:
+            self.budget_exhausted = True
+            return False
+        return True
+
+    def summary(self) -> Dict[str, Any]:
+        stages = {name: stage.summary() for name, stage in self._stages.items()}
+        return {
+            "schema": "llm_runtime_summary.v1",
+            "enabled": self.enabled,
+            "timeout_seconds": self.timeout_seconds,
+            "total_timeout_seconds": self.total_timeout_seconds,
+            "stage_timeout_seconds": self.stage_timeout_seconds,
+            "max_docs": self.max_docs,
+            "skip_tasks": self.skip_tasks,
+            "stage_summary": stages,
+            "total_llm_duration_ms": round(sum(float(stage.get("llm_duration_ms") or 0.0) for stage in stages.values()), 3),
+            "total_llm_call_count": sum(int(stage.get("call_count") or 0) for stage in stages.values()),
+            "timeout_count": sum(int(stage.get("timeout_count") or 0) for stage in stages.values()),
+            "fallback_count": sum(int(stage.get("fallback_count") or 0) for stage in stages.values()),
+            "budget_exhausted": self.budget_exhausted,
+            "elapsed_ms": self.elapsed_ms(),
+        }
+
+
+class _LLMStageRuntime:
+    def __init__(self, runtime: _LLMBaselineRuntime, name: str) -> None:
+        self.runtime = runtime
+        self.name = name
+        self.status = "pending"
+        self.reason = ""
+        self.warnings: List[str] = []
+        self.call_count = 0
+        self.timeout_count = 0
+        self.fallback_count = 0
+        self.llm_duration_ms = 0.0
+        self.started = 0.0
+        self.duration_ms = 0.0
+        self._ctx = None
+
+    def __enter__(self) -> "_LLMStageRuntime":
+        self.started = time.time()
+        if not self.runtime.enabled:
+            self.status = "skipped"
+            self.reason = "llm_disabled"
+            return self
+        if not self.runtime.budget_remaining():
+            self.status = "skipped"
+            self.reason = "baseline_llm_budget_exhausted"
+            self.warnings.append(self.reason)
+            return self
+        self.status = "completed"
+        self._ctx = llm_runtime_options(
+            timeout_seconds=self.runtime.timeout_seconds,
+            operation="quality_baseline",
+            stage=self.name,
+            event_collector=self.record_event,
+        )
+        self._ctx.__enter__()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._ctx is not None:
+            self._ctx.__exit__(exc_type, exc, tb)
+        self.duration_ms = round((time.time() - self.started) * 1000, 3) if self.started else 0.0
+        if self.status == "completed":
+            if exc_type is not None:
+                self.status = "timeout" if getattr(exc, "error_type", "") == "request_timeout" else "failed"
+                self.warnings.append(f"{self.name}_{self.status}")
+            elif self.duration_ms > self.runtime.stage_timeout_seconds * 1000:
+                self.status = "timeout"
+                self.reason = "stage_timeout"
+                self.warnings.append("stage_timeout")
+            elif self.timeout_count and self.timeout_count >= max(1, self.call_count):
+                self.status = "timeout"
+                self.warnings.append(f"{self.name}_timeout")
+            elif self.timeout_count or self.fallback_count or self.warnings:
+                self.status = "partial"
+        if time.time() - self.runtime.started > self.runtime.total_timeout_seconds:
+            self.runtime.budget_exhausted = True
+
+    @property
+    def allowed(self) -> bool:
+        return self.status not in {"skipped"}
+
+    def can_continue(self) -> bool:
+        if not self.allowed:
+            return False
+        if not self.runtime.budget_remaining():
+            self.status = "skipped"
+            self.reason = "baseline_llm_budget_exhausted"
+            self.warnings.append(self.reason)
+            return False
+        if self.started and time.time() - self.started > self.runtime.stage_timeout_seconds:
+            self.status = "timeout"
+            self.reason = "stage_timeout"
+            self.warnings.append("stage_timeout")
+            return False
+        return True
+
+    def mark_fallback(self, reason: str = "fallback") -> None:
+        self.fallback_count += 1
+        if reason:
+            self.warnings.append(reason)
+
+    def mark_warning(self, warning: str) -> None:
+        if warning:
+            self.warnings.append(warning)
+
+    def record_event(self, event: Dict[str, Any]) -> None:
+        self.call_count += 1
+        self.llm_duration_ms += float(event.get("duration_ms") or 0.0)
+        if event.get("status") == "timeout" or event.get("error_type") == "request_timeout":
+            self.timeout_count += 1
+            self.warnings.append("request_timeout")
+        elif event.get("status") == "failed":
+            self.warnings.append(str(event.get("error_type") or "llm_failed"))
+
+    def summary(self) -> Dict[str, Any]:
+        status = self.status if self.status != "pending" else "skipped"
+        reason = self.reason or ("not_started" if self.status == "pending" else "")
+        return {
+            "schema": "llm_stage_runtime.v1",
+            "stage": self.name,
+            "status": status,
+            "reason": reason,
+            "duration_ms": self.duration_ms,
+            "llm_duration_ms": round(self.llm_duration_ms, 3),
+            "call_count": self.call_count,
+            "fallback_count": self.fallback_count,
+            "timeout_count": self.timeout_count,
+            "warnings": _unique_strings(self.warnings),
+        }
+
+
+class _NullStageRuntime:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.status = "completed"
+
+    def __enter__(self) -> "_NullStageRuntime":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        return None
+
+    @property
+    def allowed(self) -> bool:
+        return True
+
+    def can_continue(self) -> bool:
+        return True
+
+    def mark_fallback(self, reason: str = "fallback") -> None:
+        return None
+
+
+def _null_stage(name: str) -> _NullStageRuntime:
+    return _NullStageRuntime(name)
+
+
 def run_quality_baseline(
     db_path: Path,
     corpus_path: Path = Path("articles"),
@@ -41,8 +245,20 @@ def run_quality_baseline(
     top_k: int = 5,
     use_llm: bool = False,
     embedding_model: Optional[str] = None,
+    llm_timeout_seconds: Optional[int] = None,
+    llm_stage_timeout_seconds: Optional[int] = None,
+    llm_max_docs: Optional[int] = None,
+    skip_llm_tasks: bool = False,
 ) -> Dict[str, Any]:
     started = time.time()
+    llm_runtime = _LLMBaselineRuntime(
+        enabled=use_llm,
+        timeout_seconds=llm_timeout_seconds or deepseek_timeout_seconds(),
+        total_timeout_seconds=baseline_llm_timeout_seconds(),
+        stage_timeout_seconds=llm_stage_timeout_seconds or baseline_llm_stage_timeout_seconds(),
+        max_docs=llm_max_docs if llm_max_docs is not None else (2 if use_llm else 0),
+        skip_tasks=skip_llm_tasks,
+    )
     root = corpus_path.expanduser()
     if not root.is_absolute():
         root = PROJECT_ROOT / root
@@ -55,26 +271,47 @@ def run_quality_baseline(
 
     primary_sync = sync_directory(root, db_path, force=force, pdf_parser="pypdf")
     doc_ids = _doc_ids_for_corpus(db_path, root)
+    llm_doc_ids = llm_runtime.limit_doc_ids(doc_ids)
     corpus_meta = _corpus_metadata(root, files)
     doc_reports = [_doc_quality_summary(db_path, doc_id) for doc_id in doc_ids]
     parser_comparison = _parser_comparison(root, pdf_files, primary_sync)
-    llm = llm_status(probe=use_llm)
+    llm = _baseline_llm_probe(llm_runtime)
     fact_audit_before = fact_audit_summary(db_path, doc_ids=doc_ids) if doc_ids else {}
-    insights = _prepare_insights_and_facts(db_path, doc_ids, use_llm=use_llm)
+    insights = _prepare_insights_and_facts(
+        db_path,
+        doc_ids,
+        use_llm=use_llm,
+        runtime=llm_runtime,
+        llm_doc_ids=llm_doc_ids,
+    )
     fact_audit_after = fact_audit_summary(db_path, doc_ids=doc_ids) if doc_ids else {}
     embedding = _embedding_baseline(db_path, doc_ids, embedding_model=embedding_model)
     eval_set = _write_baseline_eval_set(doc_reports)
     suite = create_eval_suite(db_path, f"quality_baseline_{int(started)}", input_json=Path(eval_set["path"]))
     benchmark = run_benchmark(db_path, str(suite["name"]), compare_modes=["fts", "hybrid", "tree"], top_k=top_k)
-    tree = _tree_search_baseline(db_path, doc_reports, top_k=top_k, use_llm=use_llm)
-    tasks = _task_baseline(db_path, doc_ids, use_llm=use_llm)
+    tree = _tree_search_baseline(
+        db_path,
+        doc_reports,
+        top_k=top_k,
+        use_llm=use_llm,
+        runtime=llm_runtime,
+        llm_doc_ids=llm_doc_ids,
+    )
+    tasks = _task_baseline(
+        db_path,
+        doc_ids,
+        use_llm=use_llm,
+        runtime=llm_runtime,
+        llm_doc_ids=llm_doc_ids,
+        skip_llm_tasks=skip_llm_tasks,
+    )
     memory = eval_memory(db_path)
     graph = graph_summary(db_path, doc_ids=doc_ids, include_conflicts=True) if doc_ids else {
         "schema": "knowledge_graph_summary.v1",
         "available": False,
         "warnings": ["no_ready_documents_for_graph"],
     }
-    llm_baseline = _llm_baseline_summary(llm, insights, tree, tasks, graph, enabled=use_llm)
+    llm_baseline = _llm_baseline_summary(llm, insights, tree, tasks, graph, enabled=use_llm, runtime=llm_runtime.summary())
     recommendations = _recommendations(doc_reports, parser_comparison, embedding, benchmark, tree, tasks, memory, graph)
     warnings.extend(_baseline_warnings(doc_reports, parser_comparison, embedding, benchmark, tasks, memory, graph, llm_baseline))
     baseline_id = stable_id("quality_baseline", str(root), ",".join(doc_ids), started, length=12)
@@ -90,6 +327,7 @@ def run_quality_baseline(
         "primary_parser": "pypdf",
         "primary_sync": _sync_summary(primary_sync),
         "llm_status": llm,
+        "llm_runtime": llm_runtime.summary(),
         "parser_comparison": parser_comparison,
         "documents": doc_reports,
         "insights_and_facts": insights,
@@ -153,6 +391,8 @@ def latest_quality_baseline(
         review_diagnostics = review.get("llm_diagnostics") or {}
         tree_delta = (payload.get("tree_search") or {}).get("comparison_summary") or {}
         fact_delta = payload.get("fact_audit_delta") or {}
+        llm_baseline = payload.get("llm_baseline") or {}
+        stage_summary = llm_baseline.get("stage_summary") or {}
         items.append(
             {
                 "path": str(path),
@@ -165,8 +405,12 @@ def latest_quality_baseline(
                 "doc_count": payload.get("doc_count", 0),
                 "pdf_count": payload.get("pdf_count", 0),
                 "best_search_mode": (payload.get("benchmark") or {}).get("best_mode_by_score") or "",
-                "llm_baseline_status": (payload.get("llm_baseline") or {}).get("status", ""),
+                "llm_baseline_status": llm_baseline.get("status", ""),
                 "llm_reachable": ((payload.get("llm_status") or {}).get("reachable")),
+                "llm_stage_status": {name: (stage.get("status") if isinstance(stage, dict) else "") for name, stage in stage_summary.items()},
+                "llm_timeout_count": llm_baseline.get("timeout_count", 0),
+                "llm_total_duration_ms": llm_baseline.get("total_llm_duration_ms", 0.0),
+                "llm_budget_exhausted": bool(llm_baseline.get("budget_exhausted")),
                 "review_llm_error": (((payload.get("tasks") or {}).get("review") or {}).get("llm_error") or ""),
                 "review_fallback_mode": review_diagnostics.get("mode") or "",
                 "review_partial_reasons": review.get("review_partial_reasons") or [],
@@ -363,45 +607,105 @@ def _parser_provider_result(
     }
 
 
-def _prepare_insights_and_facts(db_path: Path, doc_ids: List[str], *, use_llm: bool) -> Dict[str, Any]:
+def _baseline_llm_probe(runtime: _LLMBaselineRuntime) -> Dict[str, Any]:
+    if not runtime.enabled:
+        return llm_status(probe=False)
+    with runtime.stage("llm_probe") as stage:
+        if not stage.allowed:
+            status = llm_status(probe=False)
+            return {
+                **status,
+                "probe": True,
+                "reachable": False,
+                "error": stage.reason or "baseline_llm_budget_exhausted",
+            }
+        status = llm_status(probe=True, timeout_seconds=min(runtime.timeout_seconds, 15))
+        if not status.get("reachable"):
+            stage.mark_fallback(str(status.get("error") or "llm_unreachable"))
+        return status
+
+
+def _prepare_insights_and_facts(
+    db_path: Path,
+    doc_ids: List[str],
+    *,
+    use_llm: bool,
+    runtime: Optional[_LLMBaselineRuntime] = None,
+    llm_doc_ids: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     items = []
     warnings: List[str] = []
+    llm_doc_set = set(llm_doc_ids or doc_ids)
+    rule_by_doc: Dict[str, Dict[str, Any]] = {}
     for doc_id in doc_ids:
         try:
             rule_summary = _extract_insight_fact_summary(db_path, doc_id, use_llm=False)
-            if use_llm:
-                llm_summary = _extract_insight_fact_summary(db_path, doc_id, use_llm=True)
-                final = llm_summary
-                items.append(
-                    {
-                        "doc_id": doc_id,
-                        "innovation_status": final.get("innovation_status", "partial"),
-                        "innovation_count": final.get("innovation_count", 0),
-                        "citation_reference_count": final.get("citation_reference_count", 0),
-                        "citation_relation_count": final.get("citation_relation_count", 0),
-                        "fact_status": final.get("fact_status", "partial"),
-                        "claim_count": final.get("claim_count", 0),
-                        "entity_count": final.get("entity_count", 0),
-                        "relation_count": final.get("relation_count", 0),
-                        "source": final.get("source", ""),
-                        "llm_used": final.get("llm_used", False),
-                        "llm_error": final.get("llm_error", ""),
-                        "noise_filtered_count": final.get("noise_filtered_count", 0),
-                        "entity_noise_filtered_count": final.get("entity_noise_filtered_count", 0),
-                        "long_claim_trimmed_count": final.get("long_claim_trimmed_count", 0),
-                        "rule": rule_summary,
-                        "llm": llm_summary,
-                        "warnings": _unique_strings(final.get("warnings") or []),
-                    }
-                )
-            else:
+            rule_by_doc[doc_id] = rule_summary
+            if not use_llm:
                 items.append(rule_summary)
         except Exception as exc:
             warnings.append(f"insight_fact_failed:{doc_id}:{exc}")
-            items.append({"doc_id": doc_id, "innovation_status": "skipped", "fact_status": "skipped", "error": str(exc)})
+            rule_by_doc[doc_id] = {"doc_id": doc_id, "innovation_status": "skipped", "fact_status": "skipped", "error": str(exc)}
+            if not use_llm:
+                items.append(rule_by_doc[doc_id])
+    if use_llm:
+        llm_by_doc: Dict[str, Dict[str, Any]] = {}
+        with (runtime.stage("llm_insights") if runtime else _null_stage("llm_insights")) as stage:
+            for doc_id in doc_ids:
+                if doc_id not in llm_doc_set:
+                    continue
+                if not stage.can_continue():
+                    warnings.append("llm_insights_skipped:baseline_llm_budget_exhausted")
+                    break
+                try:
+                    llm_by_doc.setdefault(doc_id, {})["insight"] = _extract_insight_summary(db_path, doc_id, use_llm=True)
+                except Exception as exc:
+                    stage.mark_fallback(getattr(exc, "error_type", "") or "llm_insight_failed")
+                    llm_by_doc.setdefault(doc_id, {})["insight"] = {"doc_id": doc_id, "mode": "llm", "innovation_status": "partial", "llm_error": str(exc)}
+        with (runtime.stage("llm_facts") if runtime else _null_stage("llm_facts")) as stage:
+            for doc_id in doc_ids:
+                if doc_id not in llm_doc_set:
+                    continue
+                if not stage.can_continue():
+                    warnings.append("llm_facts_skipped:baseline_llm_budget_exhausted")
+                    break
+                try:
+                    llm_by_doc.setdefault(doc_id, {})["fact"] = _extract_fact_summary(db_path, doc_id, use_llm=True)
+                except Exception as exc:
+                    stage.mark_fallback(getattr(exc, "error_type", "") or "llm_fact_failed")
+                    llm_by_doc.setdefault(doc_id, {})["fact"] = {"doc_id": doc_id, "mode": "llm", "fact_status": "partial", "llm_error": str(exc)}
+        for doc_id in doc_ids:
+            rule_summary = rule_by_doc.get(doc_id) or {"doc_id": doc_id}
+            if doc_id not in llm_doc_set:
+                items.append({**rule_summary, "llm": {"status": "skipped", "reason": "llm_max_docs"}, "warnings": _unique_strings([*rule_summary.get("warnings", []), "llm_doc_skipped:max_docs"])})
+                continue
+            llm_summary = _merge_insight_fact_summaries(rule_summary, llm_by_doc.get(doc_id) or {})
+            items.append(
+                {
+                    "doc_id": doc_id,
+                    "innovation_status": llm_summary.get("innovation_status", "partial"),
+                    "innovation_count": llm_summary.get("innovation_count", 0),
+                    "citation_reference_count": llm_summary.get("citation_reference_count", 0),
+                    "citation_relation_count": llm_summary.get("citation_relation_count", 0),
+                    "fact_status": llm_summary.get("fact_status", "partial"),
+                    "claim_count": llm_summary.get("claim_count", 0),
+                    "entity_count": llm_summary.get("entity_count", 0),
+                    "relation_count": llm_summary.get("relation_count", 0),
+                    "source": llm_summary.get("source", ""),
+                    "llm_used": llm_summary.get("llm_used", False),
+                    "llm_error": llm_summary.get("llm_error", ""),
+                    "noise_filtered_count": llm_summary.get("noise_filtered_count", 0),
+                    "entity_noise_filtered_count": llm_summary.get("entity_noise_filtered_count", 0),
+                    "long_claim_trimmed_count": llm_summary.get("long_claim_trimmed_count", 0),
+                    "rule": rule_summary,
+                    "llm": llm_summary,
+                    "warnings": _unique_strings(llm_summary.get("warnings") or []),
+                }
+            )
     return {
         "schema": "baseline_insights_facts.v1",
         "use_llm": use_llm,
+        "llm_doc_ids": list(llm_doc_ids or []),
         "doc_count": len(items),
         "items": items,
         "warnings": _unique_strings(warnings),
@@ -409,11 +713,15 @@ def _prepare_insights_and_facts(db_path: Path, doc_ids: List[str], *, use_llm: b
 
 
 def _extract_insight_fact_summary(db_path: Path, doc_id: str, *, use_llm: bool) -> Dict[str, Any]:
+    insight_summary = _extract_insight_summary(db_path, doc_id, use_llm=use_llm)
+    fact_summary = _extract_fact_summary(db_path, doc_id, use_llm=use_llm)
+    return _merge_insight_fact_summaries({}, {"insight": insight_summary, "fact": fact_summary})
+
+
+def _extract_insight_summary(db_path: Path, doc_id: str, *, use_llm: bool) -> Dict[str, Any]:
     insight = extract_doc_insights(db_path, doc_id, force=True, use_llm=use_llm, require_llm=False)
     innovation = insight.get("innovation") or {}
     citation_map = insight.get("citation_map") or {}
-    fact = extract_facts(db_path, doc_id, force=True, use_llm=use_llm, require_llm=False)
-    fact_report = fact.get("fact_report") or {}
     return {
         "doc_id": doc_id,
         "mode": "llm" if use_llm else "rule",
@@ -422,18 +730,55 @@ def _extract_insight_fact_summary(db_path: Path, doc_id: str, *, use_llm: bool) 
         "innovation_count": len(innovation.get("items") or []),
         "citation_reference_count": len(citation_map.get("references") or []),
         "citation_relation_count": len(citation_map.get("relations") or []),
+        "llm_error": insight.get("llm_error") or "",
+        "warnings": _unique_strings(innovation.get("warnings") or []),
+    }
+
+
+def _extract_fact_summary(db_path: Path, doc_id: str, *, use_llm: bool) -> Dict[str, Any]:
+    fact = extract_facts(db_path, doc_id, force=True, use_llm=use_llm, require_llm=False)
+    fact_report = fact.get("fact_report") or {}
+    return {
+        "doc_id": doc_id,
+        "mode": "llm" if use_llm else "rule",
         "fact_status": str(fact_report.get("status") or "partial"),
         "source": fact_report.get("source") or "",
         "llm_used": bool(fact_report.get("llm_used")),
-        "llm_error": fact_report.get("llm_error") or insight.get("llm_error") or "",
+        "llm_error": fact_report.get("llm_error") or "",
         "claim_count": fact_report.get("claim_count", 0),
         "entity_count": fact_report.get("entity_count", 0),
         "relation_count": fact_report.get("relation_count", 0),
         "noise_filtered_count": fact_report.get("noise_filtered_count", 0),
         "entity_noise_filtered_count": fact_report.get("entity_noise_filtered_count", 0),
         "long_claim_trimmed_count": fact_report.get("long_claim_trimmed_count", 0),
-        "warnings": _unique_strings([*innovation.get("warnings", []), *fact_report.get("warnings", [])]),
+        "warnings": _unique_strings(fact_report.get("warnings", [])),
     }
+
+
+def _merge_insight_fact_summaries(rule_summary: Dict[str, Any], llm_parts: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    insight = llm_parts.get("insight") or {}
+    fact = llm_parts.get("fact") or {}
+    merged = {
+        "doc_id": insight.get("doc_id") or fact.get("doc_id") or rule_summary.get("doc_id", ""),
+        "mode": insight.get("mode") or fact.get("mode") or rule_summary.get("mode", ""),
+        "innovation_status": insight.get("innovation_status") or rule_summary.get("innovation_status", "partial"),
+        "innovation_source": insight.get("innovation_source") or rule_summary.get("innovation_source", ""),
+        "innovation_count": insight.get("innovation_count", rule_summary.get("innovation_count", 0)),
+        "citation_reference_count": insight.get("citation_reference_count", rule_summary.get("citation_reference_count", 0)),
+        "citation_relation_count": insight.get("citation_relation_count", rule_summary.get("citation_relation_count", 0)),
+        "fact_status": fact.get("fact_status") or rule_summary.get("fact_status", "partial"),
+        "source": fact.get("source") or insight.get("innovation_source") or rule_summary.get("source", ""),
+        "llm_used": bool(fact.get("llm_used")) or bool(rule_summary.get("llm_used")),
+        "llm_error": fact.get("llm_error") or insight.get("llm_error") or "",
+        "claim_count": fact.get("claim_count", rule_summary.get("claim_count", 0)),
+        "entity_count": fact.get("entity_count", rule_summary.get("entity_count", 0)),
+        "relation_count": fact.get("relation_count", rule_summary.get("relation_count", 0)),
+        "noise_filtered_count": fact.get("noise_filtered_count", rule_summary.get("noise_filtered_count", 0)),
+        "entity_noise_filtered_count": fact.get("entity_noise_filtered_count", rule_summary.get("entity_noise_filtered_count", 0)),
+        "long_claim_trimmed_count": fact.get("long_claim_trimmed_count", rule_summary.get("long_claim_trimmed_count", 0)),
+        "warnings": _unique_strings([*rule_summary.get("warnings", []), *insight.get("warnings", []), *fact.get("warnings", [])]),
+    }
+    return merged
 
 
 def _embedding_baseline(db_path: Path, doc_ids: List[str], *, embedding_model: Optional[str]) -> Dict[str, Any]:
@@ -533,11 +878,20 @@ def _eval_query(query: str, intent: str, doc_id: str, keywords: List[str]) -> Di
     }
 
 
-def _tree_search_baseline(db_path: Path, documents: List[Dict[str, Any]], *, top_k: int, use_llm: bool) -> Dict[str, Any]:
+def _tree_search_baseline(
+    db_path: Path,
+    documents: List[Dict[str, Any]],
+    *,
+    top_k: int,
+    use_llm: bool,
+    runtime: Optional[_LLMBaselineRuntime] = None,
+    llm_doc_ids: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     items = []
     llm_items = []
     comparisons = []
     warnings = []
+    llm_doc_set = set(llm_doc_ids or [str(item.get("doc_id") or "") for item in documents])
     for doc in documents:
         doc_id = str(doc.get("doc_id") or "")
         title = str(doc.get("title") or doc_id)
@@ -546,23 +900,44 @@ def _tree_search_baseline(db_path: Path, documents: List[Dict[str, Any]], *, top
         items.append(rule_item)
         if rule_item.get("status") == "failed":
             warnings.append(f"tree_search_failed:{doc_id}:{rule_item.get('error', '')}")
-        if use_llm:
-            llm_item = _tree_search_item(db_path, doc_id, query, top_k=top_k, use_llm=True)
-            llm_items.append(llm_item)
-            if llm_item.get("status") == "failed":
-                warnings.append(f"llm_tree_search_failed:{doc_id}:{llm_item.get('error', '')}")
-            comparisons.append(
-                {
-                    "doc_id": doc_id,
-                    "rule_evidence_count": rule_item.get("evidence_count", 0),
-                    "llm_evidence_count": llm_item.get("evidence_count", 0),
-                    "evidence_delta": int(llm_item.get("evidence_count", 0) or 0) - int(rule_item.get("evidence_count", 0) or 0),
-                    "rule_warning_count": len(rule_item.get("warnings") or []),
-                    "llm_warning_count": len(llm_item.get("warnings") or []),
-                    "llm_used": bool(llm_item.get("llm_used")),
-                    "fallback_reason": llm_item.get("fallback_reason") or "",
-                }
-            )
+    if use_llm:
+        with (runtime.stage("llm_tree_search") if runtime else _null_stage("llm_tree_search")) as stage:
+            for doc in documents:
+                doc_id = str(doc.get("doc_id") or "")
+                if doc_id not in llm_doc_set:
+                    llm_items.append({"doc_id": doc_id, "status": "skipped", "mode": "llm", "reason": "llm_max_docs"})
+                    continue
+                if not stage.can_continue():
+                    warnings.append("llm_tree_search_skipped:baseline_llm_budget_exhausted")
+                    break
+                title = str(doc.get("title") or doc_id)
+                query = f"{title} 的方法设计和实验结果是什么？"
+                llm_item = _tree_search_item(db_path, doc_id, query, top_k=top_k, use_llm=True)
+                if llm_item.get("fallback_reason"):
+                    stage.mark_fallback(str(llm_item.get("fallback_reason")))
+                elif not llm_item.get("llm_used"):
+                    stage.mark_fallback("llm_not_used")
+                llm_items.append(llm_item)
+                if llm_item.get("status") == "failed":
+                    warnings.append(f"llm_tree_search_failed:{doc_id}:{llm_item.get('error', '')}")
+    rule_by_doc = {str(item.get("doc_id") or ""): item for item in items}
+    for llm_item in llm_items:
+        doc_id = str(llm_item.get("doc_id") or "")
+        if llm_item.get("status") == "skipped":
+            continue
+        rule_item = rule_by_doc.get(doc_id) or {}
+        comparisons.append(
+            {
+                "doc_id": doc_id,
+                "rule_evidence_count": rule_item.get("evidence_count", 0),
+                "llm_evidence_count": llm_item.get("evidence_count", 0),
+                "evidence_delta": int(llm_item.get("evidence_count", 0) or 0) - int(rule_item.get("evidence_count", 0) or 0),
+                "rule_warning_count": len(rule_item.get("warnings") or []),
+                "llm_warning_count": len(llm_item.get("warnings") or []),
+                "llm_used": bool(llm_item.get("llm_used")),
+                "fallback_reason": llm_item.get("fallback_reason") or "",
+            }
+        )
     return {
         "schema": "tree_search_baseline.v1",
         "llm_enabled": use_llm,
@@ -631,10 +1006,19 @@ def _tree_comparison_summary(items: List[Dict[str, Any]], llm_items: List[Dict[s
     }
 
 
-def _task_baseline(db_path: Path, doc_ids: List[str], *, use_llm: bool) -> Dict[str, Any]:
+def _task_baseline(
+    db_path: Path,
+    doc_ids: List[str],
+    *,
+    use_llm: bool,
+    runtime: Optional[_LLMBaselineRuntime] = None,
+    llm_doc_ids: Optional[List[str]] = None,
+    skip_llm_tasks: bool = False,
+) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "schema": "task_quality_baseline.v1",
         "use_llm": use_llm,
+        "skip_llm_tasks": skip_llm_tasks,
         "compare": {},
         "review": {},
         "case_study": {},
@@ -643,15 +1027,39 @@ def _task_baseline(db_path: Path, doc_ids: List[str], *, use_llm: bool) -> Dict[
     if len(doc_ids) < 2:
         result["warnings"].append("insufficient_docs_for_compare_review")
         return result
+    if use_llm and skip_llm_tasks and runtime:
+        for name in ("llm_compare", "llm_review"):
+            stage = runtime.stage(name)
+            stage.status = "skipped"
+            stage.reason = "skip_llm_tasks"
+            stage.warnings.append("llm_tasks_skipped")
+    task_doc_ids = list(llm_doc_ids or doc_ids)
+    if len(task_doc_ids) < 2:
+        task_doc_ids = list(doc_ids[:2])
+    compare_use_llm = use_llm and not skip_llm_tasks
     try:
-        compare = compare_papers(
-            db_path,
-            "真实论文集方法与实验评测对比",
-            doc_ids=doc_ids,
-            use_llm=use_llm,
-            require_llm=False,
-            search_mode="tree",
-        )
+        stage_ctx = runtime.stage("llm_compare") if runtime and use_llm and not skip_llm_tasks else _null_stage("llm_compare")
+        with stage_ctx as stage:
+            if use_llm and skip_llm_tasks:
+                result["warnings"].append("llm_tasks_skipped")
+            if use_llm and not skip_llm_tasks and not stage.allowed:
+                compare_use_llm = False
+                result["warnings"].append(stage.reason or "llm_compare_skipped")
+            elif use_llm and not skip_llm_tasks and not stage.can_continue():
+                compare_use_llm = False
+                result["warnings"].append("llm_compare_skipped:baseline_llm_budget_exhausted")
+            compare = compare_papers(
+                db_path,
+                "真实论文集方法与实验评测对比",
+                doc_ids=task_doc_ids,
+                use_llm=compare_use_llm,
+                require_llm=False,
+                search_mode="tree",
+            )
+            if compare_use_llm and compare.get("llm_error"):
+                stage.mark_fallback(str(compare.get("llm_error")))
+            elif compare_use_llm and (((compare.get("comparison_matrix") or {}).get("llm_diagnostics") or {}).get("mode") == "fallback_rule"):
+                stage.mark_fallback("compare_fallback_rule")
         matrix = compare.get("comparison_matrix") or {}
         result["compare"] = {
             "task_id": compare.get("task_id"),
@@ -669,15 +1077,28 @@ def _task_baseline(db_path: Path, doc_ids: List[str], *, use_llm: bool) -> Dict[
     except Exception as exc:
         result["compare"] = {"status": "failed", "error": str(exc)}
         result["warnings"].append(f"compare_failed:{exc}")
+    review_use_llm = use_llm and not skip_llm_tasks
     try:
-        review = generate_review_plan(
-            db_path,
-            "真实论文集任务规划方法研究综述",
-            doc_ids=doc_ids,
-            use_llm=use_llm,
-            require_llm=False,
-            search_mode="tree",
-        )
+        stage_ctx = runtime.stage("llm_review") if runtime and use_llm and not skip_llm_tasks else _null_stage("llm_review")
+        with stage_ctx as stage:
+            if use_llm and not skip_llm_tasks and not stage.allowed:
+                review_use_llm = False
+                result["warnings"].append(stage.reason or "llm_review_skipped")
+            elif use_llm and not skip_llm_tasks and not stage.can_continue():
+                review_use_llm = False
+                result["warnings"].append("llm_review_skipped:baseline_llm_budget_exhausted")
+            review = generate_review_plan(
+                db_path,
+                "真实论文集任务规划方法研究综述",
+                doc_ids=task_doc_ids,
+                use_llm=review_use_llm,
+                require_llm=False,
+                search_mode="tree",
+            )
+            if review_use_llm and review.get("llm_error"):
+                stage.mark_fallback(str(review.get("llm_error")))
+            elif review_use_llm and (((review.get("review_outline") or {}).get("llm_diagnostics") or {}).get("mode") == "fallback_rule"):
+                stage.mark_fallback("review_fallback_rule")
         outline = review.get("review_outline") or {}
         result["review"] = {
             "task_id": review.get("task_id"),
@@ -755,12 +1176,19 @@ def _llm_baseline_summary(
     graph: Dict[str, Any],
     *,
     enabled: bool,
+    runtime: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    runtime = runtime or {}
     if not enabled:
         return {
             "schema": "llm_quality_baseline.v1",
             "status": "skipped",
             "llm_status": status,
+            "stage_summary": runtime.get("stage_summary") or {},
+            "total_llm_duration_ms": runtime.get("total_llm_duration_ms", 0.0),
+            "total_llm_call_count": runtime.get("total_llm_call_count", 0),
+            "timeout_count": runtime.get("timeout_count", 0),
+            "budget_exhausted": bool(runtime.get("budget_exhausted")),
             "tree_search": {"rule_doc_count": len(tree.get("items") or []), "llm_doc_count": 0, "llm_used_count": 0, "fallback_count": 0, "comparison": []},
             "insights_and_facts": {"doc_count": len(insights.get("items") or []), "llm_doc_count": 0, "llm_used_count": 0, "llm_error_count": 0, "noise_filtered_count": 0, "long_claim_trimmed_count": 0},
             "tasks": {},
@@ -781,10 +1209,19 @@ def _llm_baseline_summary(
         warning_tags.append("llm_tree_search_fallback")
     if any((item.get("llm") or {}).get("llm_error") for item in llm_fact_items):
         warning_tags.append("llm_fact_extraction_fallback")
+    if runtime.get("timeout_count"):
+        warning_tags.append("llm_timeout")
+    if runtime.get("budget_exhausted"):
+        warning_tags.append("baseline_llm_budget_exhausted")
     return {
         "schema": "llm_quality_baseline.v1",
         "status": "completed" if status.get("reachable") or (status.get("configured") and status.get("reachable") is None) else "partial",
         "llm_status": status,
+        "stage_summary": runtime.get("stage_summary") or {},
+        "total_llm_duration_ms": runtime.get("total_llm_duration_ms", 0.0),
+        "total_llm_call_count": runtime.get("total_llm_call_count", 0),
+        "timeout_count": runtime.get("timeout_count", 0),
+        "budget_exhausted": bool(runtime.get("budget_exhausted")),
         "tree_search": {
             "rule_doc_count": len(tree.get("items") or []),
             "llm_doc_count": len(llm_items),
@@ -930,6 +1367,8 @@ def _baseline_markdown(report: Dict[str, Any]) -> str:
         f"- best_search_mode: `{(report.get('benchmark') or {}).get('best_mode_by_score', '')}`",
         f"- llm_baseline_status: `{(report.get('llm_baseline') or {}).get('status', '')}`",
         f"- llm_reachable: `{(report.get('llm_status') or {}).get('reachable', '')}`",
+        f"- llm_timeout_count: `{(report.get('llm_baseline') or {}).get('timeout_count', 0)}`",
+        f"- llm_budget_exhausted: `{(report.get('llm_baseline') or {}).get('budget_exhausted', False)}`",
         f"- real_embedding_status: `{(report.get('embedding') or {}).get('sentence_transformers', {}).get('status', '')}`",
         f"- review_partial_reasons: `{', '.join(((report.get('tasks') or {}).get('review') or {}).get('review_partial_reasons') or [])}`",
         f"- warning_count: `{len(report.get('warnings') or [])}`",
@@ -944,6 +1383,14 @@ def _baseline_markdown(report: Dict[str, Any]) -> str:
     lines.extend(["", "## Parser Comparison"])
     for provider in (report.get("parser_comparison") or {}).get("providers") or []:
         lines.append(f"- `{provider.get('provider')}` status=`{provider.get('status')}` reason=`{provider.get('reason', '')}`")
+    lines.extend(["", "## LLM Runtime"])
+    for name, stage in ((report.get("llm_baseline") or {}).get("stage_summary") or {}).items():
+        if not isinstance(stage, dict):
+            continue
+        lines.append(
+            f"- `{name}` status=`{stage.get('status')}` calls=`{stage.get('call_count', 0)}` "
+            f"timeouts=`{stage.get('timeout_count', 0)}` fallback=`{stage.get('fallback_count', 0)}`"
+        )
     lines.extend(["", "## Recommendations"])
     for item in report.get("recommendations") or []:
         lines.append(f"- {item}")
@@ -954,6 +1401,7 @@ def _baseline_html(report: Dict[str, Any]) -> str:
     review = ((report.get("tasks") or {}).get("review") or {})
     fact_delta = report.get("fact_audit_delta") or {}
     tree_summary = (report.get("tree_search") or {}).get("comparison_summary") or {}
+    llm_baseline = report.get("llm_baseline") or {}
     cards = [
         ("Docs", report.get("doc_count", 0)),
         ("PDFs", report.get("pdf_count", 0)),
@@ -962,6 +1410,9 @@ def _baseline_html(report: Dict[str, Any]) -> str:
         ("Best Mode", (report.get("benchmark") or {}).get("best_mode_by_score", "")),
         ("LLM Baseline", (report.get("llm_baseline") or {}).get("status", "")),
         ("LLM Reachable", (report.get("llm_status") or {}).get("reachable", "")),
+        ("LLM Calls", llm_baseline.get("total_llm_call_count", 0)),
+        ("LLM Timeouts", llm_baseline.get("timeout_count", 0)),
+        ("LLM Budget", "exhausted" if llm_baseline.get("budget_exhausted") else "ok"),
         ("Real Embedding", (report.get("embedding") or {}).get("sentence_transformers", {}).get("status", "")),
         ("Tree Trace", tree_summary.get("llm_trace_completeness_avg") or tree_summary.get("rule_trace_completeness_avg") or 0.0),
         ("Evidence Dedupe", review.get("duplicate_evidence_removed", 0)),
@@ -994,6 +1445,22 @@ def _baseline_html(report: Dict[str, Any]) -> str:
         [
             [item.get("provider", ""), item.get("status", ""), item.get("reason", "")]
             for item in (report.get("parser_comparison") or {}).get("providers") or []
+        ],
+    )
+    llm_runtime_html = _table(
+        "LLM Runtime",
+        ["Stage", "Status", "Calls", "Timeouts", "Fallback", "Duration"],
+        [
+            [
+                name,
+                stage.get("status", ""),
+                stage.get("call_count", 0),
+                stage.get("timeout_count", 0),
+                stage.get("fallback_count", 0),
+                stage.get("duration_ms", 0),
+            ]
+            for name, stage in (llm_baseline.get("stage_summary") or {}).items()
+            if isinstance(stage, dict)
         ],
     )
     links = _list_section(
@@ -1040,6 +1507,7 @@ def _baseline_html(report: Dict[str, Any]) -> str:
     <div class="grid">{card_html}</div>
     {docs_html}
     {parser_html}
+    {llm_runtime_html}
     {links}
     {recs}
     {partial_reasons}

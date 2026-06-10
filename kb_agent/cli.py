@@ -141,6 +141,10 @@ def main(argv: Any = None) -> None:
     baseline_parser.add_argument("--top-k", type=int, default=5)
     baseline_parser.add_argument("--with-llm", action="store_true", help="Allow optional DeepSeek calls during insight/task checks")
     baseline_parser.add_argument("--embedding-model", default=None)
+    baseline_parser.add_argument("--llm-timeout-seconds", type=int, default=None, help="Per DeepSeek call timeout used during the baseline")
+    baseline_parser.add_argument("--llm-stage-timeout-seconds", type=int, default=None, help="Maximum runtime for each LLM baseline stage")
+    baseline_parser.add_argument("--llm-max-docs", type=int, default=None, help="Maximum documents to process with LLM stages")
+    baseline_parser.add_argument("--skip-llm-tasks", action="store_true", help="Skip LLM compare/review stages while keeping other LLM checks")
 
     latest_baseline_parser = subparsers.add_parser("latest-quality-baseline", help="Show latest quality baseline reports")
     latest_baseline_parser.add_argument("--limit", type=int, default=1)
@@ -487,6 +491,10 @@ def main(argv: Any = None) -> None:
                     top_k=args.top_k,
                     use_llm=args.with_llm,
                     embedding_model=args.embedding_model,
+                    llm_timeout_seconds=args.llm_timeout_seconds,
+                    llm_stage_timeout_seconds=args.llm_stage_timeout_seconds,
+                    llm_max_docs=args.llm_max_docs,
+                    skip_llm_tasks=args.skip_llm_tasks,
                 )
             )
         )
@@ -1099,6 +1107,7 @@ def _quality_baseline_cli_summary(result: dict) -> dict:
     real_embedding = embedding.get("sentence_transformers") or {}
     llm_status = result.get("llm_status") or {}
     llm_baseline = result.get("llm_baseline") or {}
+    stage_summary = llm_baseline.get("stage_summary") or {}
     review_task = ((result.get("tasks") or {}).get("review") or {})
     review_diagnostics = review_task.get("llm_diagnostics") or {}
     return {
@@ -1119,6 +1128,10 @@ def _quality_baseline_cli_summary(result: dict) -> dict:
         "real_embedding_status": real_embedding.get("status", ""),
         "llm_baseline_status": llm_baseline.get("status", ""),
         "llm_reachable": llm_status.get("reachable"),
+        "llm_stage_status": {name: (stage.get("status") if isinstance(stage, dict) else "") for name, stage in stage_summary.items()},
+        "llm_timeout_count": llm_baseline.get("timeout_count", 0),
+        "llm_total_duration_ms": llm_baseline.get("total_llm_duration_ms", 0.0),
+        "llm_budget_exhausted": bool(llm_baseline.get("budget_exhausted")),
         "llm_tree_used": ((llm_baseline.get("tree_search") or {}).get("llm_used_count")),
         "llm_tree_fallback": ((llm_baseline.get("tree_search") or {}).get("fallback_count")),
         "llm_fact_used": ((llm_baseline.get("insights_and_facts") or {}).get("llm_used_count")),

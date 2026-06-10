@@ -636,6 +636,20 @@ compare/review 会记录 `duplicate_evidence_removed`、`evidence_quality` 和 `
 
 事实层也会从 `citation_map.json` 补齐 `cites` 关系，并过滤 `No.`、`Ra`、残缺正文长句这类实体噪声；Claim Graph 报告新增 `noisy_entity_count`，默认不把噪声实体放进 `top_entities`。
 
+## v0.24 DeepSeek 长流程稳定化
+
+v0.24 聚焦 `quality-baseline --with-llm` 的真实可复测性。DeepSeek 调用现在有统一 per-call timeout、JSON retry 次数、baseline 总预算和阶段预算；报告会把 `llm_probe`、`llm_tree_search`、`llm_insights`、`llm_facts`、`llm_compare`、`llm_review` 分别标记为 `completed | partial | skipped | failed | timeout`。
+
+推荐验收命令：
+
+```bash
+uv run python -m kb_agent.cli llm-status --probe
+uv run --extra pdf python -m kb_agent.cli quality-baseline articles --with-llm --top-k 3 --llm-timeout-seconds 45 --llm-stage-timeout-seconds 120
+uv run python -m kb_agent.cli latest-quality-baseline --real-only --limit 1
+```
+
+如果 DeepSeek 慢、超时或返回不可解析 JSON，baseline 仍会落盘；`llm_baseline.stage_summary`、`llm_timeout_count`、`llm_budget_exhausted` 和 Markdown/HTML 报告中的 “LLM Runtime” 会说明具体卡在哪个阶段。默认 `--with-llm` 只对前 2 篇论文运行 LLM 阶段，可用 `--llm-max-docs` 调整；如只想复测解析/检索而跳过 compare/review 的 LLM，可加 `--skip-llm-tasks`。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
@@ -687,6 +701,11 @@ DEEPSEEK_MODEL=deepseek_v4
 DEEPSEEK_API_KEY=sk-your-key-here
 DEEPSEEK_TEMPERATURE=0
 DEEPSEEK_MAX_TOKENS=3000
+DEEPSEEK_TIMEOUT_SECONDS=45
+DEEPSEEK_PROBE_TIMEOUT_SECONDS=15
+DEEPSEEK_JSON_RETRY_COUNT=1
+KB_BASELINE_LLM_TIMEOUT_SECONDS=420
+KB_BASELINE_LLM_STAGE_TIMEOUT_SECONDS=120
 ```
 
 如果 `DEEPSEEK_BASE_URL` 使用 `http://`，密钥会以明文经过该网络链路；只建议在可信内网或临时科研验证环境中使用。

@@ -5,10 +5,12 @@ import io
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -327,6 +329,42 @@ class IngestSearchTest(unittest.TestCase):
         output = stdout.getvalue()
         self.assertIn("llm_status.v1", output)
         self.assertNotIn("sk-test-secret", output)
+
+    def test_llm_probe_and_json_timeout_are_sanitized(self) -> None:
+        env = {
+            "DEEPSEEK_API_KEY": "sk-timeout-secret",
+            "DEEPSEEK_BASE_URL": "http://localhost:3000/v1",
+            "DEEPSEEK_MODEL": "deepseek_v4",
+            "DEEPSEEK_TIMEOUT_SECONDS": "1",
+            "DEEPSEEK_PROBE_TIMEOUT_SECONDS": "1",
+        }
+        with mock.patch("kb_agent.config._ENV_LOADED", True), mock.patch.dict(os.environ, env, clear=True), mock.patch(
+            "kb_agent.llm.urllib.request.urlopen",
+            side_effect=socket.timeout("timed out"),
+        ):
+            status = llm_status(probe=True)
+        self.assertFalse(status["reachable"])
+        self.assertIn("timed out", status["error"])
+        self.assertNotIn("sk-timeout-secret", json.dumps(status, ensure_ascii=False))
+
+        with mock.patch("kb_agent.config._ENV_LOADED", True), mock.patch.dict(os.environ, env, clear=True), mock.patch(
+            "kb_agent.llm.urllib.request.urlopen",
+            side_effect=socket.timeout("timed out"),
+        ):
+            with self.assertRaises(LLMError) as raised:
+                generate_json_object(
+                    "json only",
+                    "return secret prompt",
+                    operation="quality_baseline",
+                    stage="llm_tree_search",
+                    timeout_seconds=1,
+                    retry_count=0,
+                )
+        self.assertEqual(raised.exception.error_type, "request_timeout")
+        self.assertEqual(raised.exception.metadata["stage"], "llm_tree_search")
+        self.assertEqual(raised.exception.metadata["retry_count"], 0)
+        self.assertNotIn("sk-timeout-secret", str(raised.exception))
+        self.assertNotIn("return secret prompt", str(raised.exception))
 
     def test_generate_json_object_repairs_and_retries_safely(self) -> None:
         env = {
@@ -781,6 +819,9 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(filtered_latest["count"], 1)
             self.assertEqual(filtered_latest["items"][0]["corpus_path"], str(papers.resolve()))
             self.assertEqual(filtered_latest["items"][0]["run_kind"], "test_fixture")
+            self.assertIn("llm_stage_status", filtered_latest["items"][0])
+            self.assertIn("llm_timeout_count", filtered_latest["items"][0])
+            self.assertIn("llm_budget_exhausted", filtered_latest["items"][0])
             real_filtered = latest_quality_baseline(limit=1, corpus=papers, real_only=True)
             self.assertEqual(real_filtered["count"], 0)
 
@@ -798,6 +839,7 @@ class IngestSearchTest(unittest.TestCase):
             latest_stdout = stdout.getvalue()
             self.assertIn("quality_baseline_latest.v1", latest_stdout)
             self.assertIn("run_kind", latest_stdout)
+            self.assertIn("llm_stage_status", latest_stdout)
 
     def test_quality_baseline_with_llm_records_sanitized_llm_comparison(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -862,6 +904,11 @@ class IngestSearchTest(unittest.TestCase):
 
             self.assertEqual(result["llm_baseline"]["schema"], "llm_quality_baseline.v1")
             self.assertEqual(result["llm_baseline"]["status"], "completed")
+            self.assertIn("stage_summary", result["llm_baseline"])
+            self.assertIn("llm_probe", result["llm_baseline"]["stage_summary"])
+            self.assertIn("llm_tree_search", result["llm_baseline"]["stage_summary"])
+            self.assertIn("total_llm_call_count", result["llm_baseline"])
+            self.assertIn("budget_exhausted", result["llm_baseline"])
             self.assertEqual(result["llm_status"]["model"], "deepseek_v4")
             self.assertEqual(result["tree_search"]["llm_enabled"], True)
             self.assertEqual(len(result["tree_search"]["llm_items"]), 2)
@@ -872,8 +919,81 @@ class IngestSearchTest(unittest.TestCase):
             self.assertIn("llm_diagnostics", result["tasks"]["review"])
             self.assertIn("comparison_summary", result["tree_search"])
             html = Path(result["html_path"]).read_text(encoding="utf-8")
+            self.assertIn("LLM Runtime", html)
             self.assertNotIn("sk-", html)
             self.assertNotIn("excerpt", html)
+
+    def test_quality_baseline_llm_stage_timeout_and_budget_are_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "robot.txt").write_text(
+                "摘要：本文研究服务机器人任务规划。\n\n1 方法\n本文提出任务规划框架。\n",
+                encoding="utf-8",
+            )
+            (papers / "agents.txt").write_text(
+                "摘要：本文研究多智能体任务规划。\n\n1 方法\n本文提出任务分配算法。\n",
+                encoding="utf-8",
+            )
+            status_payload = {
+                "schema": "llm_status.v1",
+                "provider": "deepseek",
+                "configured": True,
+                "reachable": True,
+                "probe": True,
+                "base_url": "http://localhost:3000/v1",
+                "model": "deepseek_v4",
+                "temperature": 0,
+                "max_tokens": 300,
+                "insecure_http": True,
+                "error": "",
+                "response_sample": "连接正常",
+            }
+            original_insight_summary = __import__("kb_agent.quality_baseline", fromlist=["_extract_insight_summary"])._extract_insight_summary
+
+            def slow_insight_summary(db_path_arg: Path, doc_id: str, *, use_llm: bool) -> dict:
+                if use_llm:
+                    time.sleep(1.05)
+                    return {
+                        "doc_id": doc_id,
+                        "mode": "llm",
+                        "innovation_status": "partial",
+                        "innovation_count": 0,
+                        "citation_reference_count": 0,
+                        "citation_relation_count": 0,
+                        "llm_error": "",
+                        "warnings": [],
+                    }
+                return original_insight_summary(db_path_arg, doc_id, use_llm=use_llm)
+
+            with mock.patch("kb_agent.quality_baseline.importlib.util.find_spec", return_value=None), mock.patch(
+                "kb_agent.quality_baseline.llm_status",
+                return_value=status_payload,
+            ), mock.patch("kb_agent.quality_baseline.baseline_llm_timeout_seconds", return_value=1), mock.patch(
+                "kb_agent.quality_baseline._extract_insight_summary",
+                side_effect=slow_insight_summary,
+            ):
+                result = run_quality_baseline(
+                    db_path,
+                    papers,
+                    use_llm=True,
+                    top_k=1,
+                    llm_stage_timeout_seconds=1,
+                    llm_max_docs=1,
+                    skip_llm_tasks=True,
+                )
+
+            runtime = result["llm_baseline"]
+            self.assertTrue(runtime["budget_exhausted"])
+            self.assertIn("llm_insights", runtime["stage_summary"])
+            self.assertEqual(runtime["stage_summary"]["llm_insights"]["status"], "timeout")
+            self.assertIn(runtime["stage_summary"]["llm_facts"]["status"], {"skipped", "timeout"})
+            self.assertEqual(runtime["stage_summary"]["llm_compare"]["status"], "skipped")
+            self.assertIn("llm_runtime", result)
+            self.assertTrue(Path(result["json_path"]).exists())
+            self.assertNotIn("sk-", Path(result["html_path"]).read_text(encoding="utf-8"))
 
     def test_llm_fact_extraction_and_require_llm_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
