@@ -396,14 +396,15 @@ def _fact_rows(conn, doc_ids: Optional[List[str]]) -> List[Dict[str, Any]]:  # t
 def _duplicate_fact_groups(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     groups: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
-        key = "|".join(
-            [
-                str(row.get("doc_id") or ""),
-                str(row.get("fact_type") or ""),
-                str(row.get("type") or ""),
-                compact_whitespace(str(row.get("key_text") or "")).lower(),
-            ]
-        )
+        parts = [
+            str(row.get("doc_id") or ""),
+            str(row.get("fact_type") or ""),
+            str(row.get("type") or ""),
+            compact_whitespace(str(row.get("key_text") or "")).lower(),
+        ]
+        if str(row.get("type") or "") in {"cites", "citation"}:
+            parts.append(str(row.get("node_id") or ""))
+        key = "|".join(parts)
         groups.setdefault(key, []).append(row)
     result = []
     for key, items in groups.items():

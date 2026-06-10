@@ -25,6 +25,7 @@ def draft_review(
     require_llm: bool = False,
     should_continue: Optional[Callable[[], bool]] = None,
     skip_reason: str = "review_draft_budget_exhausted",
+    budget_fallback_to_rule: bool = False,
 ) -> Dict[str, Any]:
     task_dir = _review_task_dir(db_path, task_id)
     outline = _read_json(task_dir / "review_outline.json")
@@ -45,13 +46,27 @@ def draft_review(
             draft_compaction,
         )
         if should_continue is not None and not should_continue():
-            draft = _skipped_section_draft(
-                task_id,
-                section,
-                numbered_evidence,
-                reason=skip_reason,
-                compaction=compaction,
-            )
+            if budget_fallback_to_rule and not require_llm:
+                draft = _rule_based_section_draft(
+                    task_id,
+                    section,
+                    numbered_evidence,
+                    warnings=[skip_reason, "llm_budget_exhausted"],
+                    llm_diagnostics=_llm_diagnostics(
+                        used=False,
+                        fallback_reason=skip_reason,
+                        evidence_count=len(numbered_evidence),
+                        compaction=compaction,
+                    ),
+                )
+            else:
+                draft = _skipped_section_draft(
+                    task_id,
+                    section,
+                    numbered_evidence,
+                    reason=skip_reason,
+                    compaction=compaction,
+                )
             drafted.append(draft)
             section_paths = _write_section_draft(task_dir, draft)
             paths.update(section_paths)
@@ -1027,13 +1042,24 @@ def _draft_quality_level(
     quality_reasons: List[str],
 ) -> str:
     coverage = float(citation_check.get("coverage_score") or 0.0)
+    structural_reasons = [
+        reason
+        for reason in quality_reasons
+        if reason
+        not in {
+            "llm_unavailable",
+            "rule_based_section_draft",
+            "llm_budget_exhausted",
+        }
+        and not str(reason).startswith("llm_review_draft_stage_budget_exhausted")
+    ]
     if "section_draft_missing" in quality_reasons and coverage <= 0:
         return "failed"
     if "section_draft_skipped" in quality_reasons and coverage <= 0:
         return "failed"
     if missing_sections or coverage < 0.5 or "missing_refs" in quality_reasons or "section_draft_skipped" in quality_reasons:
         return "weak"
-    if quality_reasons or coverage < 0.9:
+    if structural_reasons or coverage < 0.9:
         return "usable"
     return "good"
 

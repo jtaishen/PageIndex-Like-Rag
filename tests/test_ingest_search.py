@@ -784,7 +784,7 @@ class IngestSearchTest(unittest.TestCase):
                 result = run_quality_baseline(db_path, papers, use_llm=False, top_k=3)
 
             self.assertEqual(result["schema"], "quality_baseline.v1")
-            self.assertEqual(result["code_version"], "v0.30")
+            self.assertEqual(result["code_version"], "v0.31")
             self.assertTrue(result["git_commit"])
             self.assertTrue(result["feature_flags"]["review_draft_baseline"])
             self.assertTrue(result["is_current_code_baseline"])
@@ -829,6 +829,8 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(filtered_latest["items"][0]["run_kind"], "test_fixture")
             self.assertIn("llm_stage_status", filtered_latest["items"][0])
             self.assertIn("llm_timeout_count", filtered_latest["items"][0])
+            self.assertIn("llm_hard_timeout_count", filtered_latest["items"][0])
+            self.assertIn("llm_slow_call_count", filtered_latest["items"][0])
             self.assertIn("llm_budget_exhausted", filtered_latest["items"][0])
             self.assertIn("llm_facts_success_rate", filtered_latest["items"][0])
             self.assertIn("llm_compare_dimension_success_rate", filtered_latest["items"][0])
@@ -836,6 +838,7 @@ class IngestSearchTest(unittest.TestCase):
             self.assertIn("real_embedding_node_coverage", filtered_latest["items"][0])
             self.assertIn("baseline_git_commit_short", filtered_latest["items"][0])
             self.assertIn("current_git_commit_short", filtered_latest["items"][0])
+            self.assertIn("baseline_limitations", filtered_latest["items"][0])
             self.assertTrue(filtered_latest["items"][0]["is_current_code_baseline"])
             self.assertEqual(filtered_latest["items"][0]["baseline_stale_reason"], "")
             real_filtered = latest_quality_baseline(limit=1, corpus=papers, real_only=True)
@@ -891,7 +894,7 @@ class IngestSearchTest(unittest.TestCase):
                     {
                         "schema": "quality_baseline.v1",
                         "baseline_id": "older-commit",
-                        "code_version": "v0.30",
+                        "code_version": "v0.31",
                         "git_commit": "0000000000000000000000000000000000000000",
                         "feature_flags": {"review_draft_baseline": True},
                         "corpus_path": str((Path.cwd() / "articles").resolve()),
@@ -1121,8 +1124,12 @@ class IngestSearchTest(unittest.TestCase):
 
             runtime = result["llm_baseline"]
             self.assertTrue(runtime["budget_exhausted"])
+            self.assertIn("hard_timeout_count", runtime)
+            self.assertIn("slow_call_count", runtime)
             self.assertIn("llm_insights", runtime["stage_summary"])
             self.assertEqual(runtime["stage_summary"]["llm_insights"]["status"], "timeout")
+            self.assertIn("avg_call_duration_ms", runtime["stage_summary"]["llm_insights"])
+            self.assertIn("hard_timeout_count", runtime["stage_summary"]["llm_insights"])
             self.assertIn(runtime["stage_summary"]["llm_facts"]["status"], {"skipped", "timeout"})
             self.assertEqual(runtime["stage_summary"]["llm_compare"]["status"], "skipped")
             self.assertIn("llm_runtime", result)
@@ -1132,7 +1139,9 @@ class IngestSearchTest(unittest.TestCase):
     def test_llm_fact_extraction_and_require_llm_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path, doc_id = _sync_insight_sample(Path(tmp))
-            node_id = get_artifact(db_path, doc_id, "node_index.jsonl")["content"][2]["node_id"]
+            node_index = get_artifact(db_path, doc_id, "node_index.jsonl")["content"]
+            node_id = node_index[2]["node_id"]
+            node_id_2 = node_index[3]["node_id"]
             payload = {
                 "claims": [
                     {
@@ -1140,6 +1149,12 @@ class IngestSearchTest(unittest.TestCase):
                         "text": "提出动态角色发现机制以提升任务分解效率。",
                         "evidence": [node_id],
                         "confidence": 0.84,
+                    },
+                    {
+                        "type": "method",
+                        "text": "提出动态角色发现机制以提升任务分解效率。",
+                        "evidence": [node_id_2],
+                        "confidence": 0.86,
                     },
                     {
                         "type": "result",
@@ -1155,6 +1170,13 @@ class IngestSearchTest(unittest.TestCase):
                         "aliases": ["动态角色"],
                         "evidence": [node_id],
                         "confidence": 0.82,
+                    },
+                    {
+                        "type": "method",
+                        "name": "动态角色发现机制",
+                        "aliases": ["角色发现"],
+                        "evidence": [node_id_2],
+                        "confidence": 0.86,
                     },
                     {
                         "type": "noise",
@@ -1182,6 +1204,13 @@ class IngestSearchTest(unittest.TestCase):
                         "object": "任务分解",
                         "evidence": [node_id],
                         "confidence": 0.78,
+                    },
+                    {
+                        "type": "uses",
+                        "subject": "动态角色发现机制",
+                        "object": "任务分解",
+                        "evidence": [node_id_2],
+                        "confidence": 0.8,
                     }
                 ],
                 "warnings": [],
@@ -1196,12 +1225,53 @@ class IngestSearchTest(unittest.TestCase):
             self.assertGreaterEqual(result["fact_report"]["noise_filtered_count"], 2)
             self.assertIn("entity_noise_filtered_count", result["fact_report"])
             self.assertEqual(result["fact_report"]["long_claim_trimmed_count"], 1)
-            self.assertEqual(result["claims"]["claims"][0]["confidence"], 0.84)
+            self.assertGreaterEqual(result["fact_report"]["dedupe_merged_count"], 1)
+            self.assertEqual(result["fact_report"]["post_dedupe_duplicate_count"], 0)
+            self.assertEqual(result["claims"]["claims"][0]["confidence"], 0.86)
             self.assertLessEqual(len(result["claims"]["claims"][1]["text"]), 225)
-            self.assertEqual(result["entities"]["entities"][0]["aliases"], ["动态角色"])
+            self.assertEqual(set(result["entities"]["entities"][0]["aliases"]), {"动态角色", "角色发现"})
             entity_names = {item["name"] for item in result["entities"]["entities"]}
             self.assertNotIn("No.", entity_names)
             self.assertFalse(any("总体任务规划文本进" in name for name in entity_names))
+
+            conn = db.connect(db_path)
+            db.init_db(conn)
+            try:
+                db.insert_paper_claims(
+                    conn,
+                    [
+                        {
+                            "claim_id": "claim_stale_old_version",
+                            "doc_id": doc_id,
+                            "version_id": "old_version",
+                            "node_id": node_id,
+                            "page_range": {"start": 1, "end": 1},
+                            "claim_type": "method",
+                            "text": "旧版本残留事实。",
+                            "normalized_text": "旧版本残留事实",
+                            "confidence": 0.5,
+                            "source": "test",
+                            "evidence": {"node_id": node_id},
+                        }
+                    ],
+                )
+                conn.commit()
+                stale_counts = db.paper_fact_counts(conn, doc_id=doc_id)
+            finally:
+                conn.close()
+            self.assertGreater(stale_counts["claim_count"], len(result["claims"]["claims"]))
+
+            with mock.patch("kb_agent.facts.generate_json_object", return_value=payload):
+                refreshed = extract_facts(db_path, doc_id, force=True, use_llm=True)
+            conn = db.connect(db_path)
+            db.init_db(conn)
+            try:
+                refreshed_counts = db.paper_fact_counts(conn, doc_id=doc_id)
+            finally:
+                conn.close()
+            self.assertEqual(refreshed_counts["claim_count"], len(refreshed["claims"]["claims"]))
+            self.assertEqual(refreshed_counts["entity_count"], len(refreshed["entities"]["entities"]))
+            self.assertEqual(refreshed_counts["relation_count"], len(refreshed["relations"]["relations"]))
 
         with tempfile.TemporaryDirectory() as tmp:
             db_path, doc_id = _sync_insight_sample(Path(tmp))
@@ -1314,6 +1384,10 @@ class IngestSearchTest(unittest.TestCase):
             self.assertGreaterEqual(background["content"]["source_doc_count"], 1)
             self.assertIn("compaction_report", background["content"])
             self.assertIn("evidence_summary", background["content"]["evidence"][0])
+            coverage = outline["evidence_coverage"]
+            self.assertIn("pre_dedupe_count", coverage)
+            self.assertIn("post_dedupe_count", coverage)
+            self.assertIn("duplicate_evidence_removed_by_section", coverage)
 
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
@@ -1329,6 +1403,47 @@ class IngestSearchTest(unittest.TestCase):
                     "--no-llm",
                 ])
             self.assertIn("review_outline", stdout.getvalue())
+
+    def test_review_section_evidence_dedupes_before_partial_reasons(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+            duplicate_packet = {
+                "doc_id": doc_ids[0],
+                "node_id": "dup-node",
+                "node_path": "摘要",
+                "title": "重复证据",
+                "summary": "任务规划需要处理动态约束。",
+                "excerpt": "任务规划需要处理动态约束。",
+                "tree_score": 0.9,
+            }
+            other_packet = {
+                "doc_id": doc_ids[1],
+                "node_id": "other-node",
+                "node_path": "摘要",
+                "title": "另一篇论文",
+                "summary": "多智能体规划强调协同调度。",
+                "excerpt": "多智能体规划强调协同调度。",
+                "tree_score": 0.8,
+            }
+
+            def fake_search(_db_path: Path, doc_id: str, _query: str, top_k: int, search_mode: str = "hybrid") -> list[dict]:
+                del top_k, search_mode
+                return [duplicate_packet, dict(duplicate_packet)] if doc_id == doc_ids[0] else [other_packet]
+
+            with mock.patch("kb_agent.tasks._search_doc_evidence", side_effect=fake_search):
+                result = generate_review_plan(
+                    db_path,
+                    "任务规划方法研究综述",
+                    doc_ids=doc_ids,
+                    use_llm=False,
+                )
+
+            coverage = result["review_outline"]["evidence_coverage"]
+            self.assertGreater(coverage["duplicate_evidence_removed"], 0)
+            self.assertEqual(coverage["post_dedupe_duplicate_count"], 0)
+            self.assertNotIn("duplicate_evidence", result["review_outline"]["review_partial_reasons"])
+            section = get_task_artifact(db_path, result["task_id"], "section_evidence/background_problem.json")
+            self.assertLessEqual(section["content"]["evidence_count"], 2)
 
     def test_llm_task_generation_and_require_llm_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1486,6 +1601,48 @@ class IngestSearchTest(unittest.TestCase):
                         require_llm=True,
                     )
             self.assertFalse(state_root.exists())
+
+    def test_review_baseline_fast_path_uses_section_json_directly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+            section_payloads = [
+                {
+                    "section_id": section_id,
+                    "title": title,
+                    "purpose": "规划章节。",
+                    "paper_ids": doc_ids,
+                    "evidence": [],
+                    "warnings": [],
+                }
+                for section_id, title in [
+                    ("background_problem", "研究背景与问题定义"),
+                    ("method_paradigms", "方法范式与系统框架"),
+                    ("coordination_mechanisms", "任务分解、分配与协同机制"),
+                    ("evaluation_evidence", "实验评测与证据强度"),
+                    ("limitations_future", "局限性与未来方向"),
+                ]
+            ]
+            prompts: list[str] = []
+
+            def fake_generate(system: str, user: str) -> dict:
+                prompts.append(user)
+                return section_payloads[len(prompts) - 1]
+
+            with mock.patch("kb_agent.tasks.generate_json_object", side_effect=fake_generate):
+                result = generate_review_plan(
+                    db_path,
+                    "任务规划方法研究综述",
+                    doc_ids=doc_ids,
+                    use_llm=True,
+                    prefer_section_llm=True,
+                )
+
+            outline = result["review_outline"]
+            self.assertEqual(len(prompts), 5)
+            self.assertTrue(all("section_id:" in prompt for prompt in prompts))
+            self.assertFalse(any("请生成综述规划" in prompt for prompt in prompts))
+            self.assertEqual(outline["llm_diagnostics"]["mode"], "section_json")
+            self.assertNotIn("section_json_recovery", outline["warnings"])
 
     def test_draft_review_writes_section_drafts_and_markdown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1709,6 +1866,40 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(len(skipped), 4)
             self.assertTrue(all(draft["source"] == "skipped" for draft in skipped))
             self.assertTrue(result["review_report"]["section_revision_actions"])
+
+    def test_draft_review_budget_fallback_rules_remaining_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+            task = generate_review_plan(
+                db_path,
+                "任务规划方法研究综述",
+                doc_ids=doc_ids,
+                use_llm=False,
+            )
+            checks = {"count": 0}
+
+            def should_continue() -> bool:
+                checks["count"] += 1
+                return checks["count"] == 1
+
+            result = draft_review(
+                db_path,
+                task["task_id"],
+                use_llm=False,
+                should_continue=should_continue,
+                skip_reason="llm_review_draft_stage_budget_exhausted",
+                budget_fallback_to_rule=True,
+            )
+
+            self.assertEqual(result["drafted_section_count"], 5)
+            self.assertEqual(result["skipped_section_count"], 0)
+            self.assertEqual(result["citation_check"]["skipped_section_count"], 0)
+            self.assertEqual(result["citation_check"]["unsupported_paragraph_count"], 0)
+            self.assertGreaterEqual(result["citation_check"]["coverage_score"], 0.9)
+            self.assertNotIn("section_draft_skipped", result["review_report"]["quality_reasons"])
+            self.assertEqual(result["review_report"]["draft_quality_level"], "good")
+            sources = {draft["source"] for draft in result["section_drafts"]}
+            self.assertIn("rule", sources)
 
     def test_draft_review_dedupes_evidence_and_preserves_cross_doc_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

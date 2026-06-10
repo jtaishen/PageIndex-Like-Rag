@@ -205,13 +205,13 @@ def generate_review_plan(
     use_llm: bool = True,
     require_llm: bool = False,
     search_mode: str = "hybrid",
+    prefer_section_llm: bool = False,
 ) -> Dict[str, Any]:
     started = time.time()
     selected = _select_papers(db_path, topic, doc_ids, top_k_docs, search_mode)
     contexts, prepare_warnings = _prepare_paper_contexts(db_path, selected)
     audit = fact_audit_summary(db_path, doc_ids=[context["doc_id"] for context in contexts])
-    section_evidence = _collect_section_evidence(db_path, topic, contexts, search_mode)
-    evidence_quality = _evidence_duplicate_summary([item for items in section_evidence.values() for item in items])
+    section_evidence, evidence_quality = _collect_section_evidence(db_path, topic, contexts, search_mode)
     warnings = [*prepare_warnings, *_fact_audit_warning_tags(audit)]
     if not contexts:
         warnings.append("no_selected_papers")
@@ -220,16 +220,27 @@ def generate_review_plan(
     llm_diagnostics = _llm_diagnostics("disabled" if not use_llm else "fallback_rule")
     if use_llm:
         try:
-            payload = _review_plan_with_llm(topic, contexts, section_evidence)
-            outline = _normalize_review_payload(
-                payload,
-                topic,
-                contexts,
-                section_evidence,
-                source="llm",
-                warnings=warnings,
-            )
-            llm_diagnostics = _llm_diagnostics("full_json", metadata=llm_payload_metadata(payload))
+            if prefer_section_llm:
+                outline = _review_plan_with_section_llm(
+                    topic,
+                    contexts,
+                    section_evidence,
+                    warnings=warnings,
+                    full_error=LLMError("Baseline fast path uses section JSON.", error_type="section_json_fast_path"),
+                    recovery_warning="",
+                )
+                llm_diagnostics = outline.get("llm_diagnostics") or _llm_diagnostics("section_json")
+            else:
+                payload = _review_plan_with_llm(topic, contexts, section_evidence)
+                outline = _normalize_review_payload(
+                    payload,
+                    topic,
+                    contexts,
+                    section_evidence,
+                    source="llm",
+                    warnings=warnings,
+                )
+                llm_diagnostics = _llm_diagnostics("full_json", metadata=llm_payload_metadata(payload))
         except LLMError as exc:
             full_error = exc
             try:
@@ -254,8 +265,7 @@ def generate_review_plan(
         outline = _rule_based_review_plan(topic, contexts, section_evidence, warnings)
     outline["llm_diagnostics"] = llm_diagnostics
 
-    coverage = _outline_coverage(outline, section_evidence)
-    coverage["duplicate_evidence_removed"] = evidence_quality["duplicate_evidence_removed"]
+    coverage = _outline_coverage(outline, section_evidence, evidence_quality)
     graph = graph_summary(db_path, doc_ids=[context["doc_id"] for context in contexts], include_conflicts=True)
     _apply_fact_audit_to_review(outline, audit)
     _apply_graph_summary_to_review(outline, graph)
@@ -430,8 +440,9 @@ def _collect_section_evidence(
     topic: str,
     contexts: List[Dict[str, Any]],
     search_mode: str,
-) -> Dict[str, List[Dict[str, Any]]]:
+) -> tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
     result: Dict[str, List[Dict[str, Any]]] = {}
+    by_section: Dict[str, Dict[str, Any]] = {}
     for section in REVIEW_SECTIONS:
         section_id = str(section["section_id"])
         terms = " ".join(str(term) for term in section["search_terms"])
@@ -439,8 +450,11 @@ def _collect_section_evidence(
         evidence: List[Dict[str, Any]] = []
         for context in contexts:
             evidence.extend(_search_doc_evidence(db_path, context["doc_id"], search_query, top_k=3, search_mode=search_mode))
-        result[section_id] = _dedupe_evidence(evidence)[:12]
-    return result
+        compacted, report = _compact_section_evidence(evidence, max_items=12)
+        result[section_id] = compacted
+        by_section[section_id] = report
+    quality = _section_evidence_quality(by_section, result)
+    return result, quality
 
 
 def _search_doc_evidence(db_path: Path, doc_id: str, query: str, top_k: int, search_mode: str = "hybrid") -> List[Dict[str, Any]]:
@@ -710,6 +724,7 @@ def _review_plan_with_section_llm(
     *,
     warnings: List[str],
     full_error: LLMError,
+    recovery_warning: str = "section_json_recovery",
 ) -> Dict[str, Any]:
     sections = []
     fallback_sections: List[str] = []
@@ -742,7 +757,9 @@ def _review_plan_with_section_llm(
             error_type=error.error_type,
             metadata={"retry_count": total_retry, "repair_used": repair_used, "first_error_type": full_error.error_type},
         ) from error
-    outline_warnings = [*warnings, "section_json_recovery"]
+    outline_warnings = [*warnings]
+    if recovery_warning:
+        outline_warnings.append(recovery_warning)
     if fallback_sections:
         outline_warnings.append("section_json_partial")
     diagnostics = _llm_diagnostics(
@@ -1405,7 +1422,11 @@ def _matrix_coverage(matrix: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _outline_coverage(outline: Dict[str, Any], section_evidence: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+def _outline_coverage(
+    outline: Dict[str, Any],
+    section_evidence: Dict[str, List[Dict[str, Any]]],
+    evidence_quality: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     sections = outline.get("sections") or []
     missing_sections = []
     source_doc_ids = set()
@@ -1428,6 +1449,11 @@ def _outline_coverage(outline: Dict[str, Any], section_evidence: Dict[str, List[
         "total_evidence_count": total_evidence,
         "source_doc_count": len(source_doc_ids),
         "missing_sections": missing_sections,
+        "pre_dedupe_count": (evidence_quality or {}).get("pre_dedupe_count", total_evidence),
+        "post_dedupe_count": (evidence_quality or {}).get("post_dedupe_count", total_evidence),
+        "duplicate_evidence_removed": (evidence_quality or {}).get("duplicate_evidence_removed", 0),
+        "post_dedupe_duplicate_count": (evidence_quality or {}).get("post_dedupe_duplicate_count", 0),
+        "duplicate_evidence_removed_by_section": (evidence_quality or {}).get("duplicate_evidence_removed_by_section", {}),
         "warnings": warnings,
     }
 
@@ -1773,6 +1799,34 @@ def _compact_section_evidence(
     }
 
 
+def _section_evidence_quality(
+    compaction_by_section: Dict[str, Dict[str, Any]],
+    section_evidence: Dict[str, List[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    removed_by_section = {
+        section_id: int(report.get("duplicate_evidence_removed") or 0)
+        for section_id, report in compaction_by_section.items()
+    }
+    post_duplicate_count = 0
+    for items in section_evidence.values():
+        post_stats = _dedupe_evidence_with_stats(items)[1]
+        post_duplicate_count += int(post_stats.get("duplicate_evidence_removed") or 0)
+    pre_count = sum(int(report.get("raw_evidence_count") or 0) for report in compaction_by_section.values())
+    post_count = sum(len(items) for items in section_evidence.values())
+    warnings = []
+    if post_duplicate_count:
+        warnings.append("post_dedupe_duplicate_evidence")
+    return {
+        "schema": "section_evidence_quality.v1",
+        "pre_dedupe_count": pre_count,
+        "post_dedupe_count": post_count,
+        "duplicate_evidence_removed": sum(removed_by_section.values()),
+        "duplicate_evidence_removed_by_section": removed_by_section,
+        "post_dedupe_duplicate_count": post_duplicate_count,
+        "warnings": warnings,
+    }
+
+
 def _compact_evidence_item(item: Dict[str, Any]) -> Dict[str, Any]:
     compacted = dict(item)
     summary = compact_whitespace(
@@ -1882,7 +1936,7 @@ def _review_partial_reasons(outline: Dict[str, Any], contexts: List[Dict[str, An
         reasons.append("citation_relation_gaps")
     if any("局限" in item or "limitation" in item for item in warnings):
         reasons.append("missing_limitation_evidence")
-    if int(outline.get("duplicate_evidence_removed") or 0) > 0 or int(coverage.get("duplicate_evidence_removed") or 0) > 0:
+    if int(coverage.get("post_dedupe_duplicate_count") or 0) > 0:
         reasons.append("duplicate_evidence")
     if outline.get("source") == "rule":
         reasons.append("rule_based_review_plan")

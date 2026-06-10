@@ -809,6 +809,30 @@ uv run python -m kb_agent.cli eval-dashboard --format html
 
 提交代码后需要重新跑一次真实 baseline。因为 `quality-baseline` 会记录运行时的 `git_commit`，如果先跑 baseline 再提交，`latest-quality-baseline --real-only` 会正确显示 `baseline_stale_reason=older_git_commit`，这表示报告来自旧 commit，不能代表当前提交。v0.30 还会把未使用 evidence 区分为硬阻塞和 `optional_unused_evidence`：没有缺引用、没有无证据段落时，冗余 evidence 只作为可选清理项，不再进入 `top_review_blockers`。
 
+## v0.31 DeepSeek 长流程降耗与重复证据/事实收敛
+
+v0.31 继续保持草稿质量闭环，但重点不再是草稿正文，而是收敛真实 baseline 剩余的运行时和重复数据问题。`quality-baseline --with-llm` 会对 review 规划启用 baseline-only fast path，直接使用分章节 JSON，避免先尝试长 full JSON；LLM runtime 会区分慢调用、真实请求超时和阶段预算超限。
+
+推荐真实验收：
+
+```bash
+uv run --extra pdf python -m kb_agent.cli quality-baseline articles --with-llm --top-k 3 --llm-timeout-seconds 20 --llm-stage-timeout-seconds 60 --llm-max-docs 2
+uv run python -m kb_agent.cli latest-quality-baseline --real-only --limit 1
+uv run python -m kb_agent.cli eval-dashboard --format html
+```
+
+重点查看：
+
+- `top_review_blockers`
+- `baseline_limitations`
+- `llm_runtime_limitations`
+- `llm_hard_timeout_count`
+- `llm_slow_call_count`
+- `duplicate_evidence_removed`
+- `post_dedupe_duplicate_count`
+
+`top_review_blockers` 现在只展示会直接影响综述草稿质量的硬问题，例如缺引用、无证据段落、低覆盖或去重后仍重复；`baseline_limitations` 展示当前实验边界，例如 `small_corpus`、`real_embedding_not_enabled`、可选 parser 未启用或 DeepSeek 慢/超时。section evidence 会在生成阶段完成去重和跨文档保留，facts 也会在写入 artifacts / SQLite 前按语义 key 合并重复项。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：

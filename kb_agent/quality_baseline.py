@@ -33,12 +33,14 @@ from .utils import compact_whitespace, stable_id, write_json
 
 
 BASELINE_SCHEMA = "quality_baseline.v1"
-CODE_VERSION = "v0.30"
+CODE_VERSION = "v0.31"
 BASELINE_FEATURE_FLAGS = {
     "review_draft_baseline": True,
     "baseline_staleness": True,
     "section_budgeted_review_draft": True,
     "evidence_first_review_draft": True,
+    "baseline_llm_fast_path": True,
+    "blocker_limitation_split": True,
 }
 BASELINE_DIR = DATA_DIR / "eval"
 EVAL_SET_DIR = DATA_DIR / "eval_sets"
@@ -106,6 +108,8 @@ class _LLMBaselineRuntime:
             "total_llm_duration_ms": round(sum(float(stage.get("llm_duration_ms") or 0.0) for stage in stages.values()), 3),
             "total_llm_call_count": sum(int(stage.get("call_count") or 0) for stage in stages.values()),
             "timeout_count": sum(int(stage.get("timeout_count") or 0) for stage in stages.values()),
+            "hard_timeout_count": sum(int(stage.get("hard_timeout_count") or 0) for stage in stages.values()),
+            "slow_call_count": sum(int(stage.get("slow_call_count") or 0) for stage in stages.values()),
             "fallback_count": sum(int(stage.get("fallback_count") or 0) for stage in stages.values()),
             "budget_exhausted": self.budget_exhausted,
             "elapsed_ms": self.elapsed_ms(),
@@ -121,6 +125,9 @@ class _LLMStageRuntime:
         self.warnings: List[str] = []
         self.call_count = 0
         self.timeout_count = 0
+        self.hard_timeout_count = 0
+        self.slow_call_count = 0
+        self._call_durations: List[float] = []
         self.fallback_count = 0
         self.llm_duration_ms = 0.0
         self.started = 0.0
@@ -198,9 +205,15 @@ class _LLMStageRuntime:
 
     def record_event(self, event: Dict[str, Any]) -> None:
         self.call_count += 1
-        self.llm_duration_ms += float(event.get("duration_ms") or 0.0)
+        duration_ms = float(event.get("duration_ms") or 0.0)
+        timeout_ms = float(event.get("timeout_seconds") or self.runtime.timeout_seconds or 0) * 1000
+        self._call_durations.append(duration_ms)
+        self.llm_duration_ms += duration_ms
+        if timeout_ms and duration_ms >= timeout_ms * 0.8:
+            self.slow_call_count += 1
         if event.get("status") == "timeout" or event.get("error_type") == "request_timeout":
             self.timeout_count += 1
+            self.hard_timeout_count += 1
             self.warnings.append("request_timeout")
         elif event.get("status") == "failed":
             self.warnings.append(str(event.get("error_type") or "llm_failed"))
@@ -216,8 +229,12 @@ class _LLMStageRuntime:
             "duration_ms": self.duration_ms,
             "llm_duration_ms": round(self.llm_duration_ms, 3),
             "call_count": self.call_count,
+            "avg_call_duration_ms": round(sum(self._call_durations) / max(1, len(self._call_durations)), 3),
+            "slow_call_count": self.slow_call_count,
             "fallback_count": self.fallback_count,
             "timeout_count": self.timeout_count,
+            "hard_timeout_count": self.hard_timeout_count,
+            "soft_stage_budget_exceeded": self.reason == "stage_budget_exceeded",
             "warnings": _unique_strings(self.warnings),
         }
 
@@ -368,6 +385,8 @@ def run_quality_baseline(
         "duration_ms": round((time.time() - started) * 1000, 3),
     }
     report["top_review_blockers"] = _top_review_blockers(report)
+    report["baseline_limitations"] = _baseline_limitations(report)
+    report["llm_runtime_limitations"] = _llm_runtime_limitations(report)
     json_path = BASELINE_DIR / f"quality_baseline_{baseline_id}.json"
     md_path = BASELINE_DIR / f"quality_baseline_{baseline_id}.md"
     html_path = BASELINE_DIR / f"quality_baseline_{baseline_id}.html"
@@ -444,6 +463,8 @@ def latest_quality_baseline(
                 "llm_reachable": ((payload.get("llm_status") or {}).get("reachable")),
                 "llm_stage_status": {name: (stage.get("status") if isinstance(stage, dict) else "") for name, stage in stage_summary.items()},
                 "llm_timeout_count": llm_baseline.get("timeout_count", 0),
+                "llm_hard_timeout_count": llm_baseline.get("hard_timeout_count", 0),
+                "llm_slow_call_count": llm_baseline.get("slow_call_count", 0),
                 "llm_total_duration_ms": llm_baseline.get("total_llm_duration_ms", 0.0),
                 "llm_budget_exhausted": bool(llm_baseline.get("budget_exhausted")),
                 "llm_facts_success_rate": llm_facts.get("llm_facts_success_rate", 0.0),
@@ -466,6 +487,8 @@ def latest_quality_baseline(
                 "review_draft_path": review_draft.get("review_draft_path", ""),
                 "section_revision_actions": review_draft.get("section_revision_actions") or [],
                 "top_review_blockers": _top_review_blockers(payload),
+                "baseline_limitations": _baseline_limitations(payload),
+                "llm_runtime_limitations": _llm_runtime_limitations(payload),
                 "duplicate_evidence_removed": review.get("duplicate_evidence_removed", 0),
                 "citation_gap_count_before": fact_delta.get("citation_gap_count_before", 0),
                 "citation_gap_count_after": fact_delta.get("citation_gap_count_after", 0),
@@ -542,15 +565,23 @@ def _top_review_blockers(payload: Dict[str, Any]) -> List[str]:
     review_draft = tasks.get("review_draft") or {}
     llm = payload.get("llm_baseline") or {}
     blockers: List[str] = []
-    blockers.extend(review.get("review_partial_reasons") or [])
-    blockers.extend(review_draft.get("quality_reasons") or [])
+    hard_review_reasons = {
+        "missing_refs",
+        "unsupported_paragraphs",
+        "low_evidence_coverage",
+        "section_draft_missing",
+        "section_draft_skipped",
+        "duplicate_evidence",
+    }
+    blockers.extend(reason for reason in review.get("review_partial_reasons") or [] if reason in hard_review_reasons)
+    blockers.extend(reason for reason in review_draft.get("quality_reasons") or [] if reason in hard_review_reasons)
     if not review_draft or review_draft.get("status") in {"", "skipped"}:
         blockers.append("review_draft_skipped")
     if int(review_draft.get("skipped_section_count") or 0) > 0:
         blockers.append("section_draft_skipped")
-    if review_draft.get("status") == "partial":
+    if review_draft.get("status") == "partial" and any(reason in blockers for reason in hard_review_reasons):
         blockers.append("review_draft_partial")
-    if review_draft.get("review_draft_skip_reason") or review_draft.get("reason"):
+    if int(review_draft.get("skipped_section_count") or 0) > 0 and (review_draft.get("review_draft_skip_reason") or review_draft.get("reason")):
         blockers.append(str(review_draft.get("review_draft_skip_reason") or review_draft.get("reason")))
     if int(review_draft.get("missing_ref_count") or 0) > 0:
         blockers.append("missing_refs")
@@ -558,29 +589,80 @@ def _top_review_blockers(payload: Dict[str, Any]) -> List[str]:
         blockers.append("unsupported_paragraphs")
     if review_draft.get("status") and float(review_draft.get("citation_coverage_score") or 0.0) < 0.8:
         blockers.append("low_evidence_coverage")
-    if int(llm.get("timeout_count") or 0) > 0:
-        blockers.append("llm_timeout")
-    if llm.get("budget_exhausted"):
-        blockers.append("baseline_llm_budget_exhausted")
-    if int(payload.get("doc_count") or 0) < 3:
-        blockers.append("small_corpus")
-    if (payload.get("embedding") or {}).get("real_embedding_status") == "skipped":
-        blockers.append("real_embedding_not_enabled")
+    if "duplicate_evidence" in review.get("review_partial_reasons", []) and int((review.get("evidence_coverage") or {}).get("post_dedupe_duplicate_count") or 0) > 0:
+        blockers.append("duplicate_evidence")
     priority = [
         "missing_refs",
         "unsupported_paragraphs",
         "low_evidence_coverage",
-        "llm_timeout",
-        "baseline_llm_budget_exhausted",
         "review_draft_skipped",
         "section_draft_skipped",
         "review_draft_partial",
         "duplicate_evidence",
-        "small_corpus",
-        "real_embedding_not_enabled",
     ]
-    unique = _unique_strings(blockers)
+    limitation_tags = set(_baseline_limitations(payload))
+    post_duplicate_count = int((review.get("evidence_coverage") or {}).get("post_dedupe_duplicate_count") or 0)
+    operational_tags = {
+        "llm_unavailable",
+        "rule_based_section_draft",
+        "llm_budget_exhausted",
+        "review_draft_partial",
+    }
+    unique = [
+        item
+        for item in _unique_strings(blockers)
+        if item not in limitation_tags
+        and item not in operational_tags
+        and not str(item).startswith("llm_review_draft_stage_budget_exhausted")
+        and not (item == "duplicate_evidence" and post_duplicate_count <= 0)
+    ]
     return sorted(unique, key=lambda item: priority.index(item) if item in priority else len(priority))[:8]
+
+
+def _baseline_limitations(payload: Dict[str, Any]) -> List[str]:
+    llm = payload.get("llm_baseline") or {}
+    runtime = payload.get("llm_runtime") or {}
+    embedding = payload.get("embedding") or {}
+    limitations: List[str] = []
+    if int(payload.get("doc_count") or 0) < 3:
+        limitations.append("small_corpus")
+    if embedding.get("real_embedding_status") == "skipped" or embedding.get("sentence_transformers", {}).get("status") == "skipped":
+        limitations.append("real_embedding_not_enabled")
+    if int(llm.get("timeout_count") or runtime.get("timeout_count") or 0) > 0:
+        limitations.append("llm_timeout")
+    if int(llm.get("hard_timeout_count") or runtime.get("hard_timeout_count") or 0) > 0:
+        limitations.append("hard_llm_timeout")
+    if int(llm.get("slow_call_count") or runtime.get("slow_call_count") or 0) > 0:
+        limitations.append("slow_llm_calls")
+    if llm.get("budget_exhausted") or runtime.get("budget_exhausted"):
+        limitations.append("baseline_llm_budget_exhausted")
+    tasks = payload.get("tasks") or {}
+    review_draft = tasks.get("review_draft") or {}
+    quality_reasons = set(review_draft.get("quality_reasons") or [])
+    warnings = set((review_draft.get("warnings") or []) + (payload.get("warnings") or []))
+    if {"llm_unavailable", "rule_based_section_draft", "llm_budget_exhausted"} & quality_reasons or any(
+        str(warning).startswith("llm_unavailable") or str(warning).startswith("llm_review_draft_stage_budget_exhausted")
+        for warning in warnings
+    ):
+        limitations.append("llm_rule_fallback")
+    if "optional_parser_skipped" in (payload.get("warnings") or []):
+        limitations.append("optional_parser_skipped")
+    return _unique_strings(limitations)
+
+
+def _llm_runtime_limitations(payload: Dict[str, Any]) -> List[str]:
+    llm = payload.get("llm_baseline") or {}
+    runtime = payload.get("llm_runtime") or {}
+    limitations: List[str] = []
+    if int(llm.get("timeout_count") or runtime.get("timeout_count") or 0) > 0:
+        limitations.append("llm_timeout")
+    if int(llm.get("hard_timeout_count") or runtime.get("hard_timeout_count") or 0) > 0:
+        limitations.append("hard_llm_timeout")
+    if int(llm.get("slow_call_count") or runtime.get("slow_call_count") or 0) > 0:
+        limitations.append("slow_llm_calls")
+    if llm.get("budget_exhausted") or runtime.get("budget_exhausted"):
+        limitations.append("baseline_llm_budget_exhausted")
+    return _unique_strings(limitations)
 
 
 def _corpus_fingerprint(root: Path, files: List[Path]) -> str:
@@ -1332,6 +1414,7 @@ def _task_baseline(
                 use_llm=review_use_llm,
                 require_llm=False,
                 search_mode="tree",
+                prefer_section_llm=review_use_llm,
             )
             if review_use_llm and review.get("llm_error"):
                 stage.mark_fallback(str(review.get("llm_error")))
@@ -1374,6 +1457,7 @@ def _task_baseline(
                             require_llm=False,
                             should_continue=stage.can_continue,
                             skip_reason="llm_review_draft_stage_budget_exhausted",
+                            budget_fallback_to_rule=True,
                         )
                         result["review_draft"] = _review_draft_summary(draft)
                         if draft.get("llm_error"):
@@ -1457,6 +1541,8 @@ def _llm_baseline_summary(
             "total_llm_duration_ms": runtime.get("total_llm_duration_ms", 0.0),
             "total_llm_call_count": runtime.get("total_llm_call_count", 0),
             "timeout_count": runtime.get("timeout_count", 0),
+            "hard_timeout_count": runtime.get("hard_timeout_count", 0),
+            "slow_call_count": runtime.get("slow_call_count", 0),
             "budget_exhausted": bool(runtime.get("budget_exhausted")),
             "tree_search": {"rule_doc_count": len(tree.get("items") or []), "llm_doc_count": 0, "llm_used_count": 0, "fallback_count": 0, "comparison": []},
             "insights_and_facts": {
@@ -1510,6 +1596,8 @@ def _llm_baseline_summary(
         "total_llm_duration_ms": runtime.get("total_llm_duration_ms", 0.0),
         "total_llm_call_count": runtime.get("total_llm_call_count", 0),
         "timeout_count": runtime.get("timeout_count", 0),
+        "hard_timeout_count": runtime.get("hard_timeout_count", 0),
+        "slow_call_count": runtime.get("slow_call_count", 0),
         "budget_exhausted": bool(runtime.get("budget_exhausted")),
         "tree_search": {
             "rule_doc_count": len(tree.get("items") or []),
@@ -1761,6 +1849,8 @@ def _baseline_markdown(report: Dict[str, Any]) -> str:
         f"- llm_baseline_status: `{(report.get('llm_baseline') or {}).get('status', '')}`",
         f"- llm_reachable: `{(report.get('llm_status') or {}).get('reachable', '')}`",
         f"- llm_timeout_count: `{(report.get('llm_baseline') or {}).get('timeout_count', 0)}`",
+        f"- llm_hard_timeout_count: `{(report.get('llm_baseline') or {}).get('hard_timeout_count', 0)}`",
+        f"- llm_slow_call_count: `{(report.get('llm_baseline') or {}).get('slow_call_count', 0)}`",
         f"- llm_budget_exhausted: `{(report.get('llm_baseline') or {}).get('budget_exhausted', False)}`",
         f"- llm_facts_success_rate: `{((report.get('llm_baseline') or {}).get('insights_and_facts') or {}).get('llm_facts_success_rate', 0.0)}`",
         f"- llm_compare_dimension_success_rate: `{((report.get('llm_baseline') or {}).get('tasks') or {}).get('llm_compare_dimension_success_rate', 0.0)}`",
@@ -1778,6 +1868,8 @@ def _baseline_markdown(report: Dict[str, Any]) -> str:
         f"- embedding_rebuild_needed: `{(report.get('embedding') or {}).get('embedding_rebuild_needed', False)}`",
         f"- review_partial_reasons: `{', '.join(((report.get('tasks') or {}).get('review') or {}).get('review_partial_reasons') or [])}`",
         f"- top_review_blockers: `{', '.join(report.get('top_review_blockers') or [])}`",
+        f"- baseline_limitations: `{', '.join(report.get('baseline_limitations') or [])}`",
+        f"- llm_runtime_limitations: `{', '.join(report.get('llm_runtime_limitations') or [])}`",
         f"- warning_count: `{len(report.get('warnings') or [])}`",
         "",
         "## Documents",
@@ -1832,6 +1924,8 @@ def _baseline_html(report: Dict[str, Any]) -> str:
         ("LLM Reachable", (report.get("llm_status") or {}).get("reachable", "")),
         ("LLM Calls", llm_baseline.get("total_llm_call_count", 0)),
         ("LLM Timeouts", llm_baseline.get("timeout_count", 0)),
+        ("Hard Timeouts", llm_baseline.get("hard_timeout_count", 0)),
+        ("Slow Calls", llm_baseline.get("slow_call_count", 0)),
         ("LLM Budget", "exhausted" if llm_baseline.get("budget_exhausted") else "ok"),
         ("Facts LLM Rate", llm_facts.get("llm_facts_success_rate", 0.0)),
         ("Compare LLM Rate", llm_tasks.get("llm_compare_dimension_success_rate", 0.0)),
@@ -1848,6 +1942,7 @@ def _baseline_html(report: Dict[str, Any]) -> str:
         ("Hybrid Provider", embedding.get("hybrid_embedding_provider", "")),
         ("Tree Trace", tree_summary.get("llm_trace_completeness_avg") or tree_summary.get("rule_trace_completeness_avg") or 0.0),
         ("Evidence Dedupe", review.get("duplicate_evidence_removed", 0)),
+        ("Limitations", ", ".join(report.get("baseline_limitations") or [])),
         ("Citation Gaps", f"{fact_delta.get('citation_gap_count_before', 0)}->{fact_delta.get('citation_gap_count_after', 0)}"),
         ("Memory", (report.get("memory") or {}).get("status", "")),
         ("Graph Conflicts", (report.get("claim_graph") or {}).get("conflict_count", 0)),

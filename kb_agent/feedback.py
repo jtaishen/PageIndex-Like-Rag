@@ -521,6 +521,7 @@ def _dashboard_markdown(dashboard: Dict[str, Any]) -> str:
         f"- latest_citation_coverage: `{baseline.get('citation_coverage_score', 0.0)}`",
         f"- latest_review_draft_path: `{baseline.get('review_draft_path', '')}`",
         f"- latest_top_review_blockers: `{', '.join(baseline.get('top_review_blockers') or [])}`",
+        f"- latest_baseline_limitations: `{', '.join(baseline.get('baseline_limitations') or [])}`",
         "",
         "## Feedback Labels",
     ]
@@ -613,6 +614,7 @@ def _dashboard_html(dashboard: Dict[str, Any]) -> str:
         ("Skipped Sections", baseline.get("skipped_section_count", 0)),
         ("Removed Paragraphs", baseline.get("removed_paragraph_count", 0)),
         ("Citation Coverage", baseline.get("citation_coverage_score", 0.0)),
+        ("Limitations", ", ".join(baseline.get("baseline_limitations") or [])),
     ]
     card_html = "\n".join(
         f"<section class='card'><div class='label'>{escape(str(label))}</div><div class='value'>{escape(str(value))}</div></section>"
@@ -673,6 +675,7 @@ def _dashboard_html(dashboard: Dict[str, Any]) -> str:
             f"coverage={baseline.get('citation_coverage_score', 0.0)} "
             f"draft_path={baseline.get('review_draft_path', '')}",
             f"top_blockers={', '.join(baseline.get('top_review_blockers') or [])}",
+            f"limitations={', '.join(baseline.get('baseline_limitations') or [])}",
         ]
         if baseline
         else [],

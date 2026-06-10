@@ -295,7 +295,15 @@ def _normalize_fact(row: Dict[str, Any]) -> Dict[str, Any]:
 def _duplicate_groups(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     groups: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
-        key = "|".join([row.get("fact_type") or "", row.get("type") or "", row.get("normalized_key") or ""])
+        parts = [
+            row.get("doc_id") or "",
+            row.get("fact_type") or "",
+            row.get("type") or "",
+            row.get("normalized_key") or "",
+        ]
+        if row.get("type") in {"cites", "citation"}:
+            parts.append(row.get("node_id") or "")
+        key = "|".join(parts)
         if key.endswith("|"):
             continue
         groups.setdefault(key, []).append(row)

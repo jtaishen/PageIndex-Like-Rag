@@ -115,6 +115,7 @@ def extract_facts(
 
     facts = _merge_citation_relations(doc_id, version_id, card, facts, citation_map, node_by_id)
     facts = _merge_table_facts(doc_id, version_id, facts, table_content, table_summaries, node_by_id)
+    facts = _dedupe_facts(facts)
     artifacts = _build_fact_artifacts(doc_id, version_id, card, quality, facts, llm_error)
     _write_fact_artifacts(artifact_dir, artifacts)
     _replace_fact_rows(db_path, doc_id, version_id, facts)
@@ -473,6 +474,7 @@ def _node_batches(nodes: List[Dict[str, Any]], batch_size: int) -> List[List[Dic
 
 def _merge_fact_parts(parts: List[Dict[str, Any]]) -> Dict[str, Any]:
     quality_stats: Dict[str, int] = {}
+    dedupe_stats = {"dedupe_input_count": 0, "dedupe_merged_count": 0}
     warnings: List[str] = []
     merged = {
         "claims": [],
@@ -486,6 +488,10 @@ def _merge_fact_parts(parts: List[Dict[str, Any]]) -> Dict[str, Any]:
         warnings.extend(part.get("warnings") or [])
         for key, value in (part.get("quality_stats") or {}).items():
             quality_stats[key] = quality_stats.get(key, 0) + int(value or 0)
+        part_dedupe = part.get("dedupe_stats") or {}
+        dedupe_stats["dedupe_input_count"] += int(part_dedupe.get("dedupe_input_count") or 0)
+        dedupe_stats["dedupe_merged_count"] += int(part_dedupe.get("dedupe_merged_count") or 0)
+    merged["dedupe_stats"] = dedupe_stats
     normalized = _dedupe_facts(merged)
     _apply_fact_quality_filters(normalized, quality_stats)
     normalized["quality_stats"] = quality_stats
@@ -829,6 +835,7 @@ def _merge_citation_relations(
         "claims": facts.get("claims") or [],
         "entities": facts.get("entities") or [],
         "relations": [*citation_relations, *(facts.get("relations") or [])],
+        "dedupe_stats": facts.get("dedupe_stats") or {},
     }
     normalized = _dedupe_facts(merged)
     quality_stats = dict(facts.get("quality_stats") or {})
@@ -908,6 +915,7 @@ def _merge_table_facts(
         "claims": [*(facts.get("claims") or []), *table_facts["claims"]],
         "entities": [*(facts.get("entities") or []), *table_facts["entities"]],
         "relations": [*(facts.get("relations") or []), *table_facts["relations"]],
+        "dedupe_stats": facts.get("dedupe_stats") or {},
     }
     normalized = _dedupe_facts(merged)
     quality_stats = dict(facts.get("quality_stats") or {})
@@ -1112,6 +1120,7 @@ def _build_fact_artifacts(
     warnings = _unique_strings(facts.get("warnings") or [])
     quality_stats = facts.get("quality_stats") or {}
     batch_report = facts.get("llm_batch_report") or {}
+    dedupe_stats = facts.get("dedupe_stats") or {}
     low_confidence = sum(1 for item in [*claims, *entities, *relations] if float(item.get("confidence") or 0.0) < 0.5)
     no_evidence = sum(1 for item in [*claims, *entities, *relations] if not item.get("node_id"))
     table_backed = sum(1 for item in [*claims, *entities, *relations] if _is_table_source(str(item.get("source") or "")))
@@ -1177,6 +1186,10 @@ def _build_fact_artifacts(
         "noise_filtered_count": int(quality_stats.get("noise_filtered_count") or 0),
         "entity_noise_filtered_count": int(quality_stats.get("entity_noise_filtered_count") or 0),
         "long_claim_trimmed_count": int(quality_stats.get("long_claim_trimmed_count") or 0),
+        "dedupe_input_count": int(dedupe_stats.get("dedupe_input_count") or len(claims) + len(entities) + len(relations)),
+        "dedupe_merged_count": int(dedupe_stats.get("dedupe_merged_count") or 0),
+        "post_dedupe_duplicate_count": int(dedupe_stats.get("post_dedupe_duplicate_count") or 0),
+        "fact_dedupe": dedupe_stats,
         "claim_count": len(claims),
         "entity_count": len(entities),
         "relation_count": len(relations),
@@ -1211,7 +1224,10 @@ def _replace_fact_rows(db_path: Path, doc_id: str, version_id: str, facts: Dict[
     conn = db.connect(db_path)
     db.init_db(conn)
     try:
-        db.delete_paper_facts(conn, doc_id, version_id)
+        # Facts are queried by document, not by historical parser version. Keeping
+        # older version rows makes repeated sync/extract runs look like duplicate
+        # facts, so refresh the document's fact layer as a single current snapshot.
+        db.delete_paper_facts(conn, doc_id)
         db.insert_paper_claims(conn, facts.get("claims") or [])
         db.insert_paper_entities(conn, facts.get("entities") or [])
         db.insert_paper_relations(conn, facts.get("relations") or [])
@@ -1472,10 +1488,37 @@ def _citation_entities(
 
 
 def _dedupe_facts(facts: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    claims, claim_stats = _dedupe_by_key(facts.get("claims") or [], "normalized_text", "claim")
+    entities, entity_stats = _dedupe_by_key(facts.get("entities") or [], "normalized_name", "entity")
+    relations, relation_stats = _dedupe_relations(facts.get("relations") or [])
+    prior_stats = facts.get("dedupe_stats") or {}
+    input_count = claim_stats["input_count"] + entity_stats["input_count"] + relation_stats["input_count"]
+    output_count = len(claims) + len(entities) + len(relations)
+    current_merged = max(0, input_count - output_count)
+    prior_input = int(prior_stats.get("dedupe_input_count") or 0)
+    prior_merged = int(prior_stats.get("dedupe_merged_count") or 0)
+    dedupe_stats = {
+        "schema": "fact_dedupe.v1",
+        "dedupe_input_count": max(input_count, prior_input),
+        "dedupe_output_count": output_count,
+        "dedupe_merged_count": prior_merged + current_merged,
+        "post_dedupe_duplicate_count": _post_dedupe_duplicate_count(claims, entities, relations),
+        "by_type": {
+            "claims": claim_stats,
+            "entities": entity_stats,
+            "relations": relation_stats,
+        },
+    }
     return {
-        "claims": _dedupe_by_key(facts.get("claims") or [], "normalized_text"),
-        "entities": _dedupe_by_key(facts.get("entities") or [], "normalized_name"),
-        "relations": _dedupe_relations(facts.get("relations") or []),
+        "claims": claims,
+        "entities": entities,
+        "relations": relations,
+        "dedupe_stats": dedupe_stats,
+        "status": facts.get("status"),
+        "source": facts.get("source"),
+        "quality_stats": facts.get("quality_stats") or {},
+        "llm_batch_report": facts.get("llm_batch_report") or {},
+        "warnings": facts.get("warnings") or [],
     }
 
 
@@ -1519,28 +1562,117 @@ def _looks_like_noisy_entity_name(value: str, entity_type: str = "") -> bool:
     return False
 
 
-def _dedupe_by_key(items: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
+def _dedupe_by_key(items: List[Dict[str, Any]], key: str, fact_type: str) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
     result = []
-    seen = set()
+    seen: Dict[tuple[str, str, str], Dict[str, Any]] = {}
     for item in items:
-        marker = (item.get(key), item.get("node_id"), item.get("type"))
-        if not marker[0] or marker in seen:
+        fallback_key = "text" if fact_type == "claim" else "name"
+        normalized_value = _normalize_key(str(item.get(key) or item.get(fallback_key) or ""))
+        if fact_type == "claim" and len(normalized_value) > 120:
+            normalized_value = normalized_value[:120]
+        marker = (
+            str(item.get("doc_id") or ""),
+            str(item.get("type") or ""),
+            normalized_value,
+        )
+        if not marker[2]:
             continue
-        seen.add(marker)
-        result.append(item)
-    return result[:300]
+        existing = seen.get(marker)
+        if existing is None:
+            kept = dict(item)
+            seen[marker] = kept
+            result.append(kept)
+            continue
+        _merge_duplicate_fact(existing, item)
+    stats = {
+        "input_count": len(items),
+        "output_count": len(result[:300]),
+        "merged_count": max(0, len(items) - len(result[:300])),
+    }
+    del fact_type
+    return result[:300], stats
 
 
-def _dedupe_relations(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _dedupe_relations(items: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
     result = []
-    seen = set()
+    seen: Dict[tuple[str, str, str, str], Dict[str, Any]] = {}
     for item in items:
-        marker = (item.get("relation_type") or item.get("type"), item.get("subject_id") or item.get("subject_name"), item.get("object_id") or item.get("object_name"), item.get("node_id"))
-        if not marker[0] or marker in seen:
+        relation_type = str(item.get("relation_type") or item.get("type") or "")
+        marker = (
+            str(item.get("doc_id") or ""),
+            relation_type,
+            _relation_endpoint_key(item, "subject"),
+            _relation_endpoint_key(item, "object"),
+        )
+        if relation_type in {"cites", "citation"}:
+            marker = (*marker, str(item.get("node_id") or ""))
+        if not marker[1] or not marker[2] or not marker[3]:
+            continue
+        existing = seen.get(marker)
+        if existing is None:
+            kept = dict(item)
+            seen[marker] = kept
+            result.append(kept)
+            continue
+        _merge_duplicate_fact(existing, item)
+    stats = {
+        "input_count": len(items),
+        "output_count": len(result[:500]),
+        "merged_count": max(0, len(items) - len(result[:500])),
+    }
+    return result[:500], stats
+
+
+def _relation_endpoint_key(item: Dict[str, Any], side: str) -> str:
+    name = _normalize_key(str(item.get(f"{side}_name") or ""))
+    if name:
+        return name
+    return _normalize_key(str(item.get(f"{side}_id") or ""))
+
+
+def _merge_duplicate_fact(existing: Dict[str, Any], candidate: Dict[str, Any]) -> None:
+    existing_aliases = list(existing.get("aliases") or [])
+    if float(candidate.get("confidence") or 0.0) > float(existing.get("confidence") or 0.0):
+        keep_keys = {"claim_id", "entity_id", "relation_id", "created_at"}
+        preserved = {key: existing.get(key) for key in keep_keys if key in existing}
+        existing.clear()
+        existing.update(candidate)
+        existing.update({key: value for key, value in preserved.items() if value})
+    existing["confidence"] = max(float(existing.get("confidence") or 0.0), float(candidate.get("confidence") or 0.0))
+    existing["evidence"] = _merge_evidence(existing.get("evidence") or {}, candidate.get("evidence") or {})
+    aliases = _unique_strings([*existing_aliases, *(existing.get("aliases") or []), *(candidate.get("aliases") or [])])
+    if aliases:
+        existing["aliases"] = aliases
+
+
+def _post_dedupe_duplicate_count(
+    claims: List[Dict[str, Any]],
+    entities: List[Dict[str, Any]],
+    relations: List[Dict[str, Any]],
+) -> int:
+    markers = []
+    markers.extend(("claim", item.get("doc_id"), item.get("type"), item.get("normalized_text")) for item in claims)
+    markers.extend(("entity", item.get("doc_id"), item.get("type"), item.get("normalized_name")) for item in entities)
+    for item in relations:
+        relation_type = item.get("relation_type") or item.get("type")
+        marker = (
+            "relation",
+            item.get("doc_id"),
+            relation_type,
+            _relation_endpoint_key(item, "subject"),
+            _relation_endpoint_key(item, "object"),
+        )
+        if relation_type in {"cites", "citation"}:
+            marker = (*marker, item.get("node_id"))
+        markers.append(marker)
+    seen = set()
+    duplicates = 0
+    for marker in markers:
+        if marker in seen:
+            duplicates += 1
             continue
         seen.add(marker)
-        result.append(item)
-    return result[:500]
+    return duplicates
 
 
 def _graph_nodes(claims: List[Dict[str, Any]], entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1931,7 +2063,10 @@ def _json_value(value: Any, default: Any) -> Any:
 
 
 def _normalize_key(text: str) -> str:
-    return re.sub(r"\s+", "", compact_whitespace(text).lower())
+    value = compact_whitespace(text).lower()
+    value = value.strip(" \t\r\n.,;:!?，。；：！？…")
+    value = re.sub(r"^(?:\.\.\.|…)+", "", value)
+    return re.sub(r"\s+", "", value)
 
 
 def _string_list(value: object) -> List[str]:
