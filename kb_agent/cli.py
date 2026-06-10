@@ -144,6 +144,9 @@ def main(argv: Any = None) -> None:
 
     latest_baseline_parser = subparsers.add_parser("latest-quality-baseline", help="Show latest quality baseline reports")
     latest_baseline_parser.add_argument("--limit", type=int, default=1)
+    latest_baseline_parser.add_argument("--corpus", default=None, help="Filter by corpus path, for example articles")
+    latest_baseline_parser.add_argument("--real-only", action="store_true", help="Only show real articles baselines")
+    latest_baseline_parser.add_argument("--exclude-temp", action="store_true", help="Exclude temporary test fixture baselines")
 
     eval_suite_parser = subparsers.add_parser("eval-suite", help="Create, list, or show reusable evaluation suites")
     eval_suite_subparsers = eval_suite_parser.add_subparsers(dest="suite_command", required=True)
@@ -488,7 +491,14 @@ def main(argv: Any = None) -> None:
             )
         )
     elif args.command == "latest-quality-baseline":
-        _print_json(latest_quality_baseline(limit=args.limit))
+        _print_json(
+            latest_quality_baseline(
+                limit=args.limit,
+                corpus=args.corpus,
+                real_only=args.real_only,
+                exclude_temp=args.exclude_temp,
+            )
+        )
     elif args.command == "llm-status":
         _print_json(llm_status(probe=args.probe))
     elif args.command == "eval-suite":
@@ -1097,6 +1107,10 @@ def _quality_baseline_cli_summary(result: dict) -> dict:
         "path": result.get("path"),
         "md_path": result.get("md_path"),
         "html_path": result.get("html_path"),
+        "run_kind": result.get("run_kind", ""),
+        "corpus_name": result.get("corpus_name", ""),
+        "corpus_fingerprint": result.get("corpus_fingerprint", ""),
+        "is_real_corpus": bool(result.get("is_real_corpus")),
         "corpus_path": result.get("corpus_path"),
         "doc_count": result.get("doc_count", 0),
         "pdf_count": result.get("pdf_count", 0),
@@ -1111,6 +1125,12 @@ def _quality_baseline_cli_summary(result: dict) -> dict:
         "review_llm_error": review_task.get("llm_error", ""),
         "review_fallback_mode": review_diagnostics.get("mode", ""),
         "review_retry_count": review_diagnostics.get("retry_count", 0),
+        "review_partial_reasons": review_task.get("review_partial_reasons") or [],
+        "duplicate_evidence_removed": review_task.get("duplicate_evidence_removed", 0),
+        "citation_gap_count_before": (result.get("fact_audit_delta") or {}).get("citation_gap_count_before", 0),
+        "citation_gap_count_after": (result.get("fact_audit_delta") or {}).get("citation_gap_count_after", 0),
+        "tree_trace_completeness_before": ((result.get("tree_search") or {}).get("comparison_summary") or {}).get("rule_trace_completeness_avg", 0.0),
+        "tree_trace_completeness_after": ((result.get("tree_search") or {}).get("comparison_summary") or {}).get("llm_trace_completeness_avg", 0.0),
         "compare_task_id": ((result.get("tasks") or {}).get("compare") or {}).get("task_id", ""),
         "review_task_id": review_task.get("task_id", ""),
         "claim_graph_id": (result.get("claim_graph") or {}).get("graph_id", ""),

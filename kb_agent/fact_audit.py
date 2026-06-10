@@ -377,7 +377,7 @@ def _citation_gaps(db_path: Path, doc_ids: List[str], rows: List[Dict[str, Any]]
         except (FileNotFoundError, KeyError, ValueError):
             continue
         reference_count = len(citation_map.get("references") or [])
-        relation_count = len(citation_map.get("relations") or [])
+        relation_count = _unique_citation_relation_count(citation_map.get("relations") or [])
         db_cites = relation_counts.get(doc_id, 0)
         if reference_count and db_cites == 0:
             gaps.append(
@@ -400,6 +400,18 @@ def _citation_gaps(db_path: Path, doc_ids: List[str], rows: List[Dict[str, Any]]
                 }
             )
     return gaps
+
+
+def _unique_citation_relation_count(relations: Iterable[Any]) -> int:
+    keys = set()
+    for item in relations:
+        if not isinstance(item, dict):
+            continue
+        ref_id = str(item.get("ref_id") or "")
+        node_id = str(item.get("node_id") or "")
+        if ref_id and node_id:
+            keys.add((ref_id, node_id))
+    return len(keys)
 
 
 def _artifact_summaries(db_path: Path, doc_ids: List[str]) -> List[Dict[str, Any]]:

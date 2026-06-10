@@ -114,6 +114,7 @@ def compare_papers(
     contexts, prepare_warnings = _prepare_paper_contexts(db_path, selected)
     audit = fact_audit_summary(db_path, doc_ids=[context["doc_id"] for context in contexts])
     evidence_by_dimension = _collect_dimension_evidence(db_path, query, contexts, COMPARE_DIMENSIONS, search_mode)
+    evidence_quality = _evidence_duplicate_summary(_flatten_dimension_evidence_raw(evidence_by_dimension))
     warnings = [*prepare_warnings, *_fact_audit_warning_tags(audit)]
     if len(contexts) < 2:
         warnings.append("insufficient_papers_for_comparison")
@@ -145,10 +146,13 @@ def compare_papers(
     matrix["llm_diagnostics"] = llm_diagnostics
 
     coverage = _matrix_coverage(matrix)
+    coverage["duplicate_evidence_removed"] = evidence_quality["duplicate_evidence_removed"]
     graph = graph_summary(db_path, doc_ids=[context["doc_id"] for context in contexts], include_conflicts=True)
     _apply_fact_audit_to_comparison(matrix, audit)
     _apply_graph_summary_to_comparison(matrix, graph)
     matrix["evidence_coverage"] = coverage
+    matrix["evidence_quality"] = evidence_quality
+    matrix["duplicate_evidence_removed"] = evidence_quality["duplicate_evidence_removed"]
     matrix["warnings"] = _unique_strings([*matrix.get("warnings", []), *coverage["warnings"]])
     matrix["status"] = "partial" if matrix["warnings"] or matrix.get("source") == "rule" else "extracted"
 
@@ -211,6 +215,7 @@ def generate_review_plan(
     contexts, prepare_warnings = _prepare_paper_contexts(db_path, selected)
     audit = fact_audit_summary(db_path, doc_ids=[context["doc_id"] for context in contexts])
     section_evidence = _collect_section_evidence(db_path, topic, contexts, search_mode)
+    evidence_quality = _evidence_duplicate_summary([item for items in section_evidence.values() for item in items])
     warnings = [*prepare_warnings, *_fact_audit_warning_tags(audit)]
     if not contexts:
         warnings.append("no_selected_papers")
@@ -254,11 +259,15 @@ def generate_review_plan(
     outline["llm_diagnostics"] = llm_diagnostics
 
     coverage = _outline_coverage(outline, section_evidence)
+    coverage["duplicate_evidence_removed"] = evidence_quality["duplicate_evidence_removed"]
     graph = graph_summary(db_path, doc_ids=[context["doc_id"] for context in contexts], include_conflicts=True)
     _apply_fact_audit_to_review(outline, audit)
     _apply_graph_summary_to_review(outline, graph)
     outline["evidence_coverage"] = coverage
+    outline["evidence_quality"] = evidence_quality
+    outline["duplicate_evidence_removed"] = evidence_quality["duplicate_evidence_removed"]
     outline["warnings"] = _unique_strings([*outline.get("warnings", []), *coverage["warnings"]])
+    outline["review_partial_reasons"] = _review_partial_reasons(outline, contexts, coverage)
     outline["status"] = "partial" if outline["warnings"] or outline.get("source") == "rule" else "extracted"
 
     task_id = _new_task_id("review", topic, [context["doc_id"] for context in contexts])
@@ -1515,17 +1524,107 @@ def _normalize_evidence_refs(value: object, fallback: List[Dict[str, Any]]) -> L
 
 
 def _dedupe_evidence(evidence: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return _dedupe_evidence_with_stats(evidence)[0]
+
+
+def _dedupe_evidence_with_stats(evidence: Iterable[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    raw = [item for item in evidence if isinstance(item, dict)]
     result = []
-    seen = set()
-    for item in evidence:
-        node_id = str(item.get("node_id") or "")
-        doc_id = str(item.get("doc_id") or "")
-        key = (doc_id, node_id)
-        if not node_id or key in seen:
+    seen: Dict[tuple[str, str], Dict[str, Any]] = {}
+    duplicate_count = 0
+    for index, item in enumerate(raw):
+        keys = _evidence_keys(item)
+        if not keys:
             continue
-        seen.add(key)
-        result.append(item)
-    return result
+        existing_key = next((key for key in keys if key in seen), None)
+        if existing_key is None:
+            kept = dict(item)
+            kept.setdefault("dedupe_reason", "kept:unique")
+            kept["_dedupe_index"] = index
+            for key in keys:
+                seen[key] = kept
+            result.append(kept)
+            continue
+        duplicate_count += 1
+        existing = seen[existing_key]
+        if _evidence_priority(item) > _evidence_priority(existing):
+            replacement = dict(item)
+            replacement["dedupe_reason"] = "kept:higher_score"
+            replacement["_dedupe_index"] = existing.get("_dedupe_index", index)
+            result = [replacement if current is existing else current for current in result]
+            for key in keys:
+                seen[key] = replacement
+    for item in result:
+        item.pop("_dedupe_index", None)
+    stats = {
+        "schema": "evidence_dedupe.v1",
+        "raw_evidence_count": len(raw),
+        "unique_evidence_count": len(result),
+        "duplicate_evidence_removed": duplicate_count,
+    }
+    return result, stats
+
+
+def _evidence_keys(item: Dict[str, Any]) -> List[tuple[str, str]]:
+    doc_id = str(item.get("doc_id") or "")
+    node_id = str(item.get("node_id") or "")
+    keys = []
+    if doc_id and node_id:
+        keys.append(("node", f"{doc_id}:{node_id}"))
+    node_path = compact_whitespace(str(item.get("node_path") or ""))
+    excerpt = compact_whitespace(str(item.get("excerpt") or ""))
+    if doc_id and node_path and excerpt:
+        keys.append(("text", stable_id("evidence_text", doc_id, node_path, excerpt[:260], length=18)))
+    return keys
+
+
+def _evidence_priority(item: Dict[str, Any]) -> tuple[float, float]:
+    score = item.get("tree_score")
+    if score is None:
+        score = item.get("confidence")
+    try:
+        parsed = float(score or 0.0)
+    except (TypeError, ValueError):
+        parsed = 0.0
+    excerpt_len = len(compact_whitespace(str(item.get("excerpt") or "")))
+    return (parsed, min(240.0, float(excerpt_len)))
+
+
+def _evidence_duplicate_summary(evidence: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    _, stats = _dedupe_evidence_with_stats(evidence)
+    return stats
+
+
+def _flatten_dimension_evidence_raw(evidence_by_dimension: Dict[str, Dict[str, List[Dict[str, Any]]]]) -> List[Dict[str, Any]]:
+    evidence: List[Dict[str, Any]] = []
+    for by_doc in evidence_by_dimension.values():
+        for items in by_doc.values():
+            evidence.extend(items)
+    return evidence
+
+
+def _review_partial_reasons(outline: Dict[str, Any], contexts: List[Dict[str, Any]], coverage: Dict[str, Any]) -> List[str]:
+    reasons = []
+    if len(contexts) < 3:
+        reasons.append("small_corpus")
+    if coverage.get("missing_sections"):
+        reasons.append("missing_section_evidence")
+    if int(coverage.get("source_doc_count") or 0) < max(1, min(2, len(contexts))):
+        reasons.append("low_source_doc_coverage")
+    warnings = [str(item) for item in outline.get("warnings") or []]
+    if any("citation_gap" in item or "引用缺口" in item for item in warnings):
+        reasons.append("citation_relation_gaps")
+    if any("局限" in item or "limitation" in item for item in warnings):
+        reasons.append("missing_limitation_evidence")
+    if int(outline.get("duplicate_evidence_removed") or 0) > 0 or int(coverage.get("duplicate_evidence_removed") or 0) > 0:
+        reasons.append("duplicate_evidence")
+    if outline.get("source") == "rule":
+        reasons.append("rule_based_review_plan")
+    if any("llm_unavailable" in item for item in warnings):
+        reasons.append("llm_unavailable")
+    if not reasons and (outline.get("status") == "partial" or warnings):
+        reasons.append("quality_warnings")
+    return _unique_strings(reasons)
 
 
 def _find_by_id(raw_items: object, expected_id: str, key: str = "id") -> Dict[str, Any]:

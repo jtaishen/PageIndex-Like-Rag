@@ -85,6 +85,7 @@ def tree_search(
             "doc_id": doc_id,
             "query": query,
             "query_profile": profile,
+            "resolved_intent": str(profile.get("intent") or "unknown"),
             "requested_search_mode": search_mode,
             "effective_search_mode": flat_mode,
             "budget": budget,
@@ -163,15 +164,20 @@ def tree_search_for_query(
     )
     if not docs:
         warnings.append("no_routed_documents")
+    profile = traces[0].get("query_profile") if traces else classify_query(query, use_llm=False)
     return {
         "schema": "tree_search_multi_trace.v1",
         "query": query,
         "doc_id": None,
+        "query_profile": profile,
+        "resolved_intent": str((profile or {}).get("intent") or "unknown"),
         "requested_search_mode": search_mode,
         "effective_search_mode": route_mode,
         "top_k": top_k,
         "routed_documents": docs,
         "traces": traces,
+        "expanded_nodes": _aggregate_trace_items(traces, "expanded_nodes", top_k * 3),
+        "selected_paths": _aggregate_trace_items(traces, "selected_paths", top_k * 3),
         "warnings": warnings,
         "results": results[:top_k],
         "evidence": ordered_evidence[:top_k],
@@ -280,9 +286,10 @@ def _score_nodes(
         components = {
             "search_signal": float(signal.get("rank_score") or 0.0),
             "vector_signal": min(0.12, max(0.0, float(signal.get("vector_score") or 0.0)) * 0.12),
-            "term_match": min(0.28, term_hits * 0.035 + heading_hits * 0.025),
-            "intent_type": 0.12 if node_type in preferred_types else 0.0,
-            "section_match": min(0.14, section_hits * 0.045),
+            "term_match": min(0.34, term_hits * 0.04 + heading_hits * 0.04),
+            "intent_type": 0.14 if node_type in preferred_types else 0.0,
+            "section_match": min(0.18, section_hits * 0.055),
+            "heading_path_match": min(0.12, heading_hits * 0.035 + section_hits * 0.02),
             "leaf_bonus": 0.06 if row.get("text") and node_type not in {"document", "page"} else 0.0,
             "memory_preference": _memory_boost(preferences, text),
             "quality_penalty": _quality_penalty(quality),
@@ -294,6 +301,7 @@ def _score_nodes(
             "components": components,
             "term_hits": term_hits,
             "section_hits": section_hits,
+            "selected_reason": _selected_reason(row, components, signal),
             "rank_reason": _rank_reason(components, signal),
         }
     return scored
@@ -424,6 +432,8 @@ def _build_trace_paths(
                 "node_path": by_id[node_id].get("node_path") if node_id in by_id else "",
                 "score": scored.get(node_id, {}).get("score", 0.0),
                 "score_components": scored.get(node_id, {}).get("components", {}),
+                "selected_reason": scored.get(node_id, {}).get("selected_reason", ""),
+                "dedupe_reason": "kept:node_id",
                 "path_node_ids": path,
             }
         )
@@ -510,6 +520,8 @@ def _evidence_for_selected(
         item["confidence"] = round(max(0.35, min(0.95, 0.55 + score * 0.7)), 3)
         item["tree_score"] = score
         item["score_components"] = scored.get(node_id, {}).get("components", {})
+        item["selected_reason"] = scored.get(node_id, {}).get("selected_reason", "")
+        item["dedupe_reason"] = "kept:node_id"
         item["rank_reason"] = scored.get(node_id, {}).get("rank_reason", "tree:value")
         evidence.append(item)
     return evidence
@@ -661,7 +673,45 @@ def _noise_penalty(row: Dict[str, Any], intent: str, query: str) -> float:
     compacted = text.replace(" ", "")
     if any(token in compacted for token in ("目录", "学号", "指导教师", "分类号", "密级", "网络首发", "引用格式")):
         penalty -= 0.08
+    plain_text = compact_whitespace(str(row.get("text") or row.get("summary") or ""))
+    if plain_text and len(plain_text) <= 6 and node_type not in {"keywords", "table", "figure"}:
+        penalty -= 0.05
+    if re_like_page_noise(compacted):
+        penalty -= 0.06
     return penalty
+
+
+def re_like_page_noise(text: str) -> bool:
+    return bool(
+        text
+        and (
+            text.isdigit()
+            or text.lower() in {"no", "no.", "ra", "rb", "rc"}
+            or "doi:" in text.lower()
+            or "版权所有" in text
+        )
+    )
+
+
+def _selected_reason(row: Dict[str, Any], components: Dict[str, float], signal: Dict[str, Any]) -> str:
+    positive = [
+        key
+        for key, value in sorted(components.items(), key=lambda item: -float(item[1]))
+        if float(value) > 0.0001
+    ][:3]
+    negative = [
+        key
+        for key, value in sorted(components.items(), key=lambda item: float(item[1]))
+        if float(value) < -0.0001
+    ][:2]
+    parts = [f"type={row.get('type') or ''}"]
+    if positive:
+        parts.append("boost=" + ",".join(positive))
+    if negative:
+        parts.append("penalty=" + ",".join(negative))
+    if signal.get("rank"):
+        parts.append(f"flat_rank={signal.get('rank')}")
+    return ";".join(parts)
 
 
 def _rank_reason(components: Dict[str, float], signal: Dict[str, Any]) -> str:
@@ -706,11 +756,13 @@ def _trace_warnings(
 
 
 def _empty_trace(doc_id: str, query: str, budget: int, warning: str) -> Dict[str, Any]:
+    profile = classify_query(query, use_llm=False)
     return {
         "schema": "tree_search_trace.v1",
         "doc_id": doc_id,
         "query": query,
-        "query_profile": classify_query(query, use_llm=False),
+        "query_profile": profile,
+        "resolved_intent": str(profile.get("intent") or "unknown"),
         "requested_search_mode": "hybrid",
         "effective_search_mode": "hybrid",
         "budget": budget,
@@ -726,6 +778,20 @@ def _empty_trace(doc_id: str, query: str, budget: int, warning: str) -> Dict[str
         "evidence": [],
         "latency_ms": 0.0,
     }
+
+
+def _aggregate_trace_items(traces: List[Dict[str, Any]], key: str, limit: int) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for trace in traces:
+        doc_id = str(trace.get("doc_id") or "")
+        for item in trace.get(key) or []:
+            if isinstance(item, dict):
+                enriched = dict(item)
+                enriched.setdefault("doc_id", doc_id)
+                items.append(enriched)
+            if len(items) >= limit:
+                return items
+    return items
 
 
 def _log_query(conn: Any, trace: Dict[str, Any], started: float) -> None:

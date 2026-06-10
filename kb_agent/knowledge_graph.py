@@ -267,6 +267,7 @@ def graph_summary(
         "conflict_count": report.get("conflict_count", 0),
         "isolated_fact_count": report.get("isolated_fact_count", 0),
         "evidence_coverage_rate": report.get("evidence_coverage_rate", 0.0),
+        "noisy_entity_count": report.get("noisy_entity_count", 0),
         "top_entities": report.get("top_entities") or [],
         "warnings": report.get("warnings") or [],
     }
@@ -564,12 +565,16 @@ def _graph_report(
     type_counts: Dict[str, int] = {}
     edge_type_counts: Dict[str, int] = {}
     entity_counts: Dict[str, int] = {}
+    noisy_entity_count = 0
     for node in nodes:
         node_type = str(node.get("type") or "")
         type_counts[node_type] = type_counts.get(node_type, 0) + 1
         if node_type == "entity":
             label = str(node.get("label") or "")
-            entity_counts[label] = entity_counts.get(label, 0) + 1
+            if _looks_like_noisy_entity_label(label):
+                noisy_entity_count += 1
+            else:
+                entity_counts[label] = entity_counts.get(label, 0) + 1
     for edge in edges:
         edge_type = str(edge.get("type") or "")
         edge_type_counts[edge_type] = edge_type_counts.get(edge_type, 0) + 1
@@ -588,6 +593,7 @@ def _graph_report(
         "isolated_facts": [_node_ref(item) for item in isolated[:50]],
         "low_confidence_count": len(low_confidence),
         "low_confidence_nodes": [_node_ref(item) for item in low_confidence[:50]],
+        "noisy_entity_count": noisy_entity_count,
         "evidence_coverage_rate": round(evidence_linked / max(1, fact_node_count), 4),
         "top_entities": [
             {"label": key, "count": value}
@@ -597,6 +603,34 @@ def _graph_report(
         "created_at": graph.get("created_at"),
     }
     return report
+
+
+def _looks_like_noisy_entity_label(value: str) -> bool:
+    text = compact_whitespace(value).strip(" ,，.。;；:：()（）[]【】")
+    lowered = text.lower()
+    if not text:
+        return True
+    if lowered in {"no", "no.", "ra", "rb", "rc", "rd"}:
+        return True
+    if len(text) <= 2 and re_ascii_token(text):
+        return True
+    if re_contains_sentence_punctuation(text):
+        return True
+    chinese_count = sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+    allowed_suffix = ("方法", "算法", "模型", "框架", "系统", "平台", "数据集", "指标", "任务", "场景", "机制", "模块")
+    if chinese_count > 24 and not text.endswith(allowed_suffix):
+        return True
+    if len(text) > 18 and any(token in text for token in ("则", "并", "以及", "进行", "涵盖", "包括", "通过", "用于")) and not text.endswith(allowed_suffix):
+        return True
+    return False
+
+
+def re_ascii_token(text: str) -> bool:
+    return all(char.isascii() and (char.isalnum() or char == ".") for char in text)
+
+
+def re_contains_sentence_punctuation(text: str) -> bool:
+    return any(char in text for char in "。！？!?；;\n")
 
 
 def _isolated_fact_nodes(nodes: Dict[str, Dict[str, Any]], edges: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:

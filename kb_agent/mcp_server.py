@@ -230,9 +230,14 @@ if FastMCP is not None:
         )
 
     @mcp.tool()
-    def kb_get_latest_quality_baseline(limit: int = 1) -> Dict[str, Any]:
+    def kb_get_latest_quality_baseline(
+        limit: int = 1,
+        corpus: Optional[str] = None,
+        real_only: bool = False,
+        exclude_temp: bool = False,
+    ) -> Dict[str, Any]:
         """Return latest quality baseline summaries without evidence text."""
-        return latest_quality_baseline(limit=limit)
+        return latest_quality_baseline(limit=limit, corpus=corpus, real_only=real_only, exclude_temp=exclude_temp)
 
     @mcp.tool()
     def kb_create_eval_suite(

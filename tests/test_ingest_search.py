@@ -416,6 +416,10 @@ class IngestSearchTest(unittest.TestCase):
             relation_types = {item["type"] for item in relations["relations"]}
             self.assertIn("cites", relation_types)
             self.assertIn("supports", relation_types)
+            cite_relations = [item for item in relations["relations"] if item["type"] == "cites"]
+            citation_map = get_citation_map(db_path, doc_id)
+            self.assertGreaterEqual(len(cite_relations), len(citation_map["relations"]))
+            self.assertEqual(report["entity_noise_filtered_count"], 0)
 
             for collection in (claims["claims"], entities["entities"], relations["relations"]):
                 for item in collection:
@@ -630,6 +634,7 @@ class IngestSearchTest(unittest.TestCase):
     def test_claim_graph_navigation_exports_and_dashboard(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path, doc_ids = _sync_fact_audit_samples(Path(tmp))
+            _insert_noisy_entity_for_graph(db_path, doc_ids[0])
 
             result = build_knowledge_graph(db_path, doc_ids=doc_ids, include_conflicts=True, min_confidence=0.5)
 
@@ -669,6 +674,8 @@ class IngestSearchTest(unittest.TestCase):
             report = get_graph_report(db_path, result["graph_id"])
             self.assertEqual(report["schema"], "knowledge_graph_report.v1")
             self.assertGreaterEqual(report["evidence_coverage_rate"], 0.5)
+            self.assertGreaterEqual(report["noisy_entity_count"], 1)
+            self.assertNotIn("No.", {item["label"] for item in report["top_entities"]})
 
             comparison = compare_papers(db_path, "任务完成率方法对比", doc_ids=doc_ids, use_llm=False)
             self.assertIn("claim_graph", comparison["comparison_matrix"])
@@ -740,6 +747,10 @@ class IngestSearchTest(unittest.TestCase):
 
             self.assertEqual(result["schema"], "quality_baseline.v1")
             self.assertEqual(result["doc_count"], 2)
+            self.assertEqual(result["run_kind"], "test_fixture")
+            self.assertFalse(result["is_real_corpus"])
+            self.assertTrue(result["corpus_fingerprint"])
+            self.assertEqual(result["fact_audit_delta"]["schema"], "fact_audit_delta.v1")
             self.assertTrue(Path(result["json_path"]).exists())
             self.assertTrue(Path(result["md_path"]).exists())
             self.assertTrue(Path(result["html_path"]).exists())
@@ -766,6 +777,12 @@ class IngestSearchTest(unittest.TestCase):
             latest = latest_quality_baseline(limit=1)
             self.assertEqual(latest["schema"], "quality_baseline_latest.v1")
             self.assertGreaterEqual(latest["count"], 1)
+            filtered_latest = latest_quality_baseline(limit=1, corpus=papers)
+            self.assertEqual(filtered_latest["count"], 1)
+            self.assertEqual(filtered_latest["items"][0]["corpus_path"], str(papers.resolve()))
+            self.assertEqual(filtered_latest["items"][0]["run_kind"], "test_fixture")
+            real_filtered = latest_quality_baseline(limit=1, corpus=papers, real_only=True)
+            self.assertEqual(real_filtered["count"], 0)
 
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout), mock.patch(
@@ -777,8 +794,10 @@ class IngestSearchTest(unittest.TestCase):
 
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
-                cli_main(["latest-quality-baseline", "--limit", "1"])
-            self.assertIn("quality_baseline_latest.v1", stdout.getvalue())
+                cli_main(["latest-quality-baseline", "--limit", "1", "--corpus", str(papers)])
+            latest_stdout = stdout.getvalue()
+            self.assertIn("quality_baseline_latest.v1", latest_stdout)
+            self.assertIn("run_kind", latest_stdout)
 
     def test_quality_baseline_with_llm_records_sanitized_llm_comparison(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -849,7 +868,9 @@ class IngestSearchTest(unittest.TestCase):
             self.assertGreaterEqual(result["llm_baseline"]["insights_and_facts"]["llm_used_count"], 1)
             self.assertIn("review_fallback_mode", result["llm_baseline"]["tasks"])
             self.assertIn("review_retry_count", result["llm_baseline"]["tasks"])
+            self.assertIn("review_partial_reasons", result["llm_baseline"]["tasks"])
             self.assertIn("llm_diagnostics", result["tasks"]["review"])
+            self.assertIn("comparison_summary", result["tree_search"])
             html = Path(result["html_path"]).read_text(encoding="utf-8")
             self.assertNotIn("sk-", html)
             self.assertNotIn("excerpt", html)
@@ -886,6 +907,18 @@ class IngestSearchTest(unittest.TestCase):
                         "name": "A",
                         "evidence": [node_id],
                         "confidence": 0.4,
+                    },
+                    {
+                        "type": "term",
+                        "name": "No.",
+                        "evidence": [node_id],
+                        "confidence": 0.4,
+                    },
+                    {
+                        "type": "term",
+                        "name": "微调数据集则涵盖基于输入的总体任务规划文本进",
+                        "evidence": [node_id],
+                        "confidence": 0.4,
                     }
                 ],
                 "relations": [
@@ -906,11 +939,15 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(result["fact_report"]["status"], "extracted")
             self.assertEqual(result["fact_report"]["source"], "llm")
             self.assertTrue(result["fact_report"]["llm_used"])
-            self.assertEqual(result["fact_report"]["noise_filtered_count"], 1)
+            self.assertGreaterEqual(result["fact_report"]["noise_filtered_count"], 2)
+            self.assertIn("entity_noise_filtered_count", result["fact_report"])
             self.assertEqual(result["fact_report"]["long_claim_trimmed_count"], 1)
             self.assertEqual(result["claims"]["claims"][0]["confidence"], 0.84)
             self.assertLessEqual(len(result["claims"]["claims"][1]["text"]), 225)
             self.assertEqual(result["entities"]["entities"][0]["aliases"], ["动态角色"])
+            entity_names = {item["name"] for item in result["entities"]["entities"]}
+            self.assertNotIn("No.", entity_names)
+            self.assertFalse(any("总体任务规划文本进" in name for name in entity_names))
 
         with tempfile.TemporaryDirectory() as tmp:
             db_path, doc_id = _sync_insight_sample(Path(tmp))
@@ -941,6 +978,8 @@ class IngestSearchTest(unittest.TestCase):
             matrix = result["comparison_matrix"]
             self.assertEqual(matrix["schema"], "comparison_matrix.v1")
             self.assertEqual(len(matrix["dimensions"]), 6)
+            self.assertIn("evidence_quality", matrix)
+            self.assertIn("duplicate_evidence_removed", matrix)
             dimension_ids = {item["id"] for item in matrix["dimensions"]}
             self.assertIn("problem_setting", dimension_ids)
             self.assertIn("evidence_strength", dimension_ids)
@@ -986,6 +1025,9 @@ class IngestSearchTest(unittest.TestCase):
             outline = result["review_outline"]
             self.assertEqual(outline["schema"], "review_outline.v1")
             self.assertGreaterEqual(len(outline["sections"]), 5)
+            self.assertIn("evidence_quality", outline)
+            self.assertIn("duplicate_evidence_removed", outline)
+            self.assertIn("review_partial_reasons", outline)
             self.assertIn("section_evidence/background_problem.json", result["artifact_paths"])
             background = get_task_artifact(
                 db_path,
@@ -1554,8 +1596,11 @@ class IngestSearchTest(unittest.TestCase):
             self.assertGreaterEqual(len(trace["evidence"]), 1)
             self.assertTrue(any("方法设计" in item["node_path"] for item in trace["evidence"]))
             self.assertIn("score_components", trace["evidence"][0])
+            self.assertIn("selected_reason", trace["evidence"][0])
+            self.assertIn("resolved_intent", trace)
             self.assertTrue(trace["expanded_nodes"])
             self.assertTrue(trace["selected_paths"])
+            self.assertIn("score_components", trace["selected_paths"][0])
 
             results = search_nodes(db_path, "这篇论文的方法设计是什么？", doc_id=doc_id, top_k=3, search_mode="tree")
             self.assertGreaterEqual(len(results), 1)
@@ -1564,6 +1609,15 @@ class IngestSearchTest(unittest.TestCase):
             report = build_search_report(db_path, "这篇论文的方法设计是什么？", doc_id=doc_id, top_k=3, search_mode="tree")
             self.assertEqual(report["effective_search_mode"], "tree")
             self.assertIn("tree_search_trace", report)
+            self.assertTrue(report["tree_search_trace"]["query_profile"])
+            self.assertTrue(report["tree_search_trace"]["selected_paths"])
+
+            multi_report = build_search_report(db_path, "这篇论文的方法设计是什么？", top_k=3, search_mode="tree")
+            multi_trace = multi_report["tree_search_trace"]
+            self.assertTrue(multi_trace["query_profile"])
+            self.assertTrue(multi_trace["expanded_nodes"])
+            self.assertTrue(multi_trace["selected_paths"])
+            self.assertTrue(multi_trace["evidence"])
 
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
@@ -2823,6 +2877,42 @@ def _sync_fact_audit_samples(root: Path) -> tuple[Path, list[str]]:
     finally:
         conn.close()
     return db_path, doc_ids
+
+
+def _insert_noisy_entity_for_graph(db_path: Path, doc_id: str) -> None:
+    conn = db.connect(db_path)
+    db.init_db(conn)
+    try:
+        version = db.get_document_version(conn, doc_id)
+        node = conn.execute(
+            "SELECT node_id FROM doc_nodes WHERE doc_id = ? AND COALESCE(text, '') != '' ORDER BY order_index LIMIT 1",
+            (doc_id,),
+        ).fetchone()
+        if version is None or node is None:
+            raise AssertionError(doc_id)
+        db.insert_paper_entities(
+            conn,
+            [
+                {
+                    "entity_id": "entity_noisy_no",
+                    "doc_id": doc_id,
+                    "version_id": str(version["version_id"]),
+                    "node_id": str(node["node_id"]),
+                    "type": "term",
+                    "name": "No.",
+                    "normalized_name": "no",
+                    "aliases": [],
+                    "page_range": [1, 1],
+                    "confidence": 0.8,
+                    "source": "rule",
+                    "evidence": {"node_id": str(node["node_id"])},
+                    "created_at": 1.0,
+                }
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _sync_insight_sample(root: Path) -> tuple[Path, str]:

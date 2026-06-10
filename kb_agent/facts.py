@@ -110,6 +110,7 @@ def extract_facts(
         warnings.append("llm_disabled")
         facts = _rule_based_facts(doc_id, version_id, card, quality, innovation, citation_map, selected_nodes, node_by_id, warnings)
 
+    facts = _merge_citation_relations(doc_id, version_id, card, facts, citation_map, node_by_id)
     facts = _merge_table_facts(doc_id, version_id, facts, table_content, table_summaries, node_by_id)
     artifacts = _build_fact_artifacts(doc_id, version_id, card, quality, facts, llm_error)
     _write_fact_artifacts(artifact_dir, artifacts)
@@ -524,6 +525,7 @@ def _normalize_fact_payload(
     if quality_stats["long_claim_trimmed_count"]:
         warnings.append("long_llm_claim_trimmed")
     normalized = _dedupe_facts({"claims": claims, "entities": entities, "relations": relation_rows})
+    _apply_fact_quality_filters(normalized, quality_stats)
     normalized["status"] = "extracted" if status == "extracted" and normalized["claims"] else "partial"
     normalized["source"] = source
     normalized["quality_stats"] = quality_stats
@@ -632,11 +634,90 @@ def _rule_based_facts(
             )
         )
 
+    quality_stats = {"noise_filtered_count": 0, "long_claim_trimmed_count": 0, "entity_noise_filtered_count": 0}
     normalized = _dedupe_facts({"claims": claims, "entities": entities, "relations": [item for item in relations if item]})
+    _apply_fact_quality_filters(normalized, quality_stats)
     normalized["status"] = "partial"
     normalized["source"] = "rule"
+    normalized["quality_stats"] = quality_stats
     normalized["warnings"] = _unique_strings([*warnings, "rule_based_fact_extraction", *_quality_warnings(quality)])
     return normalized
+
+
+def _merge_citation_relations(
+    doc_id: str,
+    version_id: str,
+    card: Dict[str, Any],
+    facts: Dict[str, Any],
+    citation_map: Dict[str, Any],
+    node_by_id: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    citation_relations = _facts_from_citations(doc_id, version_id, card, citation_map, node_by_id)
+    if not citation_relations:
+        return facts
+    merged = {
+        "claims": facts.get("claims") or [],
+        "entities": facts.get("entities") or [],
+        "relations": [*citation_relations, *(facts.get("relations") or [])],
+    }
+    normalized = _dedupe_facts(merged)
+    quality_stats = dict(facts.get("quality_stats") or {})
+    _apply_fact_quality_filters(normalized, quality_stats)
+    normalized["status"] = facts.get("status") or "partial"
+    normalized["source"] = facts.get("source") or "rule"
+    normalized["quality_stats"] = quality_stats
+    normalized["warnings"] = _unique_strings([*(facts.get("warnings") or []), "citation_fact_relations_added"])
+    return normalized
+
+
+def _facts_from_citations(
+    doc_id: str,
+    version_id: str,
+    card: Dict[str, Any],
+    citation_map: Dict[str, Any],
+    node_by_id: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    raw_items = []
+    for name in ("relations", "in_text_citations"):
+        for item in citation_map.get(name) or []:
+            if isinstance(item, dict):
+                raw_items.append(item)
+    relations: List[Dict[str, Any]] = []
+    seen = set()
+    title = str(card.get("title") or doc_id)
+    for index, item in enumerate(raw_items):
+        ref_id = str(item.get("ref_id") or item.get("reference_id") or "")
+        node_id = str(item.get("node_id") or "")
+        if not ref_id or not node_id:
+            continue
+        key = (ref_id, node_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        node = node_by_id.get(node_id)
+        if not node:
+            continue
+        relation = _relation_record(
+            doc_id,
+            version_id,
+            "cites",
+            title,
+            ref_id,
+            node,
+            "citation_rule",
+            _confidence(item.get("confidence"), 0.72),
+            object_id=ref_id,
+            text=f"{title} cites {ref_id}",
+            index=index,
+            extra_evidence={
+                "ref_id": ref_id,
+                "page_range": item.get("page_range") or _page_range_from_node(node),
+                "citation_marker": item.get("marker") or item.get("raw") or "",
+            },
+        )
+        if relation:
+            relations.append(relation)
+    return relations
 
 
 def _merge_table_facts(
@@ -657,9 +738,11 @@ def _merge_table_facts(
         "relations": [*(facts.get("relations") or []), *table_facts["relations"]],
     }
     normalized = _dedupe_facts(merged)
+    quality_stats = dict(facts.get("quality_stats") or {})
+    _apply_fact_quality_filters(normalized, quality_stats)
     normalized["status"] = facts.get("status") or "partial"
     normalized["source"] = facts.get("source") or "rule"
-    normalized["quality_stats"] = facts.get("quality_stats") or {}
+    normalized["quality_stats"] = quality_stats
     normalized["warnings"] = _unique_strings([*(facts.get("warnings") or []), *table_facts["warnings"]])
     return normalized
 
@@ -910,6 +993,7 @@ def _build_fact_artifacts(
         "source": facts.get("source") or "rule",
         "llm_used": (facts.get("source") == "llm" and not llm_error),
         "noise_filtered_count": int(quality_stats.get("noise_filtered_count") or 0),
+        "entity_noise_filtered_count": int(quality_stats.get("entity_noise_filtered_count") or 0),
         "long_claim_trimmed_count": int(quality_stats.get("long_claim_trimmed_count") or 0),
         "claim_count": len(claims),
         "entity_count": len(entities),
@@ -1213,6 +1297,46 @@ def _dedupe_facts(facts: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
     }
 
 
+def _apply_fact_quality_filters(facts: Dict[str, Any], quality_stats: Dict[str, int]) -> None:
+    entities = facts.get("entities") or []
+    filtered = []
+    removed = 0
+    for entity in entities:
+        if _looks_like_noisy_entity_name(str(entity.get("name") or ""), str(entity.get("type") or entity.get("entity_type") or "")):
+            removed += 1
+            continue
+        filtered.append(entity)
+    if removed:
+        quality_stats["entity_noise_filtered_count"] = quality_stats.get("entity_noise_filtered_count", 0) + removed
+    facts["entities"] = filtered
+
+
+def _looks_like_noisy_entity_name(value: str, entity_type: str = "") -> bool:
+    text = compact_whitespace(value).strip(" ,，.。;；:：()（）[]【】")
+    lowered = text.lower()
+    if not text:
+        return True
+    if lowered in {"no", "no.", "ra", "rb", "rc", "rd"}:
+        return True
+    if re.fullmatch(r"(?:[A-Za-z]{1,2}\.?|\d+)", text):
+        return True
+    if entity_type in {"metric", "result", "dataset", "citation"}:
+        return False
+    if len(text) < 2:
+        return True
+    if re.search(r"[。！？!?；;\n]", text):
+        return True
+    if "、" in text and len(text) > 12:
+        return True
+    chinese_count = len(re.findall(r"[\u4e00-\u9fff]", text))
+    allowed_suffix = ("方法", "算法", "模型", "框架", "系统", "平台", "数据集", "指标", "任务", "场景", "机制", "模块")
+    if chinese_count > 24 and not text.endswith(allowed_suffix):
+        return True
+    if len(text) > 18 and any(token in text for token in ("则", "并", "以及", "进行", "涵盖", "包括", "通过", "用于")) and not text.endswith(allowed_suffix):
+        return True
+    return False
+
+
 def _dedupe_by_key(items: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
     result = []
     seen = set()
@@ -1317,6 +1441,10 @@ def _clean_llm_entity_name(value: str, stats: Dict[str, int], *, count_noise: bo
             stats["noise_filtered_count"] = stats.get("noise_filtered_count", 0) + 1
         return ""
     if len(text) > 28 and not re.search(r"(方法|算法|模型|框架|系统|平台|数据集|指标|任务|场景|机制)$", text):
+        if count_noise:
+            stats["noise_filtered_count"] = stats.get("noise_filtered_count", 0) + 1
+        return ""
+    if _looks_like_noisy_entity_name(text):
         if count_noise:
             stats["noise_filtered_count"] = stats.get("noise_filtered_count", 0) + 1
         return ""

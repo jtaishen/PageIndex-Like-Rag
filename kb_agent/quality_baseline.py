@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import time
+import hashlib
 from html import escape
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -15,6 +16,7 @@ from .benchmark import create_eval_suite, generate_case_study, run_benchmark
 from .config import DATA_DIR, PROJECT_ROOT
 from .embeddings import EmbeddingError, build_semantic_index, semantic_index_status
 from .eval import eval_memory
+from .fact_audit import fact_audit_summary
 from .facts import extract_facts
 from .ingest import discover_files, sync_directory
 from .insights import extract_doc_insights
@@ -53,10 +55,13 @@ def run_quality_baseline(
 
     primary_sync = sync_directory(root, db_path, force=force, pdf_parser="pypdf")
     doc_ids = _doc_ids_for_corpus(db_path, root)
+    corpus_meta = _corpus_metadata(root, files)
     doc_reports = [_doc_quality_summary(db_path, doc_id) for doc_id in doc_ids]
     parser_comparison = _parser_comparison(root, pdf_files, primary_sync)
     llm = llm_status(probe=use_llm)
+    fact_audit_before = fact_audit_summary(db_path, doc_ids=doc_ids) if doc_ids else {}
     insights = _prepare_insights_and_facts(db_path, doc_ids, use_llm=use_llm)
+    fact_audit_after = fact_audit_summary(db_path, doc_ids=doc_ids) if doc_ids else {}
     embedding = _embedding_baseline(db_path, doc_ids, embedding_model=embedding_model)
     eval_set = _write_baseline_eval_set(doc_reports)
     suite = create_eval_suite(db_path, f"quality_baseline_{int(started)}", input_json=Path(eval_set["path"]))
@@ -76,6 +81,7 @@ def run_quality_baseline(
     report = {
         "schema": BASELINE_SCHEMA,
         "baseline_id": baseline_id,
+        **corpus_meta,
         "corpus_path": str(root),
         "file_count": len(files),
         "pdf_count": len(pdf_files),
@@ -87,6 +93,7 @@ def run_quality_baseline(
         "parser_comparison": parser_comparison,
         "documents": doc_reports,
         "insights_and_facts": insights,
+        "fact_audit_delta": _fact_audit_delta(fact_audit_before, fact_audit_after),
         "embedding": embedding,
         "eval_set": eval_set,
         "eval_suite": _suite_summary(suite),
@@ -117,17 +124,43 @@ def run_quality_baseline(
     }
 
 
-def latest_quality_baseline(limit: int = 1) -> Dict[str, Any]:
+def latest_quality_baseline(
+    limit: int = 1,
+    *,
+    corpus: Optional[Any] = None,
+    real_only: bool = False,
+    exclude_temp: bool = False,
+) -> Dict[str, Any]:
     BASELINE_DIR.mkdir(parents=True, exist_ok=True)
+    corpus_path = _resolve_corpus_filter(corpus) if corpus is not None else None
     items = []
-    for path in sorted(BASELINE_DIR.glob("quality_baseline_*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+    paths = sorted(
+        BASELINE_DIR.glob("quality_baseline_*.json"),
+        key=lambda item: _baseline_sort_key(item),
+    )
+    for path in paths:
         payload = _read_json(path, {})
         if payload.get("schema") != BASELINE_SCHEMA:
             continue
+        if corpus_path is not None and str(payload.get("corpus_path") or "") != str(corpus_path):
+            continue
+        is_real = _payload_is_real_corpus(payload)
+        if real_only and not is_real:
+            continue
+        if exclude_temp and payload.get("run_kind") == "test_fixture":
+            continue
+        review = ((payload.get("tasks") or {}).get("review") or {})
+        review_diagnostics = review.get("llm_diagnostics") or {}
+        tree_delta = (payload.get("tree_search") or {}).get("comparison_summary") or {}
+        fact_delta = payload.get("fact_audit_delta") or {}
         items.append(
             {
                 "path": str(path),
                 "baseline_id": payload.get("baseline_id") or "",
+                "run_kind": payload.get("run_kind") or "",
+                "corpus_name": payload.get("corpus_name") or "",
+                "corpus_fingerprint": payload.get("corpus_fingerprint") or "",
+                "is_real_corpus": is_real,
                 "corpus_path": payload.get("corpus_path") or "",
                 "doc_count": payload.get("doc_count", 0),
                 "pdf_count": payload.get("pdf_count", 0),
@@ -135,7 +168,13 @@ def latest_quality_baseline(limit: int = 1) -> Dict[str, Any]:
                 "llm_baseline_status": (payload.get("llm_baseline") or {}).get("status", ""),
                 "llm_reachable": ((payload.get("llm_status") or {}).get("reachable")),
                 "review_llm_error": (((payload.get("tasks") or {}).get("review") or {}).get("llm_error") or ""),
-                "review_fallback_mode": ((((payload.get("tasks") or {}).get("review") or {}).get("llm_diagnostics") or {}).get("mode") or ""),
+                "review_fallback_mode": review_diagnostics.get("mode") or "",
+                "review_partial_reasons": review.get("review_partial_reasons") or [],
+                "duplicate_evidence_removed": review.get("duplicate_evidence_removed", 0),
+                "citation_gap_count_before": fact_delta.get("citation_gap_count_before", 0),
+                "citation_gap_count_after": fact_delta.get("citation_gap_count_after", 0),
+                "tree_trace_completeness_before": tree_delta.get("rule_trace_completeness_avg", 0.0),
+                "tree_trace_completeness_after": tree_delta.get("llm_trace_completeness_avg", 0.0),
                 "weak_doc_count": sum(1 for item in payload.get("documents") or [] if item.get("quality_level") == "weak"),
                 "real_embedding_status": (payload.get("embedding") or {}).get("sentence_transformers", {}).get("status", ""),
                 "warning_count": len(payload.get("warnings") or []),
@@ -146,6 +185,73 @@ def latest_quality_baseline(limit: int = 1) -> Dict[str, Any]:
         if len(items) >= limit:
             break
     return {"schema": "quality_baseline_latest.v1", "count": len(items), "items": items}
+
+
+def _corpus_metadata(root: Path, files: List[Path]) -> Dict[str, Any]:
+    articles_root = (PROJECT_ROOT / "articles").resolve()
+    is_real = root == articles_root
+    run_kind = "real_articles" if is_real else ("test_fixture" if _looks_like_temp_path(root) else "local_corpus")
+    return {
+        "run_kind": run_kind,
+        "corpus_name": root.name or str(root),
+        "corpus_fingerprint": _corpus_fingerprint(root, files),
+        "is_real_corpus": is_real,
+    }
+
+
+def _corpus_fingerprint(root: Path, files: List[Path]) -> str:
+    digest = hashlib.sha256()
+    digest.update(str(root).encode("utf-8"))
+    for path in sorted(files, key=lambda item: str(item)):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        rel = str(path.relative_to(root)) if path.is_relative_to(root) else path.name
+        digest.update(rel.encode("utf-8"))
+        digest.update(str(int(stat.st_size)).encode("ascii"))
+        digest.update(str(int(stat.st_mtime)).encode("ascii"))
+    return digest.hexdigest()[:16]
+
+
+def _looks_like_temp_path(path: Path) -> bool:
+    text = str(path)
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    try:
+        if path.is_relative_to(temp_root):
+            return True
+    except ValueError:
+        pass
+    return "/private/var/folders/" in text or "/tmp/" in text
+
+
+def _resolve_corpus_filter(corpus: Any) -> Path:
+    path = Path(corpus).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
+
+
+def _baseline_sort_key(path: Path) -> tuple[int, float]:
+    payload = _read_json(path, {})
+    if payload.get("schema") != BASELINE_SCHEMA:
+        return (3, -path.stat().st_mtime)
+    if _payload_is_real_corpus(payload):
+        priority = 0
+    elif payload.get("run_kind") == "test_fixture":
+        priority = 2
+    else:
+        priority = 1
+    return (priority, -float(path.stat().st_mtime))
+
+
+def _payload_is_real_corpus(payload: Dict[str, Any]) -> bool:
+    if bool(payload.get("is_real_corpus")):
+        return True
+    try:
+        return Path(str(payload.get("corpus_path") or "")).resolve() == (PROJECT_ROOT / "articles").resolve()
+    except OSError:
+        return False
 
 
 def _doc_ids_for_corpus(db_path: Path, root: Path) -> List[str]:
@@ -281,6 +387,7 @@ def _prepare_insights_and_facts(db_path: Path, doc_ids: List[str], *, use_llm: b
                         "llm_used": final.get("llm_used", False),
                         "llm_error": final.get("llm_error", ""),
                         "noise_filtered_count": final.get("noise_filtered_count", 0),
+                        "entity_noise_filtered_count": final.get("entity_noise_filtered_count", 0),
                         "long_claim_trimmed_count": final.get("long_claim_trimmed_count", 0),
                         "rule": rule_summary,
                         "llm": llm_summary,
@@ -323,6 +430,7 @@ def _extract_insight_fact_summary(db_path: Path, doc_id: str, *, use_llm: bool) 
         "entity_count": fact_report.get("entity_count", 0),
         "relation_count": fact_report.get("relation_count", 0),
         "noise_filtered_count": fact_report.get("noise_filtered_count", 0),
+        "entity_noise_filtered_count": fact_report.get("entity_noise_filtered_count", 0),
         "long_claim_trimmed_count": fact_report.get("long_claim_trimmed_count", 0),
         "warnings": _unique_strings([*innovation.get("warnings", []), *fact_report.get("warnings", [])]),
     }
@@ -462,6 +570,7 @@ def _tree_search_baseline(db_path: Path, documents: List[Dict[str, Any]], *, top
         "items": items,
         "llm_items": llm_items,
         "comparison": comparisons,
+        "comparison_summary": _tree_comparison_summary(items, llm_items),
         "warnings": _unique_strings(warnings),
     }
 
@@ -477,14 +586,48 @@ def _tree_search_item(db_path: Path, doc_id: str, query: str, *, top_k: int, use
         "mode": "llm" if use_llm else "rule",
         "status": "completed",
         "intent": (trace.get("query_profile") or {}).get("intent", ""),
+        "resolved_intent": trace.get("resolved_intent") or (trace.get("query_profile") or {}).get("intent", ""),
         "expanded_node_count": len(trace.get("expanded_nodes") or []),
         "selected_path_count": len(trace.get("selected_paths") or []),
         "evidence_count": len(trace.get("evidence") or []),
+        "selected_node_ids": [str(item.get("node_id") or "") for item in trace.get("selected_paths") or [] if item.get("node_id")],
+        "trace_completeness": _trace_completeness(trace),
         "llm_used": bool(trace.get("llm_used")),
         "llm_selected_count": trace.get("llm_selected_count", 0),
         "llm_warning_count": trace.get("llm_warning_count", 0),
         "fallback_reason": trace.get("fallback_reason") or "",
         "warnings": trace.get("warnings") or [],
+    }
+
+
+def _trace_completeness(trace: Dict[str, Any]) -> float:
+    checks = [
+        bool(trace.get("query_profile")),
+        bool(trace.get("expanded_nodes")),
+        bool(trace.get("selected_paths")),
+        bool(trace.get("evidence")),
+    ]
+    return round(sum(1 for item in checks if item) / max(1, len(checks)), 4)
+
+
+def _tree_comparison_summary(items: List[Dict[str, Any]], llm_items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    rule_avg = _avg(float(item.get("trace_completeness") or 0.0) for item in items)
+    llm_avg = _avg(float(item.get("trace_completeness") or 0.0) for item in llm_items)
+    overlaps = []
+    llm_by_doc = {str(item.get("doc_id") or ""): item for item in llm_items}
+    for rule_item in items:
+        doc_id = str(rule_item.get("doc_id") or "")
+        llm_item = llm_by_doc.get(doc_id) or {}
+        rule_ids = set(str(item) for item in rule_item.get("selected_node_ids") or [] if item)
+        llm_ids = set(str(item) for item in llm_item.get("selected_node_ids") or [] if item)
+        denominator = len(rule_ids | llm_ids)
+        overlaps.append(round(len(rule_ids & llm_ids) / denominator, 4) if denominator else 0.0)
+    return {
+        "schema": "tree_search_comparison_summary.v1",
+        "rule_trace_completeness_avg": rule_avg,
+        "llm_trace_completeness_avg": llm_avg,
+        "trace_completeness_delta": round(llm_avg - rule_avg, 4) if llm_items else 0.0,
+        "selected_node_overlap_avg": _avg(overlaps),
     }
 
 
@@ -521,6 +664,7 @@ def _task_baseline(db_path: Path, doc_ids: List[str], *, use_llm: bool) -> Dict[
             "warnings": matrix.get("warnings") or [],
             "llm_error": compare.get("llm_error", ""),
             "llm_diagnostics": matrix.get("llm_diagnostics") or {},
+            "duplicate_evidence_removed": matrix.get("duplicate_evidence_removed", 0),
         }
     except Exception as exc:
         result["compare"] = {"status": "failed", "error": str(exc)}
@@ -547,6 +691,8 @@ def _task_baseline(db_path: Path, doc_ids: List[str], *, use_llm: bool) -> Dict[
             "warnings": outline.get("warnings") or [],
             "llm_error": review.get("llm_error", ""),
             "llm_diagnostics": outline.get("llm_diagnostics") or {},
+            "duplicate_evidence_removed": outline.get("duplicate_evidence_removed", 0),
+            "review_partial_reasons": outline.get("review_partial_reasons") or [],
         }
     except Exception as exc:
         result["review"] = {"status": "failed", "error": str(exc)}
@@ -652,6 +798,7 @@ def _llm_baseline_summary(
             "llm_used_count": sum(1 for item in llm_fact_items if (item.get("llm") or {}).get("llm_used")),
             "llm_error_count": sum(1 for item in llm_fact_items if (item.get("llm") or {}).get("llm_error")),
             "noise_filtered_count": sum(int((item.get("llm") or {}).get("noise_filtered_count") or 0) for item in llm_fact_items),
+            "entity_noise_filtered_count": sum(int((item.get("llm") or {}).get("entity_noise_filtered_count") or 0) for item in llm_fact_items),
             "long_claim_trimmed_count": sum(int((item.get("llm") or {}).get("long_claim_trimmed_count") or 0) for item in llm_fact_items),
         },
         "tasks": {
@@ -665,6 +812,8 @@ def _llm_baseline_summary(
             "review_retry_count": (review.get("llm_diagnostics") or {}).get("retry_count", 0),
             "review_repair_used": bool((review.get("llm_diagnostics") or {}).get("repair_used")),
             "review_fallback_sections": (review.get("llm_diagnostics") or {}).get("fallback_sections", []),
+            "review_partial_reasons": review.get("review_partial_reasons") or [],
+            "duplicate_evidence_removed": review.get("duplicate_evidence_removed", 0),
         },
         "fact_conflict_count": graph.get("conflict_count", 0),
         "warnings": _unique_strings(warning_tags),
@@ -696,6 +845,22 @@ def _baseline_warnings(
     warnings.extend(graph.get("warnings") or [])
     warnings.extend(llm_baseline.get("warnings") or [])
     return _unique_strings(str(item) for item in warnings)
+
+
+def _fact_audit_delta(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
+    before_citations = int(before.get("citation_gap_count") or 0)
+    after_citations = int(after.get("citation_gap_count") or 0)
+    before_duplicates = int(before.get("duplicate_group_count") or 0)
+    after_duplicates = int(after.get("duplicate_group_count") or 0)
+    return {
+        "schema": "fact_audit_delta.v1",
+        "citation_gap_count_before": before_citations,
+        "citation_gap_count_after": after_citations,
+        "citation_gap_count_delta": after_citations - before_citations,
+        "duplicate_group_count_before": before_duplicates,
+        "duplicate_group_count_after": after_duplicates,
+        "duplicate_group_count_delta": after_duplicates - before_duplicates,
+    }
 
 
 def _sync_summary(report: Dict[str, Any]) -> Dict[str, Any]:
@@ -757,6 +922,8 @@ def _baseline_markdown(report: Dict[str, Any]) -> str:
         "",
         f"- schema: `{report.get('schema')}`",
         f"- baseline_id: `{report.get('baseline_id')}`",
+        f"- run_kind: `{report.get('run_kind')}`",
+        f"- corpus_fingerprint: `{report.get('corpus_fingerprint')}`",
         f"- corpus_path: `{report.get('corpus_path')}`",
         f"- doc_count: `{report.get('doc_count')}`",
         f"- pdf_count: `{report.get('pdf_count')}`",
@@ -764,6 +931,7 @@ def _baseline_markdown(report: Dict[str, Any]) -> str:
         f"- llm_baseline_status: `{(report.get('llm_baseline') or {}).get('status', '')}`",
         f"- llm_reachable: `{(report.get('llm_status') or {}).get('reachable', '')}`",
         f"- real_embedding_status: `{(report.get('embedding') or {}).get('sentence_transformers', {}).get('status', '')}`",
+        f"- review_partial_reasons: `{', '.join(((report.get('tasks') or {}).get('review') or {}).get('review_partial_reasons') or [])}`",
         f"- warning_count: `{len(report.get('warnings') or [])}`",
         "",
         "## Documents",
@@ -783,14 +951,21 @@ def _baseline_markdown(report: Dict[str, Any]) -> str:
 
 
 def _baseline_html(report: Dict[str, Any]) -> str:
+    review = ((report.get("tasks") or {}).get("review") or {})
+    fact_delta = report.get("fact_audit_delta") or {}
+    tree_summary = (report.get("tree_search") or {}).get("comparison_summary") or {}
     cards = [
         ("Docs", report.get("doc_count", 0)),
         ("PDFs", report.get("pdf_count", 0)),
+        ("Run Kind", report.get("run_kind", "")),
         ("Warnings", len(report.get("warnings") or [])),
         ("Best Mode", (report.get("benchmark") or {}).get("best_mode_by_score", "")),
         ("LLM Baseline", (report.get("llm_baseline") or {}).get("status", "")),
         ("LLM Reachable", (report.get("llm_status") or {}).get("reachable", "")),
         ("Real Embedding", (report.get("embedding") or {}).get("sentence_transformers", {}).get("status", "")),
+        ("Tree Trace", tree_summary.get("llm_trace_completeness_avg") or tree_summary.get("rule_trace_completeness_avg") or 0.0),
+        ("Evidence Dedupe", review.get("duplicate_evidence_removed", 0)),
+        ("Citation Gaps", f"{fact_delta.get('citation_gap_count_before', 0)}->{fact_delta.get('citation_gap_count_after', 0)}"),
         ("Memory", (report.get("memory") or {}).get("status", "")),
         ("Graph Conflicts", (report.get("claim_graph") or {}).get("conflict_count", 0)),
         ("Graph Isolated", (report.get("claim_graph") or {}).get("isolated_fact_count", 0)),
@@ -833,6 +1008,7 @@ def _baseline_html(report: Dict[str, Any]) -> str:
         ],
     )
     recs = _list_section("Recommendations", report.get("recommendations") or [])
+    partial_reasons = _list_section("Review Partial Reasons", review.get("review_partial_reasons") or [])
     warnings = _list_section("Warnings", report.get("warnings") or [])
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -866,6 +1042,7 @@ def _baseline_html(report: Dict[str, Any]) -> str:
     {parser_html}
     {links}
     {recs}
+    {partial_reasons}
     {warnings}
   </main>
 </body>
@@ -904,3 +1081,10 @@ def _unique_strings(values: Iterable[Any]) -> List[str]:
         seen.add(text)
         result.append(text)
     return result
+
+
+def _avg(values: Iterable[float]) -> float:
+    items = [float(value) for value in values]
+    if not items:
+        return 0.0
+    return round(sum(items) / len(items), 4)

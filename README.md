@@ -614,6 +614,28 @@ uv run --extra pdf python -m kb_agent.cli quality-baseline articles --with-llm -
 
 如果整体 JSON 失败但分章节恢复成功，报告会显示 `review_fallback_mode=section_json`，不会再标记为纯 `rule_based_review_plan`。
 
+## v0.23 真实基线可信化与 Tree Search 证据质量
+
+v0.23 聚焦真实 `articles/` 验收，不继续横向增加新模块。`quality-baseline` 会标记 `run_kind`、`corpus_fingerprint` 和 `is_real_corpus`，`latest-quality-baseline` 默认优先展示真实 `articles/` 结果，避免测试 fixture 的临时报告抢占“最新质量”判断。
+
+查看当前真实项目质量：
+
+```bash
+uv run --extra pdf python -m kb_agent.cli quality-baseline articles --with-llm --top-k 3
+uv run python -m kb_agent.cli latest-quality-baseline --real-only --limit 1
+uv run python -m kb_agent.cli latest-quality-baseline --corpus articles --limit 1
+```
+
+Tree Search 报告会稳定包含 `query_profile`、`expanded_nodes`、`selected_paths`、`evidence`、`score_components` 和 `selected_reason`，用于判断为什么选中某个章节或证据节点：
+
+```bash
+uv run python -m kb_agent.cli search-report "服务机器人任务规划的方法设计" --search-mode tree
+```
+
+compare/review 会记录 `duplicate_evidence_removed`、`evidence_quality` 和 `review_partial_reasons`。如果综述仍是 `partial`，报告会区分是语料太少、缺引用关系、证据重复、缺章节证据，还是 LLM/规则降级导致。
+
+事实层也会从 `citation_map.json` 补齐 `cites` 关系，并过滤 `No.`、`Ra`、残缺正文长句这类实体噪声；Claim Graph 报告新增 `noisy_entity_count`，默认不把噪声实体放进 `top_entities`。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
