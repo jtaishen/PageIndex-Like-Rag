@@ -784,7 +784,7 @@ class IngestSearchTest(unittest.TestCase):
                 result = run_quality_baseline(db_path, papers, use_llm=False, top_k=3)
 
             self.assertEqual(result["schema"], "quality_baseline.v1")
-            self.assertEqual(result["code_version"], "v0.28")
+            self.assertEqual(result["code_version"], "v0.29")
             self.assertTrue(result["git_commit"])
             self.assertTrue(result["feature_flags"]["review_draft_baseline"])
             self.assertTrue(result["is_current_code_baseline"])
@@ -1532,6 +1532,122 @@ class IngestSearchTest(unittest.TestCase):
             self.assertNotIn("excerpt:", captured["user"])
             self.assertFalse(result["citation_check"]["missing_refs"])
             self.assertEqual(result["citation_check"]["sections"][0]["coverage_score"], 1.0)
+
+    def test_draft_review_falls_back_per_section_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+            task = generate_review_plan(
+                db_path,
+                "任务规划方法研究综述",
+                doc_ids=doc_ids,
+                use_llm=False,
+            )
+            payload = {
+                "claim_plan": [{"claim": "本节有证据支撑。", "evidence": ["E1"]}],
+                "body_markdown": "本节依据已有证据生成草稿。[E1]",
+                "unsupported_claims": [],
+                "warnings": [],
+            }
+            calls = {"count": 0}
+
+            def fake_generate(_system: str, _user: str) -> dict:
+                calls["count"] += 1
+                if calls["count"] == 2:
+                    raise LLMError("timeout", error_type="request_timeout")
+                return payload
+
+            with mock.patch("kb_agent.review.generate_json_object", side_effect=fake_generate):
+                result = draft_review(db_path, task["task_id"], use_llm=True)
+
+            self.assertEqual(result["drafted_section_count"], 5)
+            self.assertEqual(result["status"], "partial")
+            sources = [draft["source"] for draft in result["section_drafts"]]
+            self.assertIn("llm", sources)
+            self.assertIn("rule", sources)
+            self.assertTrue(any("llm_unavailable" in " ".join(draft.get("warnings") or []) for draft in result["section_drafts"]))
+
+    def test_draft_review_skips_remaining_sections_when_budget_checker_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+            task = generate_review_plan(
+                db_path,
+                "任务规划方法研究综述",
+                doc_ids=doc_ids,
+                use_llm=False,
+            )
+            checks = {"count": 0}
+
+            def should_continue() -> bool:
+                checks["count"] += 1
+                return checks["count"] == 1
+
+            result = draft_review(
+                db_path,
+                task["task_id"],
+                use_llm=False,
+                should_continue=should_continue,
+                skip_reason="stage_timeout",
+            )
+
+            self.assertEqual(result["drafted_section_count"], 5)
+            self.assertEqual(result["skipped_section_count"], 4)
+            self.assertEqual(result["citation_check"]["skipped_section_count"], 4)
+            self.assertIn("section_draft_skipped", result["review_report"]["quality_reasons"])
+            skipped = [draft for draft in result["section_drafts"] if draft["status"] == "skipped"]
+            self.assertEqual(len(skipped), 4)
+            self.assertTrue(all(draft["source"] == "skipped" for draft in skipped))
+            self.assertTrue(result["review_report"]["section_revision_actions"])
+
+    def test_draft_review_dedupes_evidence_and_preserves_cross_doc_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path, doc_ids = _sync_compare_samples(Path(tmp))
+            task = generate_review_plan(
+                db_path,
+                "任务规划方法研究综述",
+                doc_ids=doc_ids,
+                use_llm=False,
+            )
+            section_path = db_path.parent / ".kb_state" / task["task_id"] / "section_evidence" / "background_problem.json"
+            payload = json.loads(section_path.read_text(encoding="utf-8"))
+            payload["evidence"] = [
+                {
+                    "doc_id": doc_ids[0],
+                    "node_id": "shared_node",
+                    "node_path": "摘要",
+                    "title": "论文 A",
+                    "evidence_summary": "任务规划需要处理动态约束。",
+                    "excerpt": "任务规划需要处理动态约束。",
+                    "tree_score": 0.4,
+                },
+                {
+                    "doc_id": doc_ids[0],
+                    "node_id": "shared_node",
+                    "node_path": "摘要",
+                    "title": "论文 A",
+                    "evidence_summary": "任务规划需要处理动态约束。",
+                    "excerpt": "任务规划需要处理动态约束。",
+                    "tree_score": 0.1,
+                },
+                {
+                    "doc_id": doc_ids[1],
+                    "node_id": "other_node",
+                    "node_path": "摘要",
+                    "title": "论文 B",
+                    "evidence_summary": "多智能体规划强调协同调度。",
+                    "excerpt": "多智能体规划强调协同调度。",
+                    "tree_score": 0.3,
+                },
+            ]
+            section_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            result = draft_review(db_path, task["task_id"], section_ids=["background_problem"], use_llm=False)
+            draft = result["section_drafts"][0]
+            doc_ids_kept = {item["doc_id"] for item in draft["evidence"]}
+
+            self.assertEqual(len(draft["evidence"]), 2)
+            self.assertEqual(doc_ids_kept, set(doc_ids))
+            self.assertGreaterEqual(draft["llm_diagnostics"]["duplicate_evidence_removed"], 1)
+            self.assertEqual(draft["llm_diagnostics"]["compaction"]["source_doc_count"], 2)
 
     def test_draft_review_requires_llm_does_not_write_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

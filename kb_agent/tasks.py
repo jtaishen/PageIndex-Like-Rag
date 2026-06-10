@@ -1827,9 +1827,20 @@ def _evidence_keys(item: Dict[str, Any]) -> List[tuple[str, str]]:
     if doc_id and node_id:
         keys.append(("node", f"{doc_id}:{node_id}"))
     node_path = compact_whitespace(str(item.get("node_path") or ""))
-    excerpt = compact_whitespace(str(item.get("excerpt") or ""))
-    if doc_id and node_path and excerpt:
-        keys.append(("text", stable_id("evidence_text", doc_id, node_path, excerpt[:260], length=18)))
+    text = compact_whitespace(
+        str(
+            item.get("evidence_summary")
+            or item.get("summary")
+            or item.get("claim")
+            or item.get("excerpt")
+            or item.get("snippet")
+            or ""
+        )
+    )
+    if doc_id and node_path and text:
+        keys.append(("path_text", stable_id("evidence_text", doc_id, node_path, text[:260], length=18)))
+    elif doc_id and text:
+        keys.append(("text", stable_id("evidence_text", doc_id, text[:260], length=18)))
     return keys
 
 

@@ -4,11 +4,11 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from .llm import LLMError, generate_json_object, llm_payload_metadata
 from .tasks import TASK_ID_RE, _task_state_root
-from .utils import compact_whitespace, write_json
+from .utils import compact_whitespace, stable_id, write_json
 
 
 EVIDENCE_REF_RE = re.compile(r"\[E(\d+)\]")
@@ -23,6 +23,8 @@ def draft_review(
     section_ids: Optional[List[str]] = None,
     use_llm: bool = True,
     require_llm: bool = False,
+    should_continue: Optional[Callable[[], bool]] = None,
+    skip_reason: str = "review_draft_budget_exhausted",
 ) -> Dict[str, Any]:
     task_dir = _review_task_dir(db_path, task_id)
     outline = _read_json(task_dir / "review_outline.json")
@@ -36,8 +38,25 @@ def draft_review(
     paths: Dict[str, str] = {}
     for section in sections:
         evidence_artifact = _read_section_evidence(task_dir, str(section["section_id"]))
-        numbered_evidence = _number_evidence(evidence_artifact.get("evidence") or [])
-        compaction = evidence_artifact.get("compaction_report") if isinstance(evidence_artifact.get("compaction_report"), dict) else {}
+        prepared_evidence, draft_compaction = _prepare_draft_evidence(evidence_artifact.get("evidence") or [])
+        numbered_evidence = _number_evidence(prepared_evidence)
+        compaction = _merge_compaction_reports(
+            evidence_artifact.get("compaction_report") if isinstance(evidence_artifact.get("compaction_report"), dict) else {},
+            draft_compaction,
+        )
+        if should_continue is not None and not should_continue():
+            draft = _skipped_section_draft(
+                task_id,
+                section,
+                numbered_evidence,
+                reason=skip_reason,
+                compaction=compaction,
+            )
+            drafted.append(draft)
+            section_paths = _write_section_draft(task_dir, draft)
+            paths.update(section_paths)
+            warnings.extend(draft.get("warnings") or [])
+            continue
         if use_llm:
             try:
                 payload = _draft_section_with_llm(outline, section, numbered_evidence)
@@ -98,6 +117,7 @@ def draft_review(
         "status": status,
         "drafted_section_count": len(drafted),
         "drafted_sections": [draft["section_id"] for draft in drafted],
+        "skipped_section_count": sum(1 for draft in drafted if draft.get("status") == "skipped"),
         "section_drafts": drafted,
         "citation_check": assembled["citation_check"],
         "review_report": report,
@@ -209,6 +229,138 @@ def _number_evidence(evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return numbered
 
 
+def _prepare_draft_evidence(
+    evidence: Iterable[Dict[str, Any]],
+    *,
+    max_items: int = MAX_PROMPT_EVIDENCE,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    raw = [item for item in evidence if isinstance(item, dict)]
+    unique, dedupe_stats = _dedupe_draft_evidence(raw)
+    by_doc: Dict[str, List[Dict[str, Any]]] = {}
+    for item in unique:
+        doc_id = str(item.get("doc_id") or "_unknown")
+        by_doc.setdefault(doc_id, []).append(item)
+    for items in by_doc.values():
+        items.sort(key=_draft_evidence_priority, reverse=True)
+
+    balanced: List[Dict[str, Any]] = []
+    doc_ids = sorted(by_doc)
+    cursor = 0
+    while len(balanced) < max_items and any(by_doc.values()) and doc_ids:
+        doc_id = doc_ids[cursor % len(doc_ids)]
+        cursor += 1
+        if not by_doc.get(doc_id):
+            continue
+        balanced.append(by_doc[doc_id].pop(0))
+
+    source_doc_ids = _unique_strings(str(item.get("doc_id") or "") for item in balanced if item.get("doc_id"))
+    warnings = []
+    if int(dedupe_stats.get("duplicate_evidence_removed") or 0) > 0:
+        warnings.append("draft_duplicate_evidence_compacted")
+    if int(dedupe_stats.get("unique_evidence_count") or 0) > len(balanced):
+        warnings.append("draft_evidence_truncated")
+    return balanced, {
+        "schema": "draft_evidence_compaction.v1",
+        "raw_evidence_count": len(raw),
+        "unique_evidence_count": dedupe_stats.get("unique_evidence_count", 0),
+        "duplicate_evidence_removed": dedupe_stats.get("duplicate_evidence_removed", 0),
+        "kept_evidence_count": len(balanced),
+        "max_evidence_count": max_items,
+        "source_doc_count": len(source_doc_ids),
+        "source_doc_ids": source_doc_ids,
+        "warnings": warnings,
+    }
+
+
+def _dedupe_draft_evidence(evidence: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    seen: Dict[tuple[str, str], Dict[str, Any]] = {}
+    duplicate_count = 0
+    for index, item in enumerate(evidence):
+        keys = _draft_evidence_keys(item)
+        if not keys:
+            continue
+        existing_key = next((key for key in keys if key in seen), None)
+        if existing_key is None:
+            kept = dict(item)
+            kept.setdefault("dedupe_reason", "kept:unique")
+            kept["_dedupe_index"] = index
+            for key in keys:
+                seen[key] = kept
+            result.append(kept)
+            continue
+        duplicate_count += 1
+        existing = seen[existing_key]
+        if _draft_evidence_priority(item) > _draft_evidence_priority(existing):
+            replacement = dict(item)
+            replacement["dedupe_reason"] = "kept:higher_score"
+            replacement["_dedupe_index"] = existing.get("_dedupe_index", index)
+            result = [replacement if current is existing else current for current in result]
+            for key in keys:
+                seen[key] = replacement
+    for item in result:
+        item.pop("_dedupe_index", None)
+    return result, {
+        "schema": "draft_evidence_dedupe.v1",
+        "raw_evidence_count": len(evidence),
+        "unique_evidence_count": len(result),
+        "duplicate_evidence_removed": duplicate_count,
+    }
+
+
+def _draft_evidence_keys(item: Dict[str, Any]) -> List[tuple[str, str]]:
+    doc_id = str(item.get("doc_id") or "")
+    node_id = str(item.get("node_id") or "")
+    keys: List[tuple[str, str]] = []
+    if doc_id and node_id:
+        keys.append(("node", f"{doc_id}:{node_id}"))
+    node_path = compact_whitespace(str(item.get("node_path") or ""))
+    text = compact_whitespace(
+        str(
+            item.get("evidence_summary")
+            or item.get("summary")
+            or item.get("claim")
+            or item.get("excerpt")
+            or item.get("snippet")
+            or ""
+        )
+    )
+    if doc_id and node_path and text:
+        keys.append(("path_text", stable_id("draft_evidence", doc_id, node_path, text[:260], length=18)))
+    elif doc_id and text:
+        keys.append(("text", stable_id("draft_evidence", doc_id, text[:260], length=18)))
+    return keys
+
+
+def _draft_evidence_priority(item: Dict[str, Any]) -> tuple[float, float]:
+    score = item.get("tree_score")
+    if score is None:
+        score = item.get("confidence")
+    try:
+        parsed = float(score or 0.0)
+    except (TypeError, ValueError):
+        parsed = 0.0
+    text_len = len(_evidence_summary(item))
+    return (parsed, min(240.0, float(text_len)))
+
+
+def _merge_compaction_reports(artifact: Dict[str, Any], draft: Dict[str, Any]) -> Dict[str, Any]:
+    warnings = _unique_strings([*(artifact.get("warnings") or []), *(draft.get("warnings") or [])])
+    return {
+        "schema": "review_draft_compaction.v1",
+        "artifact": artifact,
+        "draft": draft,
+        "raw_evidence_count": draft.get("raw_evidence_count", artifact.get("raw_evidence_count", 0)),
+        "unique_evidence_count": draft.get("unique_evidence_count", artifact.get("unique_evidence_count", 0)),
+        "duplicate_evidence_removed": int(artifact.get("duplicate_evidence_removed") or 0)
+        + int(draft.get("duplicate_evidence_removed") or 0),
+        "kept_evidence_count": draft.get("kept_evidence_count", artifact.get("kept_evidence_count", 0)),
+        "source_doc_count": draft.get("source_doc_count", artifact.get("source_doc_count", 0)),
+        "source_doc_ids": draft.get("source_doc_ids") or artifact.get("source_doc_ids") or [],
+        "warnings": warnings,
+    }
+
+
 def _draft_section_with_llm(
     outline: Dict[str, Any],
     section: Dict[str, Any],
@@ -280,6 +432,7 @@ def _llm_diagnostics(
         "compact_count": int(compaction.get("kept_evidence_count") or evidence_count),
         "duplicate_evidence_removed": int(compaction.get("duplicate_evidence_removed") or 0),
         "compaction_warnings": _string_list(compaction.get("warnings")),
+        "compaction": compaction,
     }
 
 
@@ -339,6 +492,33 @@ def _rule_based_section_draft(
     )
 
 
+def _skipped_section_draft(
+    task_id: str,
+    section: Dict[str, Any],
+    evidence: List[Dict[str, Any]],
+    *,
+    reason: str,
+    compaction: Dict[str, Any],
+) -> Dict[str, Any]:
+    return _section_draft(
+        task_id,
+        section,
+        evidence,
+        "",
+        source="skipped",
+        status="skipped",
+        claim_plan=[],
+        unsupported_claims=[],
+        warnings=[reason, "section_draft_skipped"],
+        llm_diagnostics=_llm_diagnostics(
+            used=False,
+            fallback_reason=reason,
+            evidence_count=len(evidence),
+            compaction=compaction,
+        ),
+    )
+
+
 def _section_draft(
     task_id: str,
     section: Dict[str, Any],
@@ -368,6 +548,7 @@ def _section_draft(
         "used_evidence": used_evidence,
         "unsupported_claims": unsupported_claims,
         "llm_diagnostics": llm_diagnostics,
+        "evidence_compaction": llm_diagnostics.get("compaction") or {},
         "warnings": _unique_strings(warnings),
         "created_at": time.time(),
     }
@@ -460,6 +641,7 @@ def _build_citation_check(task_id: str, drafts: List[Dict[str, Any]]) -> Dict[st
     unused_evidence = []
     unsupported_paragraphs = []
     scores = []
+    skipped_sections = []
     for draft in drafts:
         section_id = str(draft.get("section_id") or "")
         body = str(draft.get("body_markdown") or "")
@@ -469,16 +651,21 @@ def _build_citation_check(task_id: str, drafts: List[Dict[str, Any]]) -> Dict[st
         section_unused = sorted(ref for ref in evidence_refs if ref not in body_refs)
         section_unsupported = _unsupported_paragraphs(section_id, body)
         missing_refs.extend({"section_id": section_id, "ref_id": ref} for ref in section_missing)
-        unused_evidence.extend({"section_id": section_id, "ref_id": ref} for ref in section_unused)
+        if draft.get("status") == "skipped":
+            skipped_sections.append(section_id)
+            section_unused = []
+        else:
+            unused_evidence.extend({"section_id": section_id, "ref_id": ref} for ref in section_unused)
         unsupported_paragraphs.extend(section_unsupported)
         paragraphs = _checkable_paragraphs(body)
         supported_count = max(0, len(paragraphs) - len(section_unsupported))
-        score = _coverage_score(supported_count, len(paragraphs), len(section_missing))
+        score = 0.0 if draft.get("status") == "skipped" else _coverage_score(supported_count, len(paragraphs), len(section_missing))
         scores.append(score)
         sections.append(
             {
                 "section_id": section_id,
                 "title": draft.get("title") or section_id,
+                "status": draft.get("status") or "",
                 "evidence_count": len(evidence_refs),
                 "body_ref_count": len(body_refs),
                 "missing_ref_count": len(section_missing),
@@ -495,6 +682,8 @@ def _build_citation_check(task_id: str, drafts: List[Dict[str, Any]]) -> Dict[st
         warnings.append("unused_evidence")
     if unsupported_paragraphs:
         warnings.append("unsupported_paragraphs")
+    if skipped_sections:
+        warnings.append("section_draft_skipped")
     if scores and overall < 0.8:
         warnings.append("low_evidence_coverage")
     return {
@@ -506,9 +695,11 @@ def _build_citation_check(task_id: str, drafts: List[Dict[str, Any]]) -> Dict[st
         "missing_refs": missing_refs,
         "unused_evidence": unused_evidence,
         "unsupported_paragraphs": unsupported_paragraphs,
+        "skipped_sections": skipped_sections,
         "missing_ref_count": len(missing_refs),
         "unused_evidence_count": len(unused_evidence),
         "unsupported_paragraph_count": len(unsupported_paragraphs),
+        "skipped_section_count": len(skipped_sections),
         "warnings": warnings,
         "created_at": time.time(),
     }
@@ -526,6 +717,11 @@ def _build_review_report(
         str(section.get("section_id") or "")
         for section in outline_sections
         if str(section.get("section_id") or "") not in drafted_ids
+    ]
+    skipped_sections = [
+        str(draft.get("section_id") or "")
+        for draft in drafts
+        if draft.get("status") == "skipped" and draft.get("section_id")
     ]
     warnings = list(citation_check.get("warnings") or [])
     for draft in drafts:
@@ -557,7 +753,9 @@ def _build_review_report(
         "title": outline.get("title") or outline.get("topic") or "",
         "section_count": len(outline_sections),
         "drafted_section_count": len(drafts),
+        "skipped_section_count": len(skipped_sections),
         "missing_sections": missing_sections,
+        "skipped_sections": skipped_sections,
         "citation_coverage_score": citation_check.get("coverage_score", 0.0),
         "section_statuses": [
             {
@@ -598,6 +796,9 @@ def _section_revision_actions(
         if not draft:
             actions.append("为本节运行 draft-review。")
             reasons.append("section_draft_missing")
+        if draft.get("status") == "skipped":
+            actions.append("本节草稿阶段被跳过；需要释放 LLM 阶段预算后重跑，或用规则草稿补齐。")
+            reasons.append("section_draft_skipped")
         if int(check.get("missing_ref_count") or 0) > 0:
             actions.append("修正文中无法映射的证据编号。")
             reasons.append("missing_refs")
@@ -635,6 +836,8 @@ def _section_revision_actions(
 def _section_quality_level(section_id: str, citation_check: Dict[str, Any], draft: Dict[str, Any]) -> str:
     if not draft:
         return "failed"
+    if draft.get("status") == "skipped":
+        return "failed"
     section_check = {}
     for item in citation_check.get("sections") or []:
         if isinstance(item, dict) and str(item.get("section_id") or "") == section_id:
@@ -667,6 +870,8 @@ def _draft_quality_reasons(
         reasons.append("section_draft_missing")
     if missing_sections:
         reasons.append("section_draft_missing")
+    if citation_check.get("skipped_sections"):
+        reasons.append("section_draft_skipped")
     if citation_check.get("missing_refs"):
         reasons.append("missing_refs")
     if citation_check.get("unused_evidence"):
@@ -690,7 +895,9 @@ def _draft_quality_level(
     coverage = float(citation_check.get("coverage_score") or 0.0)
     if "section_draft_missing" in quality_reasons and coverage <= 0:
         return "failed"
-    if missing_sections or coverage < 0.5 or "missing_refs" in quality_reasons:
+    if "section_draft_skipped" in quality_reasons and coverage <= 0:
+        return "failed"
+    if missing_sections or coverage < 0.5 or "missing_refs" in quality_reasons or "section_draft_skipped" in quality_reasons:
         return "weak"
     if quality_reasons or coverage < 0.9:
         return "usable"

@@ -759,6 +759,31 @@ uv run python -m kb_agent.cli eval-dashboard --format html
 
 `review_report.json` 现在会按章节输出 `section_revision_actions`，用于判断每一节需要补证据、修引用、重写段落还是人工确认。`eval-dashboard` 会展示最新真实 baseline 的草稿质量、引用覆盖、stale warning 和草稿工件路径；报告仍只展示 ID、指标、路径、短 warning 和动作建议，不包含论文正文、长 evidence、完整 prompt 或综述正文。
 
+## v0.29 真实 baseline 复跑与综述草稿质量修复
+
+v0.29 继续收束真实验收闭环。`code_version` 升级为 `v0.29`，`quality-baseline --with-llm` 的综述草稿阶段会按章节检查阶段预算；如果预算耗尽，剩余章节会写入 `status=skipped` 的稳定草稿工件，并通过 `skipped_section_count`、`section_revision_actions` 和 `top_review_blockers` 暴露出来。
+
+推荐真实验收：
+
+```bash
+uv run --extra pdf python -m kb_agent.cli quality-baseline articles --with-llm --top-k 3 --llm-timeout-seconds 20 --llm-stage-timeout-seconds 60 --llm-max-docs 2
+uv run python -m kb_agent.cli latest-quality-baseline --real-only --limit 1
+uv run python -m kb_agent.cli eval-dashboard --format html
+```
+
+重点查看：
+
+- `is_current_code_baseline`
+- `baseline_stale_reason`
+- `llm_stage_status.llm_review_draft`
+- `review_draft_status`
+- `skipped_section_count`
+- `citation_coverage_score`
+- `section_revision_actions`
+- `top_review_blockers`
+
+`draft-review` 入口现在会再次压缩并均衡 section evidence：同一 `doc_id/node_id`、重复 `node_path + summary` 的证据只保留最高质量项，并优先保留跨文档证据。`small_corpus` 仍作为两篇论文验收集的背景限制展示，不会被伪装成代码失败。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：

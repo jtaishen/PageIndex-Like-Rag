@@ -33,10 +33,11 @@ from .utils import compact_whitespace, stable_id, write_json
 
 
 BASELINE_SCHEMA = "quality_baseline.v1"
-CODE_VERSION = "v0.28"
+CODE_VERSION = "v0.29"
 BASELINE_FEATURE_FLAGS = {
     "review_draft_baseline": True,
     "baseline_staleness": True,
+    "section_budgeted_review_draft": True,
 }
 BASELINE_DIR = DATA_DIR / "eval"
 EVAL_SET_DIR = DATA_DIR / "eval_sets"
@@ -455,6 +456,7 @@ def latest_quality_baseline(
                 "missing_ref_count": review_draft.get("missing_ref_count", 0),
                 "unsupported_paragraph_count": review_draft.get("unsupported_paragraph_count", 0),
                 "drafted_section_count": review_draft.get("drafted_section_count", 0),
+                "skipped_section_count": review_draft.get("skipped_section_count", 0),
                 "review_draft_path": review_draft.get("review_draft_path", ""),
                 "section_revision_actions": review_draft.get("section_revision_actions") or [],
                 "top_review_blockers": _top_review_blockers(payload),
@@ -533,6 +535,8 @@ def _top_review_blockers(payload: Dict[str, Any]) -> List[str]:
     blockers.extend(review_draft.get("quality_reasons") or [])
     if not review_draft or review_draft.get("status") in {"", "skipped"}:
         blockers.append("review_draft_skipped")
+    if int(review_draft.get("skipped_section_count") or 0) > 0:
+        blockers.append("section_draft_skipped")
     if review_draft.get("status") == "partial":
         blockers.append("review_draft_partial")
     if review_draft.get("review_draft_skip_reason") or review_draft.get("reason"):
@@ -558,7 +562,9 @@ def _top_review_blockers(payload: Dict[str, Any]) -> List[str]:
         "llm_timeout",
         "baseline_llm_budget_exhausted",
         "review_draft_skipped",
+        "section_draft_skipped",
         "review_draft_partial",
+        "duplicate_evidence",
         "small_corpus",
         "real_embedding_not_enabled",
     ]
@@ -1355,10 +1361,14 @@ def _task_baseline(
                             review_task_id,
                             use_llm=True,
                             require_llm=False,
+                            should_continue=stage.can_continue,
+                            skip_reason="llm_review_draft_stage_budget_exhausted",
                         )
                         result["review_draft"] = _review_draft_summary(draft)
                         if draft.get("llm_error"):
                             stage.mark_fallback(str(draft.get("llm_error")))
+                        if result["review_draft"].get("skipped_section_count"):
+                            stage.mark_warning("review_draft_sections_skipped")
                         if result["review_draft"].get("status") == "partial":
                             stage.mark_warning("review_draft_partial")
             except Exception as exc:
@@ -1541,6 +1551,7 @@ def _llm_baseline_summary(
             "missing_ref_count": review_draft.get("missing_ref_count", 0),
             "unsupported_paragraph_count": review_draft.get("unsupported_paragraph_count", 0),
             "drafted_section_count": review_draft.get("drafted_section_count", 0),
+            "skipped_section_count": review_draft.get("skipped_section_count", 0),
             "review_draft_path": review_draft.get("review_draft_path", ""),
             "section_revision_actions": review_draft.get("section_revision_actions") or [],
         },
@@ -1617,6 +1628,7 @@ def _review_draft_summary(result: Dict[str, Any]) -> Dict[str, Any]:
         "draft_quality_level": report.get("draft_quality_level") or "",
         "quality_reasons": report.get("quality_reasons") or [],
         "drafted_section_count": result.get("drafted_section_count") or report.get("drafted_section_count", 0),
+        "skipped_section_count": result.get("skipped_section_count") or report.get("skipped_section_count", 0),
         "section_count": report.get("section_count", 0),
         "citation_coverage_score": report.get("citation_coverage_score") or citation_check.get("coverage_score", 0.0),
         "missing_ref_count": len(citation_check.get("missing_refs") or []),
@@ -1642,7 +1654,8 @@ def _review_draft_skip_summary(reason: str) -> Dict[str, Any]:
         "reason": reason,
         "draft_quality_level": "",
         "quality_reasons": ["review_draft_skipped"],
-        "drafted_section_count": 0,
+            "drafted_section_count": 0,
+        "skipped_section_count": 0,
         "section_count": 0,
         "citation_coverage_score": 0.0,
         "missing_ref_count": 0,
@@ -1737,6 +1750,7 @@ def _baseline_markdown(report: Dict[str, Any]) -> str:
         f"- review_draft_status: `{((report.get('tasks') or {}).get('review_draft') or {}).get('status', '')}`",
         f"- review_draft_skip_reason: `{((report.get('tasks') or {}).get('review_draft') or {}).get('review_draft_skip_reason', '')}`",
         f"- review_draft_quality_level: `{((report.get('tasks') or {}).get('review_draft') or {}).get('draft_quality_level', '')}`",
+        f"- skipped_section_count: `{((report.get('tasks') or {}).get('review_draft') or {}).get('skipped_section_count', 0)}`",
         f"- citation_coverage_score: `{((report.get('tasks') or {}).get('review_draft') or {}).get('citation_coverage_score', 0.0)}`",
         f"- real_embedding_status: `{(report.get('embedding') or {}).get('sentence_transformers', {}).get('status', '')}`",
         f"- real_embedding_model: `{(report.get('embedding') or {}).get('real_embedding_model', '')}`",
@@ -1805,6 +1819,7 @@ def _baseline_html(report: Dict[str, Any]) -> str:
         ("Draft Status", review_draft.get("status", "")),
         ("Draft Skip", review_draft.get("review_draft_skip_reason", "")),
         ("Draft Quality", review_draft.get("draft_quality_level", "")),
+        ("Skipped Sections", review_draft.get("skipped_section_count", 0)),
         ("Citation Coverage", review_draft.get("citation_coverage_score", 0.0)),
         ("Real Embedding", (embedding.get("sentence_transformers") or {}).get("status", "")),
         ("Embedding Model", embedding.get("real_embedding_model", "")),

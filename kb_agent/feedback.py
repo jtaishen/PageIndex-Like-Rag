@@ -516,6 +516,7 @@ def _dashboard_markdown(dashboard: Dict[str, Any]) -> str:
         f"- latest_baseline_stale_reason: `{baseline.get('baseline_stale_reason', '')}`",
         f"- latest_review_draft_status: `{baseline.get('review_draft_status', '')}`",
         f"- latest_review_draft_quality: `{baseline.get('review_draft_quality_level', '')}`",
+        f"- latest_skipped_section_count: `{baseline.get('skipped_section_count', 0)}`",
         f"- latest_citation_coverage: `{baseline.get('citation_coverage_score', 0.0)}`",
         f"- latest_review_draft_path: `{baseline.get('review_draft_path', '')}`",
         f"- latest_top_review_blockers: `{', '.join(baseline.get('top_review_blockers') or [])}`",
@@ -553,7 +554,8 @@ def _dashboard_markdown(dashboard: Dict[str, Any]) -> str:
                 f"- baseline=`{baseline.get('baseline_id', '')}` current=`{baseline.get('is_current_code_baseline', '')}` "
                 f"stale=`{baseline.get('baseline_stale_reason', '')}` path=`{baseline.get('path', '')}`",
                 f"- review_draft=`{baseline.get('review_draft_status', '')}` quality=`{baseline.get('review_draft_quality_level', '')}` "
-                f"coverage=`{baseline.get('citation_coverage_score', 0.0)}` draft_path=`{baseline.get('review_draft_path', '')}`",
+                f"skipped=`{baseline.get('skipped_section_count', 0)}` coverage=`{baseline.get('citation_coverage_score', 0.0)}` "
+                f"draft_path=`{baseline.get('review_draft_path', '')}`",
             ]
         )
     lines.extend(["", "## Search Tuning"])
@@ -607,6 +609,7 @@ def _dashboard_html(dashboard: Dict[str, Any]) -> str:
         ("Baseline Current", baseline.get("is_current_code_baseline", "")),
         ("Baseline Stale", baseline.get("baseline_stale_reason", "")),
         ("Draft Quality", baseline.get("review_draft_quality_level", "")),
+        ("Skipped Sections", baseline.get("skipped_section_count", 0)),
         ("Citation Coverage", baseline.get("citation_coverage_score", 0.0)),
     ]
     card_html = "\n".join(
@@ -664,7 +667,8 @@ def _dashboard_html(dashboard: Dict[str, Any]) -> str:
             f"baseline={baseline.get('baseline_id', '')} current={baseline.get('is_current_code_baseline', '')} "
             f"stale={baseline.get('baseline_stale_reason', '')} path={baseline.get('path', '')}",
             f"review_draft={baseline.get('review_draft_status', '')} quality={baseline.get('review_draft_quality_level', '')} "
-            f"coverage={baseline.get('citation_coverage_score', 0.0)} draft_path={baseline.get('review_draft_path', '')}",
+            f"skipped={baseline.get('skipped_section_count', 0)} coverage={baseline.get('citation_coverage_score', 0.0)} "
+            f"draft_path={baseline.get('review_draft_path', '')}",
             f"top_blockers={', '.join(baseline.get('top_review_blockers') or [])}",
         ]
         if baseline
