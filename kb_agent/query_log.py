@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from . import db
-from .utils import compact_whitespace, stable_id
+from .utils import compact_whitespace, stable_id, unique_strings as _unique_strings
 
 
 SENSITIVE_KEYS = {
@@ -301,18 +301,6 @@ def _looks_sensitive(item: Any) -> bool:
     if not isinstance(item, dict):
         return False
     return any(key in item for key in SENSITIVE_KEYS)
-
-
-def _unique_strings(values: Iterable[Any]) -> List[str]:
-    result = []
-    seen = set()
-    for value in values:
-        text = str(value).strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        result.append(text)
-    return result
 
 
 def _inc(counts: Dict[str, int], key: str) -> None:

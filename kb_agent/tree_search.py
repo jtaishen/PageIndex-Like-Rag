@@ -11,7 +11,7 @@ from .llm import LLMError, generate_json_object
 from .models import EvidencePacket, SearchResult
 from .query import classify_query
 from .query_log import insert_query_log
-from .utils import compact_whitespace, first_words
+from .utils import compact_whitespace, first_words, unique_strings as _unique_strings
 
 
 FLAT_SEARCH_MODES = {"hybrid", "fts"}
@@ -843,15 +843,3 @@ def _optional_float(value: object) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
-
-
-def _unique_strings(values: Iterable[str]) -> List[str]:
-    result = []
-    seen = set()
-    for value in values:
-        text = str(value).strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        result.append(text)
-    return result

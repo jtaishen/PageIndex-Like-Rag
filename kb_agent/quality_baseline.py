@@ -29,7 +29,7 @@ from .parsers import pdf_adapter_statuses
 from .review import draft_review
 from .tasks import COMPARE_DIMENSIONS, compare_papers, generate_review_plan
 from .tree_search import tree_search
-from .utils import compact_whitespace, stable_id, write_json
+from .utils import compact_whitespace, read_json as _read_json, stable_id, unique_strings as _unique_strings, write_json
 
 
 BASELINE_SCHEMA = "quality_baseline.v1"
@@ -2071,25 +2071,6 @@ def _table(title: str, headers: List[str], rows: List[List[Any]]) -> str:
 def _list_section(title: str, items: Iterable[Any]) -> str:
     rows = "\n".join(f"<li>{escape(str(item))}</li>" for item in items)
     return f"<section class='panel'><h2>{escape(title)}</h2><ul>{rows}</ul></section>"
-
-
-def _read_json(path: Path, default: Any) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return default
-
-
-def _unique_strings(values: Iterable[Any]) -> List[str]:
-    result = []
-    seen = set()
-    for value in values:
-        text = compact_whitespace(str(value))
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        result.append(text)
-    return result
 
 
 def _avg(values: Iterable[float]) -> float:

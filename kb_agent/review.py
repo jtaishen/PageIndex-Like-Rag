@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from .llm import LLMError, generate_json_object, llm_payload_metadata
 from .tasks import TASK_ID_RE, _task_state_root
-from .utils import compact_whitespace, stable_id, write_json
+from .utils import compact_whitespace, stable_id, unique_strings as _unique_strings, write_json
 
 
 EVIDENCE_REF_RE = re.compile(r"\[E(\d+)\]")
@@ -1137,18 +1137,6 @@ def _string_list(value: object) -> List[str]:
         text = _string_value(item)
         if text:
             result.append(text)
-    return result
-
-
-def _unique_strings(values: Iterable[str]) -> List[str]:
-    result = []
-    seen = set()
-    for value in values:
-        text = str(value).strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        result.append(text)
     return result
 
 

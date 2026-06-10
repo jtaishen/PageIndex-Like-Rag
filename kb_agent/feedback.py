@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from . import db
 from .config import DATA_DIR
 from .query_log import query_stats
-from .utils import compact_whitespace, stable_id, write_json
+from .utils import compact_whitespace, stable_id, unique_strings as _unique_strings, write_json
 
 
 COMMENT_LIMIT = 600
@@ -766,18 +766,6 @@ def _json_list(value: Any) -> List[str]:
 def _preferred_mode(value: str) -> str:
     text = compact_whitespace(value)
     return text if text in {"hybrid", "tree", "fts"} else ""
-
-
-def _unique_strings(values: Iterable[Any]) -> List[str]:
-    result = []
-    seen = set()
-    for value in values:
-        text = compact_whitespace(str(value))
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        result.append(text)
-    return result
 
 
 def _inc(counts: Dict[str, int], key: str) -> None:

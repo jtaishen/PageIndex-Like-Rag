@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from . import db
 from .tasks import TASK_ID_RE, _task_state_root
-from .utils import compact_whitespace, stable_id
+from .utils import compact_whitespace, stable_id, unique_strings as _unique_strings
 
 
 ALLOWED_MEMORY_TYPES = {
@@ -446,15 +446,3 @@ def _compact_task_progress(rows: List[Dict[str, object]]) -> Dict[str, object]:
         "importance": importance or 0.7,
         "confidence": confidence or 0.8,
     }
-
-
-def _unique_strings(values: Iterable[str]) -> List[str]:
-    result = []
-    seen = set()
-    for value in values:
-        text = str(value).strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        result.append(text)
-    return result

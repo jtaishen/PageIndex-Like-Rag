@@ -50,7 +50,7 @@ from .tasks import compare_papers, generate_review_plan, get_task_artifact
 from .tree_search import tree_search
 
 
-def main(argv: Any = None) -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="kb", description="PageIndex-like knowledge base MVP")
     parser.add_argument("--db", default=None, help="SQLite database path. Defaults to data/kb.sqlite")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -389,9 +389,17 @@ def main(argv: Any = None) -> None:
     profile_apply = profile_subparsers.add_parser("apply", help="Apply a saved search profile for auto mode")
     profile_apply.add_argument("name")
 
+    return parser
+
+
+def main(argv: Any = None) -> None:
+    parser = build_parser()
     args = parser.parse_args(argv)
     db_path = resolve_db_path(args.db)
+    _dispatch_command(args, db_path)
 
+
+def _dispatch_command(args: Any, db_path: Path) -> None:
     if args.command == "sync":
         result = sync_directory(Path(args.path), db_path, force=args.force, pdf_parser=args.pdf_parser)
         if args.build_embeddings:

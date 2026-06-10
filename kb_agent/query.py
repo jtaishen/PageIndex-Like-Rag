@@ -4,7 +4,7 @@ import re
 from typing import Any, Dict, Iterable, List, Optional
 
 from .llm import LLMError, generate_json_object
-from .utils import compact_whitespace
+from .utils import compact_whitespace, string_list as _string_list, unique_strings as _unique_strings
 
 
 INTENT_SPECS: Dict[str, Dict[str, List[str]]] = {
@@ -186,25 +186,3 @@ def _normalize_llm_profile(query: str, base: Dict[str, Any], payload: Dict[str, 
         "warnings": warnings,
         "llm_error": "",
     }
-
-
-def _string_list(value: object) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value] if value.strip() else []
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    return []
-
-
-def _unique_strings(values: Iterable[str]) -> List[str]:
-    result = []
-    seen = set()
-    for value in values:
-        text = str(value).strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        result.append(text)
-    return result

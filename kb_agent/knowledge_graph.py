@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from . import db
 from .config import DEFAULT_DB_PATH, PROJECT_ROOT
 from .fact_audit import audit_facts
-from .utils import compact_whitespace, stable_id, write_json
+from .utils import compact_whitespace, read_json as _read_json, stable_id, unique_strings as _unique_strings, write_json
 
 
 GRAPH_SCHEMA = "knowledge_graph.v1"
@@ -849,13 +849,6 @@ def _json_value(value: Any, default: Any) -> Any:
         return default
 
 
-def _read_json(path: Path, default: Any) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return default
-
-
 def _short_label(value: Any, limit: int = 160) -> str:
     text = compact_whitespace(str(value or ""))
     if len(text) <= limit:
@@ -870,15 +863,3 @@ def _normalize_key(value: Any) -> str:
 
 def _mermaid_id(value: str) -> str:
     return "n_" + "".join(ch if ch.isalnum() else "_" for ch in value)[:80]
-
-
-def _unique_strings(values: Iterable[Any]) -> List[str]:
-    result = []
-    seen = set()
-    for value in values:
-        text = compact_whitespace(str(value))
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        result.append(text)
-    return result

@@ -92,3 +92,41 @@ def unique_preserve_order(values: Iterable[str]) -> List[str]:
             result.append(value)
             seen.add(value)
     return result
+
+
+def unique_strings(values: Iterable[Any]) -> List[str]:
+    seen = set()
+    result: List[str] = []
+    for value in values:
+        text = compact_whitespace(str(value))
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def string_list(value: object) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def excerpt(text: str, max_chars: int) -> str:
+    compacted = compact_whitespace(str(text or ""))
+    if len(compacted) <= max_chars:
+        return compacted
+    return compacted[:max_chars].rstrip() + "..."
+
+
+def read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default

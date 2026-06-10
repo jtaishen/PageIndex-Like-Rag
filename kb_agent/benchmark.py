@@ -14,7 +14,7 @@ from .knowledge_graph import graph_summary
 from .query import classify_query
 from .query_log import list_query_logs
 from .search import build_search_report, search_documents, search_nodes
-from .utils import compact_whitespace, stable_id, write_json
+from .utils import compact_whitespace, read_json as _read_json, stable_id, unique_strings as _unique_strings, write_json
 
 
 SUITE_DIR = DATA_DIR / "eval_suites"
@@ -746,13 +746,6 @@ def _safe_name(value: str) -> str:
     return safe.strip("_") or stable_id("suite", text, length=8)
 
 
-def _read_json(path: Path, default: Any) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return default
-
-
 def _dedupe_queries(items: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     result = []
     seen = set()
@@ -805,15 +798,3 @@ def _string_list(value: Any) -> List[str]:
     if isinstance(value, list):
         return _unique_strings(str(item) for item in value)
     return _unique_strings(str(value).split(","))
-
-
-def _unique_strings(values: Iterable[Any]) -> List[str]:
-    result = []
-    seen = set()
-    for value in values:
-        text = str(value).strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        result.append(text)
-    return result

@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from . import db
 from .artifacts import get_artifact, get_citation_map
 from .config import DATA_DIR
-from .utils import compact_whitespace, stable_id, write_json
+from .utils import compact_whitespace, read_json as _read_json, stable_id, unique_strings as _unique_strings, write_json
 
 
 AUDIT_SCHEMA = "fact_audit.v1"
@@ -552,13 +552,6 @@ def _json_value(value: Any, default: Any) -> Any:
         return default
 
 
-def _read_json(path: Path, default: Any) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return default
-
-
 def _query_terms(query: str) -> List[str]:
     text = compact_whitespace(query)
     return [term for term in ANCHOR_TERMS if term in text]
@@ -573,15 +566,3 @@ def _excerpt(text: str, limit: int) -> str:
     if len(value) <= limit:
         return value
     return value[:limit] + "..."
-
-
-def _unique_strings(values: Iterable[Any]) -> List[str]:
-    result = []
-    seen = set()
-    for value in values:
-        text = compact_whitespace(str(value))
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        result.append(text)
-    return result

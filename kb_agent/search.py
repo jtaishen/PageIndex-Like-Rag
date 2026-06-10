@@ -15,7 +15,7 @@ from .embeddings import (
     vector_from_json,
 )
 from .models import EvidencePacket, SearchResult
-from .utils import compact_whitespace
+from .utils import compact_whitespace, unique_strings as _unique_strings
 
 
 SEARCH_MODES = {"hybrid", "fts", "tree", "auto"}
@@ -749,13 +749,3 @@ def _optional_float(value: object) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
-
-
-def _unique_strings(values: Iterable[str]) -> List[str]:
-    seen = set()
-    result = []
-    for value in values:
-        if value and value not in seen:
-            seen.add(value)
-            result.append(value)
-    return result

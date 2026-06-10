@@ -11,7 +11,7 @@ from .artifacts import get_artifact, get_doc_card, get_parse_quality, list_artif
 from .config import llm_fact_batch_size, llm_fact_max_nodes
 from .insights import extract_doc_insights
 from .llm import LLMError, generate_json_object
-from .utils import compact_whitespace, stable_id, write_json
+from .utils import compact_whitespace, stable_id, string_list as _string_list, unique_strings as _unique_strings, write_json
 
 
 FACT_ARTIFACTS = {
@@ -2069,14 +2069,6 @@ def _normalize_key(text: str) -> str:
     return re.sub(r"\s+", "", value)
 
 
-def _string_list(value: object) -> List[str]:
-    if isinstance(value, list):
-        return [compact_whitespace(str(item)) for item in value if compact_whitespace(str(item))]
-    if isinstance(value, str) and value.strip():
-        return [compact_whitespace(value)]
-    return []
-
-
 def _confidence(value: object, default: float) -> float:
     try:
         score = float(value)  # type: ignore[arg-type]
@@ -2090,15 +2082,3 @@ def _excerpt(text: str, max_chars: int) -> str:
     if len(cleaned) <= max_chars:
         return cleaned
     return cleaned[:max_chars].rstrip() + " ..."
-
-
-def _unique_strings(values: Iterable[Any]) -> List[str]:
-    result = []
-    seen = set()
-    for value in values:
-        text = compact_whitespace(str(value))
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        result.append(text)
-    return result

@@ -11,7 +11,7 @@ from .config import DATA_DIR
 from .memory import evaluate_memory_write, resume_task
 from .search import search_documents, search_nodes
 from .tasks import get_task_artifact
-from .utils import compact_whitespace, write_json
+from .utils import compact_whitespace, unique_strings as _unique_strings, write_json
 
 
 def eval_search(
@@ -574,15 +574,3 @@ def _mode_score(
         - weak_rate * 0.03,
         6,
     )
-
-
-def _unique_strings(values: Iterable[str]) -> List[str]:
-    result = []
-    seen = set()
-    for value in values:
-        text = str(value).strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        result.append(text)
-    return result
