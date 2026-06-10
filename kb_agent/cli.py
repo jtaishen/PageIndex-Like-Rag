@@ -972,9 +972,13 @@ def _review_summary(result: dict) -> dict:
         "task_id": result.get("task_id"),
         "status": result.get("status") or report.get("status"),
         "drafted_section_count": result.get("drafted_section_count") or report.get("drafted_section_count"),
+        "draft_quality_level": report.get("draft_quality_level", ""),
+        "quality_reasons": report.get("quality_reasons") or [],
         "citation_coverage_score": report.get("citation_coverage_score") or citation_check.get("coverage_score"),
         "missing_ref_count": len(citation_check.get("missing_refs") or []),
+        "unused_evidence_count": len(citation_check.get("unused_evidence") or []),
         "unsupported_paragraph_count": len(citation_check.get("unsupported_paragraphs") or []),
+        "revision_actions": report.get("revision_actions") or report.get("next_actions") or [],
         "artifact_paths": result.get("artifact_paths", {}),
         "warnings": report.get("warnings", []),
         "llm_error": result.get("llm_error", ""),
@@ -1111,6 +1115,7 @@ def _quality_baseline_cli_summary(result: dict) -> dict:
     llm_facts = llm_baseline.get("insights_and_facts") or {}
     llm_tasks = llm_baseline.get("tasks") or {}
     review_task = ((result.get("tasks") or {}).get("review") or {})
+    review_draft = ((result.get("tasks") or {}).get("review_draft") or {})
     review_diagnostics = review_task.get("llm_diagnostics") or {}
     return {
         "schema": result.get("schema"),
@@ -1152,6 +1157,13 @@ def _quality_baseline_cli_summary(result: dict) -> dict:
         "review_fallback_mode": review_diagnostics.get("mode", ""),
         "review_retry_count": review_diagnostics.get("retry_count", 0),
         "review_partial_reasons": review_task.get("review_partial_reasons") or [],
+        "review_draft_status": review_draft.get("status", ""),
+        "review_draft_quality_level": review_draft.get("draft_quality_level", ""),
+        "citation_coverage_score": review_draft.get("citation_coverage_score", 0.0),
+        "missing_ref_count": review_draft.get("missing_ref_count", 0),
+        "unsupported_paragraph_count": review_draft.get("unsupported_paragraph_count", 0),
+        "drafted_section_count": review_draft.get("drafted_section_count", 0),
+        "review_draft_path": review_draft.get("review_draft_path", ""),
         "duplicate_evidence_removed": review_task.get("duplicate_evidence_removed", 0),
         "citation_gap_count_before": (result.get("fact_audit_delta") or {}).get("citation_gap_count_before", 0),
         "citation_gap_count_after": (result.get("fact_audit_delta") or {}).get("citation_gap_count_after", 0),

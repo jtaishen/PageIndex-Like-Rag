@@ -6,12 +6,14 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from .llm import LLMError, generate_json_object
+from .llm import LLMError, generate_json_object, llm_payload_metadata
 from .tasks import TASK_ID_RE, _task_state_root
 from .utils import compact_whitespace, write_json
 
 
 EVIDENCE_REF_RE = re.compile(r"\[E(\d+)\]")
+MAX_PROMPT_EVIDENCE = 8
+MAX_PROMPT_SUMMARY_CHARS = 240
 
 
 def draft_review(
@@ -35,10 +37,22 @@ def draft_review(
     for section in sections:
         evidence_artifact = _read_section_evidence(task_dir, str(section["section_id"]))
         numbered_evidence = _number_evidence(evidence_artifact.get("evidence") or [])
+        compaction = evidence_artifact.get("compaction_report") if isinstance(evidence_artifact.get("compaction_report"), dict) else {}
         if use_llm:
             try:
                 payload = _draft_section_with_llm(outline, section, numbered_evidence)
-                draft = _normalize_llm_section_draft(task_id, section, numbered_evidence, payload)
+                draft = _normalize_llm_section_draft(
+                    task_id,
+                    section,
+                    numbered_evidence,
+                    payload,
+                    llm_diagnostics=_llm_diagnostics(
+                        used=True,
+                        metadata=llm_payload_metadata(payload),
+                        evidence_count=len(numbered_evidence),
+                        compaction=compaction,
+                    ),
+                )
             except LLMError as exc:
                 if require_llm:
                     raise
@@ -48,6 +62,13 @@ def draft_review(
                     section,
                     numbered_evidence,
                     warnings=[f"llm_unavailable:{llm_error}"],
+                    llm_diagnostics=_llm_diagnostics(
+                        used=False,
+                        error=exc,
+                        fallback_reason=getattr(exc, "error_type", "") or "llm_error",
+                        evidence_count=len(numbered_evidence),
+                        compaction=compaction,
+                    ),
                 )
         else:
             draft = _rule_based_section_draft(
@@ -55,6 +76,12 @@ def draft_review(
                 section,
                 numbered_evidence,
                 warnings=["llm_disabled"],
+                llm_diagnostics=_llm_diagnostics(
+                    used=False,
+                    fallback_reason="llm_disabled",
+                    evidence_count=len(numbered_evidence),
+                    compaction=compaction,
+                ),
             )
         drafted.append(draft)
         section_paths = _write_section_draft(task_dir, draft)
@@ -210,16 +237,50 @@ def _draft_section_with_llm(
 
 def _format_evidence_for_prompt(evidence: List[Dict[str, Any]]) -> List[str]:
     lines = []
-    for item in evidence[:14]:
+    for item in evidence[:MAX_PROMPT_EVIDENCE]:
         lines.append(f"[{item.get('ref_id')}]")
         lines.append(f"title: {item.get('title') or item.get('doc_id') or ''}")
         lines.append(f"node_path: {item.get('node_path') or ''}")
         lines.append(f"page_range: {item.get('page_range') or ''}")
-        lines.append(f"excerpt: {_excerpt(str(item.get('excerpt') or ''), 700)}")
+        lines.append(f"summary: {_evidence_summary(item)}")
         lines.append("")
     if not lines:
         lines.append("无可用证据。")
     return lines
+
+
+def _evidence_summary(item: Dict[str, Any]) -> str:
+    text = compact_whitespace(
+        str(item.get("evidence_summary") or item.get("summary") or item.get("claim") or item.get("excerpt") or "")
+    )
+    if not text:
+        text = compact_whitespace(f"{item.get('heading') or ''} {item.get('node_path') or ''}")
+    return _excerpt(text, MAX_PROMPT_SUMMARY_CHARS)
+
+
+def _llm_diagnostics(
+    *,
+    used: bool,
+    metadata: Optional[Dict[str, Any]] = None,
+    error: Optional[LLMError] = None,
+    fallback_reason: str = "",
+    evidence_count: int = 0,
+    compaction: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    metadata = metadata or {}
+    compaction = compaction or {}
+    return {
+        "schema": "section_draft_llm_diagnostics.v1",
+        "used": used,
+        "retry_count": int(metadata.get("retry_count") or 0),
+        "repair_used": bool(metadata.get("repair_used")),
+        "error_type": (getattr(error, "error_type", "") if error else str(metadata.get("error_type") or "")),
+        "fallback_reason": fallback_reason,
+        "evidence_count": evidence_count,
+        "compact_count": int(compaction.get("kept_evidence_count") or evidence_count),
+        "duplicate_evidence_removed": int(compaction.get("duplicate_evidence_removed") or 0),
+        "compaction_warnings": _string_list(compaction.get("warnings")),
+    }
 
 
 def _normalize_llm_section_draft(
@@ -227,6 +288,8 @@ def _normalize_llm_section_draft(
     section: Dict[str, Any],
     evidence: List[Dict[str, Any]],
     payload: Dict[str, object],
+    *,
+    llm_diagnostics: Dict[str, Any],
 ) -> Dict[str, Any]:
     body = _body_value(payload.get("body_markdown") or payload.get("body") or payload.get("draft"))
     warnings = _string_list(payload.get("warnings"))
@@ -243,6 +306,7 @@ def _normalize_llm_section_draft(
         claim_plan=_normalize_claim_plan(payload.get("claim_plan")),
         unsupported_claims=_string_list(payload.get("unsupported_claims")),
         warnings=warnings,
+        llm_diagnostics=llm_diagnostics,
     )
 
 
@@ -251,6 +315,7 @@ def _rule_based_section_draft(
     section: Dict[str, Any],
     evidence: List[Dict[str, Any]],
     warnings: List[str],
+    llm_diagnostics: Dict[str, Any],
 ) -> Dict[str, Any]:
     body = _fallback_body(section, evidence)
     claim_plan = [
@@ -270,6 +335,7 @@ def _rule_based_section_draft(
         claim_plan=claim_plan,
         unsupported_claims=[],
         warnings=[*warnings, "rule_based_section_draft"],
+        llm_diagnostics=llm_diagnostics,
     )
 
 
@@ -284,6 +350,7 @@ def _section_draft(
     claim_plan: List[Dict[str, Any]],
     unsupported_claims: List[str],
     warnings: List[str],
+    llm_diagnostics: Dict[str, Any],
 ) -> Dict[str, Any]:
     refs = _body_refs(body)
     used_evidence = [item for item in evidence if item.get("ref_id") in refs]
@@ -300,6 +367,7 @@ def _section_draft(
         "evidence": evidence,
         "used_evidence": used_evidence,
         "unsupported_claims": unsupported_claims,
+        "llm_diagnostics": llm_diagnostics,
         "warnings": _unique_strings(warnings),
         "created_at": time.time(),
     }
@@ -423,8 +491,12 @@ def _build_citation_check(task_id: str, drafts: List[Dict[str, Any]]) -> Dict[st
     warnings = []
     if missing_refs:
         warnings.append("missing_evidence_refs")
+    if unused_evidence:
+        warnings.append("unused_evidence")
     if unsupported_paragraphs:
         warnings.append("unsupported_paragraphs")
+    if scores and overall < 0.8:
+        warnings.append("low_evidence_coverage")
     return {
         "schema": "citation_check.v1",
         "task_id": task_id,
@@ -434,6 +506,9 @@ def _build_citation_check(task_id: str, drafts: List[Dict[str, Any]]) -> Dict[st
         "missing_refs": missing_refs,
         "unused_evidence": unused_evidence,
         "unsupported_paragraphs": unsupported_paragraphs,
+        "missing_ref_count": len(missing_refs),
+        "unused_evidence_count": len(unused_evidence),
+        "unsupported_paragraph_count": len(unsupported_paragraphs),
         "warnings": warnings,
         "created_at": time.time(),
     }
@@ -457,19 +532,27 @@ def _build_review_report(
         warnings.extend(draft.get("warnings") or [])
     if missing_sections:
         warnings.append("missing_section_drafts")
+    quality_reasons = _draft_quality_reasons(outline_sections, drafts, citation_check, missing_sections, warnings)
+    draft_quality_level = _draft_quality_level(citation_check, missing_sections, quality_reasons)
     next_actions = []
     if citation_check.get("missing_refs"):
         next_actions.append("修正文中无法映射的证据编号。")
+    if citation_check.get("unused_evidence"):
+        next_actions.append("删除未使用证据，或把关键证据补充到正文对应观点。")
     if citation_check.get("unsupported_paragraphs"):
         next_actions.append("为缺少证据标记的段落补充引用，或删除无证据观点。")
     if missing_sections:
         next_actions.append("为尚未生成的章节运行 draft-review。")
+    if citation_check.get("coverage_score", 0.0) < 0.8:
+        next_actions.append("优先重写低覆盖章节，确保每个关键段落至少有一个 [E#] 证据标记。")
     if not next_actions:
         next_actions.append("人工通读综述草稿，检查章节衔接和引用表达。")
     return {
         "schema": "review_report.v1",
         "task_id": task_id,
         "status": "partial" if warnings or missing_sections else "drafted",
+        "draft_quality_level": draft_quality_level,
+        "quality_reasons": quality_reasons,
         "title": outline.get("title") or outline.get("topic") or "",
         "section_count": len(outline_sections),
         "drafted_section_count": len(drafts),
@@ -487,6 +570,7 @@ def _build_review_report(
         ],
         "warnings": _unique_strings(warnings),
         "next_actions": next_actions,
+        "revision_actions": next_actions,
         "created_at": time.time(),
     }
 
@@ -494,6 +578,48 @@ def _build_review_report(
 def _body_refs(body: str) -> List[str]:
     refs = [f"E{match.group(1)}" for match in EVIDENCE_REF_RE.finditer(body)]
     return _unique_strings(refs)
+
+
+def _draft_quality_reasons(
+    outline_sections: List[Dict[str, Any]],
+    drafts: List[Dict[str, Any]],
+    citation_check: Dict[str, Any],
+    missing_sections: List[str],
+    warnings: List[str],
+) -> List[str]:
+    reasons = []
+    if outline_sections and not drafts:
+        reasons.append("section_draft_missing")
+    if missing_sections:
+        reasons.append("section_draft_missing")
+    if citation_check.get("missing_refs"):
+        reasons.append("missing_refs")
+    if citation_check.get("unused_evidence"):
+        reasons.append("unused_evidence")
+    if citation_check.get("unsupported_paragraphs"):
+        reasons.append("unsupported_paragraphs")
+    if float(citation_check.get("coverage_score") or 0.0) < 0.8:
+        reasons.append("low_evidence_coverage")
+    if any(str(warning).startswith("llm_unavailable") for warning in warnings):
+        reasons.append("llm_unavailable")
+    if any(str(warning) == "rule_based_section_draft" for warning in warnings):
+        reasons.append("rule_based_section_draft")
+    return _unique_strings(reasons)
+
+
+def _draft_quality_level(
+    citation_check: Dict[str, Any],
+    missing_sections: List[str],
+    quality_reasons: List[str],
+) -> str:
+    coverage = float(citation_check.get("coverage_score") or 0.0)
+    if "section_draft_missing" in quality_reasons and coverage <= 0:
+        return "failed"
+    if missing_sections or coverage < 0.5 or "missing_refs" in quality_reasons:
+        return "weak"
+    if quality_reasons or coverage < 0.9:
+        return "usable"
+    return "good"
 
 
 def _unsupported_paragraphs(section_id: str, body: str) -> List[Dict[str, Any]]:

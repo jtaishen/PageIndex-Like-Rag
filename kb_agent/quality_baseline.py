@@ -25,6 +25,7 @@ from .insights import extract_doc_insights
 from .knowledge_graph import graph_summary
 from .llm import llm_runtime_options, llm_status
 from .parsers import pdf_adapter_statuses
+from .review import draft_review
 from .tasks import COMPARE_DIMENSIONS, compare_papers, generate_review_plan
 from .tree_search import tree_search
 from .utils import compact_whitespace, stable_id, write_json
@@ -234,6 +235,9 @@ class _NullStageRuntime:
     def mark_fallback(self, reason: str = "fallback") -> None:
         return None
 
+    def mark_warning(self, warning: str) -> None:
+        return None
+
 
 def _null_stage(name: str) -> _NullStageRuntime:
     return _NullStageRuntime(name)
@@ -398,6 +402,7 @@ def latest_quality_baseline(
         stage_summary = llm_baseline.get("stage_summary") or {}
         llm_facts = llm_baseline.get("insights_and_facts") or {}
         llm_tasks = llm_baseline.get("tasks") or {}
+        review_draft = ((payload.get("tasks") or {}).get("review_draft") or {})
         items.append(
             {
                 "path": str(path),
@@ -423,6 +428,13 @@ def latest_quality_baseline(
                 "review_llm_error": (((payload.get("tasks") or {}).get("review") or {}).get("llm_error") or ""),
                 "review_fallback_mode": review_diagnostics.get("mode") or "",
                 "review_partial_reasons": review.get("review_partial_reasons") or [],
+                "review_draft_status": review_draft.get("status", ""),
+                "review_draft_quality_level": review_draft.get("draft_quality_level", ""),
+                "citation_coverage_score": review_draft.get("citation_coverage_score", 0.0),
+                "missing_ref_count": review_draft.get("missing_ref_count", 0),
+                "unsupported_paragraph_count": review_draft.get("unsupported_paragraph_count", 0),
+                "drafted_section_count": review_draft.get("drafted_section_count", 0),
+                "review_draft_path": review_draft.get("review_draft_path", ""),
                 "duplicate_evidence_removed": review.get("duplicate_evidence_removed", 0),
                 "citation_gap_count_before": fact_delta.get("citation_gap_count_before", 0),
                 "citation_gap_count_after": fact_delta.get("citation_gap_count_after", 0),
@@ -1133,6 +1145,7 @@ def _task_baseline(
         "skip_llm_tasks": skip_llm_tasks,
         "compare": {},
         "review": {},
+        "review_draft": {},
         "case_study": {},
         "warnings": [],
     }
@@ -1140,11 +1153,12 @@ def _task_baseline(
         result["warnings"].append("insufficient_docs_for_compare_review")
         return result
     if use_llm and skip_llm_tasks and runtime:
-        for name in ("llm_compare", "llm_review"):
+        for name in ("llm_compare", "llm_review", "llm_review_draft"):
             stage = runtime.stage(name)
             stage.status = "skipped"
             stage.reason = "skip_llm_tasks"
             stage.warnings.append("llm_tasks_skipped")
+        result["review_draft"] = {"status": "skipped", "reason": "skip_llm_tasks"}
     task_doc_ids = list(llm_doc_ids or doc_ids)
     if len(task_doc_ids) < 2:
         task_doc_ids = list(doc_ids[:2])
@@ -1230,6 +1244,36 @@ def _task_baseline(
     except Exception as exc:
         result["review"] = {"status": "failed", "error": str(exc)}
         result["warnings"].append(f"review_failed:{exc}")
+    if use_llm and not skip_llm_tasks:
+        review_task_id = str((result.get("review") or {}).get("task_id") or "")
+        if review_task_id:
+            try:
+                stage_ctx = runtime.stage("llm_review_draft") if runtime else _null_stage("llm_review_draft")
+                with stage_ctx as stage:
+                    if not stage.allowed:
+                        result["review_draft"] = {"status": "skipped", "reason": stage.reason or "llm_review_draft_skipped"}
+                    elif not stage.can_continue():
+                        result["review_draft"] = {
+                            "status": "skipped",
+                            "reason": "llm_review_draft_skipped:baseline_llm_budget_exhausted",
+                        }
+                    else:
+                        draft = draft_review(
+                            db_path,
+                            review_task_id,
+                            use_llm=True,
+                            require_llm=False,
+                        )
+                        result["review_draft"] = _review_draft_summary(draft)
+                        if draft.get("llm_error"):
+                            stage.mark_fallback(str(draft.get("llm_error")))
+                        if result["review_draft"].get("status") == "partial":
+                            stage.mark_warning("review_draft_partial")
+            except Exception as exc:
+                result["review_draft"] = {"status": "failed", "error": str(exc)}
+                result["warnings"].append(f"review_draft_failed:{exc}")
+        else:
+            result["review_draft"] = {"status": "skipped", "reason": "missing_review_task_id"}
     try:
         case = generate_case_study(db_path, "真实论文集方法与实验评测对比", doc_ids=doc_ids, compare_modes=["hybrid", "tree"], top_k=5)
         result["case_study"] = {
@@ -1324,6 +1368,7 @@ def _llm_baseline_summary(
     llm_fact_items = [item for item in insight_items if isinstance(item, dict) and item.get("llm")]
     compare = tasks.get("compare") or {}
     review = tasks.get("review") or {}
+    review_draft = tasks.get("review_draft") or {}
     compare_diag = compare.get("llm_diagnostics") or {}
     fact_batch_count = sum(int((item.get("llm") or {}).get("batch_count") or 0) for item in llm_fact_items)
     fact_batch_success = sum(int((item.get("llm") or {}).get("batch_success_count") or 0) for item in llm_fact_items)
@@ -1336,6 +1381,10 @@ def _llm_baseline_summary(
         warning_tags.append("llm_tree_search_fallback")
     if any((item.get("llm") or {}).get("llm_error") for item in llm_fact_items):
         warning_tags.append("llm_fact_extraction_fallback")
+    if review_draft.get("status") == "partial":
+        warning_tags.append("review_draft_partial")
+    if review_draft.get("draft_quality_level") in {"weak", "failed"}:
+        warning_tags.append(f"review_draft_{review_draft.get('draft_quality_level')}")
     if runtime.get("timeout_count"):
         warning_tags.append("llm_timeout")
     if runtime.get("budget_exhausted"):
@@ -1393,6 +1442,13 @@ def _llm_baseline_summary(
             "review_fallback_sections": (review.get("llm_diagnostics") or {}).get("fallback_sections", []),
             "review_partial_reasons": review.get("review_partial_reasons") or [],
             "duplicate_evidence_removed": review.get("duplicate_evidence_removed", 0),
+            "review_draft_status": review_draft.get("status", ""),
+            "review_draft_quality_level": review_draft.get("draft_quality_level", ""),
+            "citation_coverage_score": review_draft.get("citation_coverage_score", 0.0),
+            "missing_ref_count": review_draft.get("missing_ref_count", 0),
+            "unsupported_paragraph_count": review_draft.get("unsupported_paragraph_count", 0),
+            "drafted_section_count": review_draft.get("drafted_section_count", 0),
+            "review_draft_path": review_draft.get("review_draft_path", ""),
         },
         "fact_conflict_count": graph.get("conflict_count", 0),
         "warnings": _unique_strings(warning_tags),
@@ -1420,6 +1476,7 @@ def _baseline_warnings(
     warnings.extend(benchmark.get("warnings") or [])
     warnings.extend((tasks.get("compare") or {}).get("warnings") or [])
     warnings.extend((tasks.get("review") or {}).get("warnings") or [])
+    warnings.extend((tasks.get("review_draft") or {}).get("warnings") or [])
     warnings.extend(memory.get("warnings") or [])
     warnings.extend(graph.get("warnings") or [])
     warnings.extend(llm_baseline.get("warnings") or [])
@@ -1451,6 +1508,31 @@ def _sync_summary(report: Dict[str, Any]) -> Dict[str, Any]:
         "failed": report.get("failed", 0),
         "error_count": len(report.get("errors") or []),
         "errors": report.get("errors") or [],
+    }
+
+
+def _review_draft_summary(result: Dict[str, Any]) -> Dict[str, Any]:
+    report = result.get("review_report") or {}
+    citation_check = result.get("citation_check") or {}
+    artifacts = result.get("artifact_paths") or {}
+    return {
+        "schema": "review_draft_baseline_summary.v1",
+        "task_id": result.get("task_id") or "",
+        "status": result.get("status") or report.get("status") or "",
+        "draft_quality_level": report.get("draft_quality_level") or "",
+        "quality_reasons": report.get("quality_reasons") or [],
+        "drafted_section_count": result.get("drafted_section_count") or report.get("drafted_section_count", 0),
+        "section_count": report.get("section_count", 0),
+        "citation_coverage_score": report.get("citation_coverage_score") or citation_check.get("coverage_score", 0.0),
+        "missing_ref_count": len(citation_check.get("missing_refs") or []),
+        "unused_evidence_count": len(citation_check.get("unused_evidence") or []),
+        "unsupported_paragraph_count": len(citation_check.get("unsupported_paragraphs") or []),
+        "review_draft_path": artifacts.get("review_draft", ""),
+        "citation_check_path": artifacts.get("citation_check", ""),
+        "review_report_path": artifacts.get("review_report", ""),
+        "warning_count": len(report.get("warnings") or []),
+        "warnings": report.get("warnings") or [],
+        "llm_error": result.get("llm_error", ""),
     }
 
 
@@ -1513,6 +1595,9 @@ def _baseline_markdown(report: Dict[str, Any]) -> str:
         f"- llm_budget_exhausted: `{(report.get('llm_baseline') or {}).get('budget_exhausted', False)}`",
         f"- llm_facts_success_rate: `{((report.get('llm_baseline') or {}).get('insights_and_facts') or {}).get('llm_facts_success_rate', 0.0)}`",
         f"- llm_compare_dimension_success_rate: `{((report.get('llm_baseline') or {}).get('tasks') or {}).get('llm_compare_dimension_success_rate', 0.0)}`",
+        f"- review_draft_status: `{((report.get('tasks') or {}).get('review_draft') or {}).get('status', '')}`",
+        f"- review_draft_quality_level: `{((report.get('tasks') or {}).get('review_draft') or {}).get('draft_quality_level', '')}`",
+        f"- citation_coverage_score: `{((report.get('tasks') or {}).get('review_draft') or {}).get('citation_coverage_score', 0.0)}`",
         f"- real_embedding_status: `{(report.get('embedding') or {}).get('sentence_transformers', {}).get('status', '')}`",
         f"- real_embedding_model: `{(report.get('embedding') or {}).get('real_embedding_model', '')}`",
         f"- real_embedding_node_coverage: `{(report.get('embedding') or {}).get('real_embedding_node_coverage', 0.0)}`",
@@ -1547,6 +1632,7 @@ def _baseline_markdown(report: Dict[str, Any]) -> str:
 
 def _baseline_html(report: Dict[str, Any]) -> str:
     review = ((report.get("tasks") or {}).get("review") or {})
+    review_draft = ((report.get("tasks") or {}).get("review_draft") or {})
     fact_delta = report.get("fact_audit_delta") or {}
     tree_summary = (report.get("tree_search") or {}).get("comparison_summary") or {}
     llm_baseline = report.get("llm_baseline") or {}
@@ -1566,6 +1652,9 @@ def _baseline_html(report: Dict[str, Any]) -> str:
         ("LLM Budget", "exhausted" if llm_baseline.get("budget_exhausted") else "ok"),
         ("Facts LLM Rate", llm_facts.get("llm_facts_success_rate", 0.0)),
         ("Compare LLM Rate", llm_tasks.get("llm_compare_dimension_success_rate", 0.0)),
+        ("Draft Status", review_draft.get("status", "")),
+        ("Draft Quality", review_draft.get("draft_quality_level", "")),
+        ("Citation Coverage", review_draft.get("citation_coverage_score", 0.0)),
         ("Real Embedding", (embedding.get("sentence_transformers") or {}).get("status", "")),
         ("Embedding Model", embedding.get("real_embedding_model", "")),
         ("Embedding Coverage", embedding.get("real_embedding_node_coverage", 0.0)),
@@ -1626,6 +1715,7 @@ def _baseline_html(report: Dict[str, Any]) -> str:
             f"benchmark: {(report.get('benchmark') or {}).get('path', '')}",
             f"compare_task: {((report.get('tasks') or {}).get('compare') or {}).get('task_id', '')}",
             f"review_task: {((report.get('tasks') or {}).get('review') or {}).get('task_id', '')}",
+            f"review_draft: {review_draft.get('review_draft_path', '')}",
             f"case_study: {((report.get('tasks') or {}).get('case_study') or {}).get('path', '')}",
             f"claim_graph: {(report.get('claim_graph') or {}).get('graph_dir', '')}",
         ],

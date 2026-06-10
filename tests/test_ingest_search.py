@@ -896,6 +896,12 @@ class IngestSearchTest(unittest.TestCase):
                 "warnings": [],
             }
             tree_payload = {"selected_node_ids": [], "rationale": ["使用规则候选即可。"], "warnings": []}
+            draft_payload = {
+                "claim_plan": [{"claim": "可基于证据生成综述章节。", "evidence": ["E1"]}],
+                "body_markdown": "本节基于已有证据组织综述内容。[E1]",
+                "unsupported_claims": [],
+                "warnings": [],
+            }
 
             with mock.patch("kb_agent.quality_baseline.importlib.util.find_spec", return_value=None), mock.patch(
                 "kb_agent.quality_baseline.llm_status",
@@ -906,7 +912,10 @@ class IngestSearchTest(unittest.TestCase):
             ), mock.patch("kb_agent.insights.generate_json_object", return_value=insight_payload), mock.patch(
                 "kb_agent.facts.generate_json_object",
                 return_value=fact_payload,
-            ), mock.patch("kb_agent.tasks.generate_json_object", return_value={"warnings": []}):
+            ), mock.patch("kb_agent.tasks.generate_json_object", return_value={"warnings": []}), mock.patch(
+                "kb_agent.review.generate_json_object",
+                return_value=draft_payload,
+            ):
                 result = run_quality_baseline(db_path, papers, use_llm=True, top_k=2)
 
             self.assertEqual(result["llm_baseline"]["schema"], "llm_quality_baseline.v1")
@@ -927,6 +936,11 @@ class IngestSearchTest(unittest.TestCase):
             self.assertIn("compare_dimension_timeout_count", result["llm_baseline"]["tasks"])
             self.assertIn("review_retry_count", result["llm_baseline"]["tasks"])
             self.assertIn("review_partial_reasons", result["llm_baseline"]["tasks"])
+            self.assertIn("llm_review_draft", result["llm_baseline"]["stage_summary"])
+            self.assertIn("review_draft_status", result["llm_baseline"]["tasks"])
+            self.assertIn("review_draft_quality_level", result["llm_baseline"]["tasks"])
+            self.assertIn("citation_coverage_score", result["llm_baseline"]["tasks"])
+            self.assertTrue(result["tasks"]["review_draft"].get("review_report_path"))
             self.assertIn("llm_diagnostics", result["tasks"]["review"])
             self.assertIn("comparison_summary", result["tree_search"])
             html = Path(result["html_path"]).read_text(encoding="utf-8")
@@ -1231,6 +1245,8 @@ class IngestSearchTest(unittest.TestCase):
             )
             self.assertEqual(background["content"]["schema"], "section_evidence.v1")
             self.assertGreaterEqual(background["content"]["source_doc_count"], 1)
+            self.assertIn("compaction_report", background["content"])
+            self.assertIn("evidence_summary", background["content"]["evidence"][0])
 
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
@@ -1451,8 +1467,13 @@ class IngestSearchTest(unittest.TestCase):
                 "unsupported_claims": [],
                 "warnings": [],
             }
+            captured: dict = {}
 
-            with mock.patch("kb_agent.review.generate_json_object", return_value=payload):
+            def fake_generate(_system: str, user: str) -> dict:
+                captured["user"] = user
+                return payload
+
+            with mock.patch("kb_agent.review.generate_json_object", side_effect=fake_generate):
                 result = draft_review(
                     db_path,
                     task["task_id"],
@@ -1464,6 +1485,9 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(draft["source"], "llm")
             self.assertEqual(draft["status"], "drafted")
             self.assertEqual(draft["used_evidence"][0]["ref_id"], "E1")
+            self.assertTrue(draft["llm_diagnostics"]["used"])
+            self.assertIn("summary:", captured["user"])
+            self.assertNotIn("excerpt:", captured["user"])
             self.assertFalse(result["citation_check"]["missing_refs"])
             self.assertEqual(result["citation_check"]["sections"][0]["coverage_score"], 1.0)
 
@@ -1514,6 +1538,9 @@ class IngestSearchTest(unittest.TestCase):
             missing_refs = result["citation_check"]["missing_refs"]
             self.assertTrue(any(item["ref_id"] == "E99" for item in missing_refs))
             self.assertGreaterEqual(len(result["citation_check"]["unsupported_paragraphs"]), 1)
+            self.assertIn(result["review_report"]["draft_quality_level"], {"usable", "weak"})
+            self.assertIn("missing_refs", result["review_report"]["quality_reasons"])
+            self.assertTrue(result["review_report"]["revision_actions"])
 
             assembled = assemble_review(db_path, task["task_id"])
             self.assertIn("review_draft", assembled["artifact_paths"])

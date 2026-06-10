@@ -1481,16 +1481,18 @@ def _section_evidence_artifact(
     topic: str,
     evidence: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    doc_ids = _unique_strings(str(item.get("doc_id") or "") for item in evidence if item.get("doc_id"))
+    compacted, compaction_report = _compact_section_evidence(evidence)
+    doc_ids = _unique_strings(str(item.get("doc_id") or "") for item in compacted if item.get("doc_id"))
     return {
         "schema": "section_evidence.v1",
         "task_id": task_id,
         "section_id": section_id,
         "topic": topic,
-        "evidence": evidence,
-        "evidence_count": len(evidence),
+        "evidence": compacted,
+        "evidence_count": len(compacted),
         "source_doc_count": len(doc_ids),
         "source_doc_ids": doc_ids,
+        "compaction_report": compaction_report,
         "created_at": time.time(),
     }
 
@@ -1729,6 +1731,55 @@ def _normalize_evidence_refs(value: object, fallback: List[Dict[str, Any]]) -> L
 
 def _dedupe_evidence(evidence: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return _dedupe_evidence_with_stats(evidence)[0]
+
+
+def _compact_section_evidence(
+    evidence: Iterable[Dict[str, Any]],
+    *,
+    max_items: int = 8,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    deduped, dedupe_stats = _dedupe_evidence_with_stats(evidence)
+    by_doc: Dict[str, List[Dict[str, Any]]] = {}
+    for item in deduped:
+        doc_id = str(item.get("doc_id") or "")
+        by_doc.setdefault(doc_id, []).append(item)
+    for items in by_doc.values():
+        items.sort(key=_evidence_priority, reverse=True)
+    compacted: List[Dict[str, Any]] = []
+    doc_ids = sorted(by_doc)
+    cursor = 0
+    while len(compacted) < max_items and any(by_doc.values()):
+        doc_id = doc_ids[cursor % len(doc_ids)]
+        cursor += 1
+        if not by_doc.get(doc_id):
+            continue
+        compacted.append(_compact_evidence_item(by_doc[doc_id].pop(0)))
+    warnings = []
+    if dedupe_stats.get("duplicate_evidence_removed"):
+        warnings.append("duplicate_evidence_compacted")
+    if int(dedupe_stats.get("unique_evidence_count") or 0) > len(compacted):
+        warnings.append("section_evidence_truncated")
+    source_doc_ids = _unique_strings(str(item.get("doc_id") or "") for item in compacted if item.get("doc_id"))
+    return compacted, {
+        "schema": "section_evidence_compaction.v1",
+        "raw_evidence_count": dedupe_stats.get("raw_evidence_count", 0),
+        "unique_evidence_count": dedupe_stats.get("unique_evidence_count", 0),
+        "duplicate_evidence_removed": dedupe_stats.get("duplicate_evidence_removed", 0),
+        "kept_evidence_count": len(compacted),
+        "max_evidence_count": max_items,
+        "source_doc_count": len(source_doc_ids),
+        "source_doc_ids": source_doc_ids,
+        "warnings": warnings,
+    }
+
+
+def _compact_evidence_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    compacted = dict(item)
+    summary = compact_whitespace(
+        str(item.get("summary") or item.get("claim") or item.get("excerpt") or item.get("snippet") or "")
+    )
+    compacted["evidence_summary"] = summary[:240]
+    return compacted
 
 
 def _dedupe_evidence_with_stats(evidence: Iterable[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:

@@ -711,6 +711,29 @@ uv run python -m kb_agent.cli search-report "服务机器人任务规划的方�
 
 默认检索模式仍是 `hybrid`，不会因为保存 profile 自动改变；只有显式传入 `--search-mode auto` 时才读取 active profile。
 
+## v0.27 DeepSeek 综述草稿真实验收
+
+v0.27 暂停真实 embedding，继续使用现有 `hash` 兜底，把重点放在 DeepSeek 已可用的综述链路上。`quality-baseline --with-llm` 现在会在生成 `review_outline.json` 后继续运行 `draft-review -> check-review -> assemble-review`，并在报告中展示草稿质量。
+
+推荐真实验收：
+
+```bash
+uv run --extra pdf python -m kb_agent.cli quality-baseline articles --with-llm --top-k 3 --llm-timeout-seconds 20 --llm-stage-timeout-seconds 60 --llm-max-docs 2
+uv run python -m kb_agent.cli latest-quality-baseline --real-only --limit 1
+```
+
+重点查看：
+
+- `llm_stage_status.llm_review_draft`
+- `review_draft_status`
+- `review_draft_quality_level`
+- `citation_coverage_score`
+- `missing_ref_count`
+- `unsupported_paragraph_count`
+- `review_draft_path`
+
+`draft-review` 现在会使用压缩后的 section evidence。每节 evidence 会写入 `compaction_report`，LLM prompt 只包含短 `summary`、章节路径、页码和证据编号，不直接塞入长 excerpt。每个 `section_drafts/*.json` 会记录 `llm_diagnostics`，用于判断该节是 DeepSeek 生成、规则回退、超时还是部分成功。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
