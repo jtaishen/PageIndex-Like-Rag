@@ -1,0 +1,46 @@
+{
+  "schema": "search_eval_bge_m3.v1",
+  "description": "Small real-articles retrieval suite for comparing FTS, hash hybrid, BGE-M3 hybrid, tree, and auto search.",
+  "queries": [
+    {
+      "query": "服务机器人任务规划方法如何利用大语言模型和工具调用？",
+      "intent": "method",
+      "category": "method",
+      "query_type": "semantic_method",
+      "expected_doc_ids": ["doc_9ad273f3a965c81d"],
+      "expected_keywords": ["服务机器人", "大语言模型", "Agent"]
+    },
+    {
+      "query": "基于大语言模型的服务机器人任务规划实验成功率是多少？",
+      "intent": "experiment",
+      "category": "experiment",
+      "query_type": "metric_exact",
+      "expected_doc_ids": ["doc_9ad273f3a965c81d"],
+      "expected_keywords": ["任务成功率", "81%", "84%"]
+    },
+    {
+      "query": "多智能体系统中的分布式任务规划关键技术包括哪些？",
+      "intent": "method",
+      "category": "method",
+      "query_type": "semantic_method",
+      "expected_doc_ids": ["doc_72fb5a9138e575d5"],
+      "expected_keywords": ["多智能体系统", "分布式任务规划", "任务分配"]
+    },
+    {
+      "query": "多智能体任务分配方法的局限和未来工作是什么？",
+      "intent": "limitation",
+      "category": "limitation",
+      "query_type": "semantic_limitation",
+      "expected_doc_ids": ["doc_72fb5a9138e575d5"],
+      "expected_keywords": ["局限", "未来", "任务分配"]
+    },
+    {
+      "query": "服务机器人任务规划和多智能体分布式任务规划有什么区别？",
+      "intent": "compare",
+      "category": "compare",
+      "query_type": "semantic_compare",
+      "expected_doc_ids": ["doc_9ad273f3a965c81d", "doc_72fb5a9138e575d5"],
+      "expected_keywords": ["服务机器人", "多智能体", "任务规划"]
+    }
+  ]
+}

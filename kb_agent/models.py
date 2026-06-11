@@ -110,3 +110,8 @@ class SearchResult:
     vector_score: Optional[float] = None
     hybrid_score: Optional[float] = None
     rank_reason: str = ""
+    query_intent: str = ""
+    hybrid_weighting: str = ""
+    fts_contribution: Optional[float] = None
+    vector_contribution: Optional[float] = None
+    hybrid_conflict: str = ""

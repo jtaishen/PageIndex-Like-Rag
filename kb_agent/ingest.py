@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -594,11 +595,11 @@ def _reference_sections_artifact(
 def _doc_description(parsed) -> str:  # type: ignore[no-untyped-def]
     abstract = str(parsed.metadata.get("abstract") or "").strip()
     if abstract:
-        return _text_excerpt(abstract, 500)
+        return _content_excerpt(abstract, 500)
     keywords = parsed.metadata.get("keywords") or []
     if keywords:
         return _text_excerpt(f"{parsed.title}。关键词：{'、'.join(str(item) for item in keywords)}", 500)
-    return _text_excerpt(parsed.raw_text, 500)
+    return _content_excerpt(parsed.raw_text, 500)
 
 
 def _doc_card_summaries(parsed, *, use_llm: bool = True) -> Dict[str, object]:  # type: ignore[no-untyped-def]
@@ -702,13 +703,16 @@ def _section_signals(parsed, limit: int) -> List[Dict[str, str]]:  # type: ignor
         if kind == "heading" and heading:
             current_heading = heading
             continue
-        if not text.strip():
+        if not text.strip() or _is_doc_card_noise_text(text, heading=current_heading, page=getattr(block, "page", None)):
             continue
         if current_heading or kind in {"abstract", "paragraph"}:
+            cleaned = _clean_doc_card_text(text)
+            if not cleaned:
+                continue
             signals.append(
                 {
                     "heading": current_heading or kind,
-                    "text": _text_excerpt(text, 240),
+                    "text": _text_excerpt(cleaned, 240),
                 }
             )
         if len(signals) >= limit:
@@ -727,6 +731,9 @@ def _section_excerpt(parsed, heading_terms: Iterable[str], max_chars: int) -> st
         if kind == "heading" and heading:
             current_heading = heading
             continue
+        if _is_doc_card_noise_text(text, heading=current_heading, page=getattr(block, "page", None)):
+            continue
+        text = _clean_doc_card_text(text)
         haystack = f"{current_heading} {text}".lower()
         if text.strip() and any(term and term in haystack for term in terms):
             matched.append(text)
@@ -738,11 +745,68 @@ def _section_excerpt(parsed, heading_terms: Iterable[str], max_chars: int) -> st
 def _short_summary(value: object, max_chars: int) -> str:
     if not isinstance(value, str):
         return ""
-    cleaned = _text_excerpt(value, max_chars)
+    compacted = " ".join(value.split())
+    source = _clean_doc_card_text(compacted) if _is_doc_card_noise_text(compacted) else compacted
+    cleaned = _text_excerpt(source, max_chars)
     banned_markers = ("```", "prompt", "原文：", "正文：")
     if any(marker.lower() in cleaned.lower() for marker in banned_markers):
         return ""
+    if _is_doc_card_noise_text(cleaned):
+        return ""
     return cleaned
+
+
+_DOC_CARD_NOISE_MARKERS = (
+    "网络首发",
+    "引用格式",
+    "issn",
+    "cn ",
+    "journal of",
+    "中图分类号",
+    "文献标志码",
+    "收稿日期",
+    "基金项目",
+    "资助",
+    "版权所有",
+    "copyright",
+    "http://",
+    "https://",
+    "www.",
+)
+
+
+def _content_excerpt(text: str, max_chars: int) -> str:
+    cleaned = _clean_doc_card_text(text)
+    return _text_excerpt(cleaned or text, max_chars)
+
+
+def _clean_doc_card_text(text: object) -> str:
+    raw = str(text or "")
+    pieces = re.split(r"[\n\r。；;]+", raw)
+    kept: List[str] = []
+    for piece in pieces:
+        compacted = " ".join(piece.split())
+        if not compacted:
+            continue
+        if _is_doc_card_noise_text(compacted):
+            continue
+        kept.append(compacted)
+    return " ".join(kept)
+
+
+def _is_doc_card_noise_text(text: object, *, heading: str = "", page: Optional[int] = None) -> bool:
+    compacted = " ".join(str(text or "").split())
+    if not compacted:
+        return False
+    lowered = f"{heading} {compacted}".lower()
+    marker_count = sum(1 for marker in _DOC_CARD_NOISE_MARKERS if marker in lowered)
+    if marker_count >= 1 and (page in {None, 0, 1, 2} or len(compacted) < 260 or marker_count >= 2):
+        return True
+    if re.search(r"第\s*\d+\s*页|page\s+\d+", lowered):
+        return True
+    if re.search(r"^(题目|作者|引用格式|基金项目|收稿日期)[:：]", compacted):
+        return True
+    return False
 
 
 def _text_excerpt(text: str, max_chars: int) -> str:

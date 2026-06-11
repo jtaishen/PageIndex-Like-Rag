@@ -811,7 +811,7 @@ class IngestSearchTest(unittest.TestCase):
                 result = run_quality_baseline(db_path, papers, use_llm=False, top_k=3)
 
             self.assertEqual(result["schema"], "quality_baseline.v1")
-            self.assertEqual(result["code_version"], "v0.36")
+            self.assertEqual(result["code_version"], "v0.37")
             self.assertTrue(result["git_commit"])
             self.assertTrue(result["feature_flags"]["review_draft_baseline"])
             self.assertTrue(result["is_current_code_baseline"])
@@ -1040,7 +1040,7 @@ class IngestSearchTest(unittest.TestCase):
                     {
                         "schema": "quality_baseline.v1",
                         "baseline_id": "older-commit",
-                        "code_version": "v0.36",
+                        "code_version": "v0.37",
                         "git_commit": "0000000000000000000000000000000000000000",
                         "feature_flags": {"review_draft_baseline": True},
                         "corpus_path": str((Path.cwd() / "articles").resolve()),
@@ -1258,7 +1258,9 @@ class IngestSearchTest(unittest.TestCase):
             self.assertFalse(embedding["embedding_rebuild_needed"])
             self.assertNotIn("sk-test-secret", json.dumps(result))
             benchmark_payload = json.loads(Path(result["benchmark"]["path"]).read_text(encoding="utf-8"))
-            self.assertEqual(benchmark_payload["mode_results"]["hybrid"]["fallback_rate"], 0.0)
+            self.assertIn("hash-hybrid", benchmark_payload["mode_results"])
+            self.assertIn("bge-m3-hybrid", benchmark_payload["mode_results"])
+            self.assertEqual(benchmark_payload["mode_results"]["bge-m3-hybrid"]["fallback_rate"], 0.0)
 
     def test_quality_baseline_llm_stage_timeout_and_budget_are_reported(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2556,6 +2558,73 @@ class IngestSearchTest(unittest.TestCase):
             self.assertIn("vector", results[0].rank_reason)
             self.assertNotIn("missing_embedding_index", report["warnings"])
             self.assertEqual(report["embedding_status"]["provider"], "openai-compatible")
+            self.assertEqual(report["hybrid_query_profile"]["weighting_mode"], "semantic_vector_boost")
+            self.assertEqual(report["results"][0]["query_intent"], "qa")
+            self.assertEqual(report["results"][0]["hybrid_weighting"], "semantic_vector_boost")
+            self.assertGreater(report["results"][0]["vector_contribution"], 0)
+            self.assertIn("node_route_signal", report["document_routing"]["items"][0])
+
+    def test_benchmark_compares_hash_and_bge_hybrid_modes(self) -> None:
+        def fake_urlopen(request, timeout=0):  # type: ignore[no-untyped-def]
+            del timeout
+            body = json.loads((request.data or b"{}").decode("utf-8"))
+            data = []
+            for index, text in enumerate(body["input"]):
+                if "目标节点" in text or "语义查询" in text:
+                    embedding = [1.0, 0.0]
+                else:
+                    embedding = [0.0, 1.0]
+                data.append({"index": index, "embedding": embedding})
+            return _FakeHTTPResponse({"data": data})
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {
+                "KB_EMBEDDING_BASE_URL": "http://localhost:3000/v1",
+                "KB_EMBEDDING_API_KEY": "sk-test-secret",
+                "KB_EMBEDDING_MODEL": "bge-m3",
+            },
+            clear=False,
+        ), mock.patch("kb_agent.embeddings.urllib.request.urlopen", side_effect=fake_urlopen):
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "target.txt").write_text(
+                "摘要：本文提出目标节点方法，用于机器人协同规划。\n\n"
+                "第一章 方法\n目标节点方法通过共享任务图完成协作。\n",
+                encoding="utf-8",
+            )
+            sync_directory(papers, db_path, doc_card_use_llm=False)
+            build_semantic_index(db_path, provider="hash", force=True)
+            build_semantic_index(db_path, provider="openai-compatible", model="bge-m3", force=True)
+            suite_json = root / "bge_suite.json"
+            suite_json.write_text(
+                json.dumps(
+                    {
+                        "queries": [
+                            {
+                                "query": "语义查询",
+                                "category": "semantic_method",
+                                "query_type": "semantic_method",
+                                "expected_keywords": ["目标节点"],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            suite_name = f"bge_provider_compare_{time.time_ns()}"
+            create_eval_suite(db_path, suite_name, input_json=suite_json)
+
+            benchmark = run_benchmark(db_path, suite_name, compare_modes=["fts", "hash-hybrid", "bge-m3-hybrid"], top_k=2)
+
+            self.assertEqual(set(benchmark["mode_results"].keys()), {"fts", "hash-hybrid", "bge-m3-hybrid"})
+            self.assertEqual(benchmark["mode_results"]["hash-hybrid"]["embedding_provider"], "hash")
+            self.assertEqual(benchmark["mode_results"]["bge-m3-hybrid"]["embedding_provider"], "openai-compatible")
+            self.assertEqual(benchmark["mode_results"]["bge-m3-hybrid"]["embedding_model"], "bge-m3")
+            self.assertIn("semantic_method", benchmark["mode_results"]["bge-m3-hybrid"]["query_type_metrics"])
 
     def test_hybrid_search_falls_back_without_embedding_index(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2630,6 +2699,48 @@ class IngestSearchTest(unittest.TestCase):
             self.assertGreater(card_route["routing_score"], 0)
             self.assertTrue(card_route["selection_reasons"])
             self.assertIn("fallback_reason", card_route)
+
+    def test_doc_card_rule_summary_filters_front_matter_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "noisy_card.txt").write_text(
+                "华中科技大学学报(自然科学版) Journal of Huazhong University of Science and Technology ISSN 1671-4512 CN 42-1658/N\n"
+                "《华中科技大学学报(自然科学版)》网络首发论文\n"
+                "题目：基于大语言模型的服务机器人任务规划方法\n"
+                "引用格式：李某. 基于大语言模型的服务机器人任务规划方法[J/OL].\n\n"
+                "摘要：本文研究面向服务机器人的任务规划方法。\n"
+                "关键词：服务机器人；任务规划；工具调用\n\n"
+                "1 方法设计\n"
+                "本文提出任务图驱动的工具调用框架，用于服务机器人理解用户指令并完成任务规划。\n\n"
+                "2 创新点\n"
+                "本文的主要贡献是结合任务图、工具调用和反馈修正机制提升任务规划鲁棒性。\n\n"
+                "3 局限与未来工作\n"
+                "本文仍存在真实场景验证不足的局限，未来将扩展到复杂通信约束。\n",
+                encoding="utf-8",
+            )
+
+            report = sync_directory(papers, db_path, doc_card_use_llm=False)
+            self.assertEqual(report["indexed"], 1)
+            conn = db.connect(db_path)
+            db.init_db(conn)
+            try:
+                row = conn.execute("SELECT doc_id FROM documents").fetchone()
+                card = db.get_doc_card(conn, str(row["doc_id"]))
+            finally:
+                conn.close()
+
+            self.assertIsNotNone(card)
+            card_text = json.dumps(card, ensure_ascii=False)
+            self.assertIn("任务图驱动", str(card["method_summary"]))
+            self.assertIn("反馈修正", str(card["innovation_summary"]))
+            self.assertIn("真实场景验证不足", str(card["limitation_summary"]))
+            self.assertNotIn("网络首发", card_text)
+            self.assertNotIn("引用格式", card_text)
+            self.assertNotIn("ISSN", card_text)
+            self.assertNotIn("Journal of Huazhong", card_text)
 
     def test_hybrid_search_uses_vector_candidates(self) -> None:
         class FakeProvider:

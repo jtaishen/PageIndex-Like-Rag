@@ -41,7 +41,7 @@ from .utils import compact_whitespace, read_json as _read_json, stable_id, uniqu
 
 
 BASELINE_SCHEMA = "quality_baseline.v1"
-CODE_VERSION = "v0.36"
+CODE_VERSION = "v0.37"
 BASELINE_FEATURE_FLAGS = {
     "review_draft_baseline": True,
     "baseline_staleness": True,
@@ -53,6 +53,8 @@ BASELINE_FEATURE_FLAGS = {
     "doc_card_summary_fields": True,
     "document_routing_explanations": True,
     "openai_compatible_embedding": True,
+    "bge_hybrid_calibration": True,
+    "doc_card_noise_filtering": True,
 }
 BASELINE_DIR = DATA_DIR / "eval"
 EVAL_SET_DIR = DATA_DIR / "eval_sets"
@@ -111,7 +113,8 @@ def run_quality_baseline(
     with _embedding_search_env(embedding):
         eval_set = _write_baseline_eval_set(doc_reports)
         suite = create_eval_suite(db_path, f"quality_baseline_{int(started)}", input_json=Path(eval_set["path"]))
-        benchmark = run_benchmark(db_path, str(suite["name"]), compare_modes=["fts", "hybrid", "tree", "auto"], top_k=top_k)
+        benchmark_modes = _baseline_benchmark_modes(embedding)
+        benchmark = run_benchmark(db_path, str(suite["name"]), compare_modes=benchmark_modes, top_k=top_k)
         tree = _tree_search_baseline(
             db_path,
             doc_reports,
@@ -1058,6 +1061,12 @@ def _baseline_real_embedding_provider(embedding_provider: Optional[str]) -> str:
     if not embedding_provider:
         return "sentence-transformers"
     return resolve_embedding_provider(embedding_provider)
+
+
+def _baseline_benchmark_modes(embedding: Dict[str, Any]) -> List[str]:
+    if embedding.get("hybrid_embedding_provider") == "openai-compatible":
+        return ["fts", "hash-hybrid", "bge-m3-hybrid", "tree", "auto"]
+    return ["fts", "hybrid", "tree", "auto"]
 
 
 def _baseline_sentence_transformers_available() -> bool:

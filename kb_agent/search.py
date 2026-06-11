@@ -15,6 +15,7 @@ from .embeddings import (
     vector_from_json,
 )
 from .models import EvidencePacket, SearchResult
+from .query import classify_query
 from .utils import compact_whitespace, unique_strings as _unique_strings
 
 
@@ -139,6 +140,7 @@ def build_search_report(
             "warnings": _unique_strings([*trace.get("warnings", []), *((auto_resolution or {}).get("warnings") or [])]),
             "auto_resolution": auto_resolution or {},
             "embedding_status": _safe_embedding_status(db_path),
+            "hybrid_query_profile": _hybrid_query_profile(query),
             "documents": docs,
             "document_routing": routing,
             "results": trace.get("results", []),
@@ -166,6 +168,7 @@ def build_search_report(
         "warnings": _unique_strings([*warnings, *((auto_resolution or {}).get("warnings") or [])]),
         "auto_resolution": auto_resolution or {},
         "embedding_status": _safe_embedding_status(db_path),
+        "hybrid_query_profile": _hybrid_query_profile(query),
         "documents": docs,
         "document_routing": routing,
         "results": [result.__dict__ for result in results],
@@ -374,6 +377,7 @@ def _merge_hybrid_rows(
 ) -> List[Dict[str, object]]:
     merged: Dict[str, Dict[str, object]] = {}
     reasons: Dict[str, List[str]] = {}
+    profile = _hybrid_query_profile(query)
     for rank, row in enumerate(fts_rows, start=1):
         item = merged.setdefault(str(row["node_id"]), dict(row))
         item["fts_rank"] = rank
@@ -392,11 +396,24 @@ def _merge_hybrid_rows(
         fts_rank = item.get("fts_rank")
         vector_rank = item.get("vector_rank")
         score = 0.0
+        fts_contribution = 0.0
+        vector_contribution = 0.0
         if fts_rank:
-            score += 1.0 / (60.0 + int(fts_rank))
+            fts_contribution = float(profile["fts_weight"]) / (60.0 + int(fts_rank))
+            score += fts_contribution
         if vector_rank:
-            score += 1.0 / (60.0 + int(vector_rank))
+            vector_contribution = float(profile["vector_weight"]) / (60.0 + int(vector_rank))
+            score += vector_contribution
         penalty, rerank_reasons = _rerank_penalty(item, terms, query, quality_by_doc)
+        conflict = _hybrid_conflict_reason(fts_rank, vector_rank)
+        if conflict:
+            rerank_reasons.append(f"hybrid_conflict:{conflict}")
+        rerank_reasons.append(f"weight:{profile['weighting_mode']}")
+        item["query_intent"] = profile["intent"]
+        item["hybrid_weighting"] = profile["weighting_mode"]
+        item["fts_contribution"] = round(fts_contribution, 8)
+        item["vector_contribution"] = round(vector_contribution, 8)
+        item["hybrid_conflict"] = conflict
         item["hybrid_score"] = round(score - penalty, 8)
         item["rank_reason"] = ",".join([*reasons.get(node_id, []), *rerank_reasons])
     return sorted(
@@ -434,6 +451,52 @@ def _rerank_penalty(
         penalty += 0.004
         reasons.append("parse_quality_penalty")
     return penalty, reasons
+
+
+def _hybrid_query_profile(query: str) -> Dict[str, object]:
+    profile = classify_query(query, use_llm=False)
+    intent = str(profile.get("intent") or "qa")
+    normalized = query.lower()
+    exact_metric = bool(re.search(r"\d", query)) or any(
+        term in normalized
+        for term in ("指标", "数值", "成功率", "准确率", "召回率", "表格", "表 ", "table", "metric", "score", "%")
+    )
+    if intent == "citation":
+        weighting_mode = "fts_reference_boost"
+        fts_weight = 1.25
+        vector_weight = 0.75
+    elif exact_metric or intent == "experiment":
+        weighting_mode = "fts_metric_boost"
+        fts_weight = 1.15
+        vector_weight = 0.85
+    elif intent in {"method", "limitation", "compare", "review", "qa"}:
+        weighting_mode = "semantic_vector_boost"
+        fts_weight = 0.85
+        vector_weight = 1.15
+    else:
+        weighting_mode = "balanced"
+        fts_weight = 1.0
+        vector_weight = 1.0
+    return {
+        "schema": "hybrid_query_profile.v1",
+        "intent": intent,
+        "weighting_mode": weighting_mode,
+        "fts_weight": fts_weight,
+        "vector_weight": vector_weight,
+        "exact_metric": exact_metric,
+    }
+
+
+def _hybrid_conflict_reason(fts_rank: object, vector_rank: object) -> str:
+    fts_value = _optional_float(fts_rank)
+    vector_value = _optional_float(vector_rank)
+    if fts_value is None and vector_value is not None:
+        return "vector_without_fts"
+    if fts_value is not None and vector_value is None:
+        return "fts_without_vector"
+    if fts_value is not None and vector_value is not None and abs(fts_value - vector_value) >= 8:
+        return "rank_divergence"
+    return ""
 
 
 def _rank_node_rows(rows: List[Dict[str, object]], query: str) -> List[Dict[str, object]]:
@@ -482,6 +545,11 @@ def _rows_to_results(rows: List[Dict[str, object]], reason_prefix: str) -> List[
                 vector_score=_optional_float(row.get("vector_score")),
                 hybrid_score=_optional_float(row.get("hybrid_score")),
                 rank_reason=rank_reason,
+                query_intent=str(row.get("query_intent") or ""),
+                hybrid_weighting=str(row.get("hybrid_weighting") or ""),
+                fts_contribution=_optional_float(row.get("fts_contribution")),
+                vector_contribution=_optional_float(row.get("vector_contribution")),
+                hybrid_conflict=str(row.get("hybrid_conflict") or ""),
             )
         )
     return results
@@ -796,6 +864,7 @@ def _document_route_explanation(
         "routing_score": round(score, 3),
         "selection_reasons": _unique_strings(selection_reasons),
         "fallback_reason": fallback_reason,
+        "node_route_signal": node_signal or {},
     }
 
 
@@ -813,6 +882,7 @@ def _document_routing_report(docs: List[Dict[str, object]]) -> Dict[str, object]
                 "fallback_reason": item.get("fallback_reason", ""),
                 "node_matches": item.get("node_matches", 0),
                 "rank_reason": item.get("rank_reason", ""),
+                "node_route_signal": item.get("node_route_signal") or {},
             }
             for item in docs
         ],
@@ -829,6 +899,11 @@ def _node_route_signals(results: List[SearchResult]) -> Dict[str, Dict[str, obje
                 "rank_reason": result.rank_reason,
                 "score": result.score,
                 "hybrid_score": result.hybrid_score,
+                "query_intent": result.query_intent,
+                "hybrid_weighting": result.hybrid_weighting,
+                "fts_contribution": result.fts_contribution,
+                "vector_contribution": result.vector_contribution,
+                "hybrid_conflict": result.hybrid_conflict,
             },
         )
         item["node_matches"] = int(item["node_matches"]) + 1
@@ -838,6 +913,11 @@ def _node_route_signals(results: List[SearchResult]) -> Dict[str, Dict[str, obje
             item["rank_reason"] = result.rank_reason
             item["score"] = result.score
             item["hybrid_score"] = result.hybrid_score
+            item["query_intent"] = result.query_intent
+            item["hybrid_weighting"] = result.hybrid_weighting
+            item["fts_contribution"] = result.fts_contribution
+            item["vector_contribution"] = result.vector_contribution
+            item["hybrid_conflict"] = result.hybrid_conflict
     return signals
 
 

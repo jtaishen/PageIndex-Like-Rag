@@ -923,6 +923,27 @@ uv run --extra pdf python -m kb_agent.cli quality-baseline articles --embedding-
 
 `bge_reranker` 当前不作为 v0.36 的硬依赖；如果远程 `/rerank` 服务不可用，检索链路仍保持 FTS + embedding hybrid 兜底。
 
+## v0.37 BGE-M3 检索质量校准与 Doc Card 降噪
+
+v0.37 不新增数据库 schema，也不接入 `bge_reranker` 正式链路。重点是让真实 embedding 的收益可评测、可解释：hybrid 会根据 query intent 调整 FTS/vector 权重，`search-report` 会输出 `hybrid_query_profile`、每个结果的 FTS/vector contribution、weighting mode 和 conflict reason。
+
+benchmark 支持显式比较 hash 与 BGE-M3：
+
+```bash
+uv run python -m kb_agent.cli eval-suite create bge-m3-real-v1 --input-json tests/fixtures/search_eval_bge_m3_queries.json
+KB_EMBEDDING_PROVIDER=openai-compatible KB_EMBEDDING_MODEL=bge-m3 uv run python -m kb_agent.cli benchmark bge-m3-real-v1 --compare-modes fts,hash-hybrid,bge-m3-hybrid,tree,auto --top-k 5
+```
+
+Doc Card 规则摘要会过滤期刊页眉、网络首发、引用格式、ISSN/CN、版权和 URL 等 front matter，优先从正文方法、贡献、局限段落生成 `description`、`method_summary`、`innovation_summary` 和 `limitation_summary`，减少文档路由被元信息污染。
+
+版本末尾真实验收：
+
+```bash
+KB_EMBEDDING_PROVIDER=openai-compatible KB_EMBEDDING_MODEL=bge-m3 uv run python -m kb_agent.cli search-report "任务规划方法" --search-mode hybrid --top-k 3
+uv run --extra pdf python -m kb_agent.cli quality-baseline articles --embedding-provider openai-compatible --embedding-model bge-m3 --top-k 3
+uv run python -m kb_agent.cli latest-quality-baseline --real-only --limit 1
+```
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：

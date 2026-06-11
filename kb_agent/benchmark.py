@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -107,9 +109,10 @@ def run_benchmark(
     top_k: int = 5,
 ) -> Dict[str, Any]:
     suite = get_eval_suite(suite_name)
-    modes = _unique_strings(compare_modes or ["fts", "hybrid", "tree", "auto"])
+    specs = [_benchmark_search_spec(mode) for mode in _unique_strings(compare_modes or ["fts", "hybrid", "tree", "auto"])]
+    modes = _unique_strings(str(spec["label"]) for spec in specs)
     queries = [item for item in suite.get("queries") or [] if isinstance(item, dict)]
-    mode_results = {mode: _benchmark_mode(db_path, queries, mode, top_k) for mode in modes}
+    mode_results = {str(spec["label"]): _benchmark_mode(db_path, queries, str(spec["label"]), top_k) for spec in specs}
     created_at = time.time()
     benchmark_id = stable_id("benchmark", suite.get("name"), ",".join(modes), created_at, length=12)
     report = {
@@ -250,6 +253,9 @@ def latest_failure_analyses(limit: int = 5) -> List[Dict[str, Any]]:
 
 
 def _benchmark_mode(db_path: Path, queries: List[Dict[str, Any]], mode: str, top_k: int) -> Dict[str, Any]:
+    spec = _benchmark_search_spec(mode)
+    mode_label = str(spec["label"])
+    search_mode = str(spec["search_mode"])
     items = []
     doc_recall_values: List[float] = []
     node_recall_values: List[float] = []
@@ -268,8 +274,9 @@ def _benchmark_mode(db_path: Path, queries: List[Dict[str, Any]], mode: str, top
         expected_nodes = _string_list(raw.get("expected_node_ids"))
         expected_keywords = _string_list(raw.get("expected_keywords") or raw.get("expected_node_keywords"))
         expected_sources = _string_list(raw.get("expected_fact_sources"))
-        docs = search_documents(db_path, query, top_k=top_k, search_mode=mode)
-        nodes = search_nodes(db_path, query, top_k=top_k, search_mode=mode)
+        with _benchmark_embedding_env(str(spec.get("provider") or ""), str(spec.get("model") or "")):
+            docs = search_documents(db_path, query, top_k=top_k, search_mode=search_mode)
+            nodes = search_nodes(db_path, query, top_k=top_k, search_mode=search_mode)
         result_doc_ids = [str(item.get("doc_id") or "") for item in docs if item.get("doc_id")]
         result_node_ids = [result.node_id for result in nodes]
         node_text = " ".join(compact_whitespace(f"{node.title} {node.node_path} {node.heading} {node.snippet}") for node in nodes)
@@ -292,7 +299,7 @@ def _benchmark_mode(db_path: Path, queries: List[Dict[str, Any]], mode: str, top
             weak_count += 1
         trace_score = 0.0
         warnings: List[str] = []
-        if mode == "tree":
+        if search_mode == "tree":
             trace_score, trace_warnings = _tree_trace_completeness(db_path, query, top_k)
             warnings.extend(trace_warnings)
             trace_scores.append(trace_score)
@@ -313,6 +320,7 @@ def _benchmark_mode(db_path: Path, queries: List[Dict[str, Any]], mode: str, top
                 "query": query,
                 "intent": raw.get("intent") or "",
                 "category": raw.get("category") or "",
+                "query_type": raw.get("query_type") or raw.get("category") or raw.get("intent") or "",
                 "expected_doc_ids": expected_docs,
                 "expected_node_ids": expected_nodes,
                 "expected_keywords": expected_keywords,
@@ -349,7 +357,10 @@ def _benchmark_mode(db_path: Path, queries: List[Dict[str, Any]], mode: str, top
     )
     return {
         "schema": "benchmark_mode.v1",
-        "search_mode": mode,
+        "search_mode": mode_label,
+        "effective_search_mode": search_mode,
+        "embedding_provider": spec.get("provider") or "",
+        "embedding_model": spec.get("model") or "",
         "top_k": top_k,
         "query_count": query_count,
         "doc_recall_at_k": _average(doc_recall_values),
@@ -361,8 +372,67 @@ def _benchmark_mode(db_path: Path, queries: List[Dict[str, Any]], mode: str, top
         "weak_parse_rate": round(weak_rate, 4),
         "trace_completeness": round(trace_completeness, 4),
         "benchmark_score": benchmark_score,
+        "query_type_metrics": _query_type_metrics(items),
         "items": items,
     }
+
+
+def _benchmark_search_spec(mode: str) -> Dict[str, object]:
+    raw = str(mode or "hybrid").strip()
+    normalized = raw.lower()
+    if normalized in {"hash-hybrid", "hybrid:hash"}:
+        return {
+            "label": "hash-hybrid",
+            "search_mode": "hybrid",
+            "provider": "hash",
+            "model": "hash-ngram-v1",
+        }
+    if normalized in {"bge-m3-hybrid", "hybrid:bge-m3", "hybrid:openai-compatible:bge-m3"}:
+        return {
+            "label": "bge-m3-hybrid",
+            "search_mode": "hybrid",
+            "provider": "openai-compatible",
+            "model": "bge-m3",
+        }
+    return {"label": raw, "search_mode": raw, "provider": "", "model": ""}
+
+
+@contextmanager
+def _benchmark_embedding_env(provider: str, model: str):
+    previous_provider = os.environ.get("KB_EMBEDDING_PROVIDER")
+    previous_model = os.environ.get("KB_EMBEDDING_MODEL")
+    if provider:
+        os.environ["KB_EMBEDDING_PROVIDER"] = provider
+    if model:
+        os.environ["KB_EMBEDDING_MODEL"] = model
+    try:
+        yield
+    finally:
+        if previous_provider is None:
+            os.environ.pop("KB_EMBEDDING_PROVIDER", None)
+        else:
+            os.environ["KB_EMBEDDING_PROVIDER"] = previous_provider
+        if previous_model is None:
+            os.environ.pop("KB_EMBEDDING_MODEL", None)
+        else:
+            os.environ["KB_EMBEDDING_MODEL"] = previous_model
+
+
+def _query_type_metrics(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for item in items:
+        key = compact_whitespace(str(item.get("query_type") or item.get("category") or item.get("intent") or "uncategorized"))
+        grouped.setdefault(key or "uncategorized", []).append(item)
+    metrics: Dict[str, Dict[str, float]] = {}
+    for key, group in grouped.items():
+        metrics[key] = {
+            "query_count": float(len(group)),
+            "doc_recall_at_k": _average([float(item.get("doc_recall_at_k") or 0.0) for item in group]),
+            "node_recall_at_k": _average([float(item.get("node_recall_at_k") or 0.0) for item in group]),
+            "mrr": _average([float(item.get("mrr") or 0.0) for item in group]),
+            "fallback_rate": _average([1.0 if item.get("fallback_used") else 0.0 for item in group]),
+        }
+    return metrics
 
 
 def _queries_from_json(path: Path) -> List[Dict[str, Any]]:

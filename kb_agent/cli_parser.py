@@ -122,7 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     benchmark_parser = subparsers.add_parser("benchmark", help="Run a benchmark suite across search modes")
     benchmark_parser.add_argument("suite_name")
-    benchmark_parser.add_argument("--compare-modes", default="fts,hybrid,tree,auto")
+    benchmark_parser.add_argument("--compare-modes", default="fts,hybrid,tree,auto", help="Comma-separated modes, e.g. fts,hash-hybrid,bge-m3-hybrid,tree,auto")
     benchmark_parser.add_argument("--top-k", type=int, default=5)
 
     failure_parser = subparsers.add_parser("analyze-failures", help="Analyze benchmark failures and next actions")
