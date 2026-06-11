@@ -137,11 +137,11 @@ def frame_selection_reasons(frame: Dict[str, Any], support_status: str) -> List[
 
 
 def frame_fallback_reason(frame: Dict[str, Any], support_status: str, query: str) -> str:
-    if support_status == "supported":
+    if support_status in {"supported", "structurally_supported"}:
         return ""
-    if support_status == "partial":
+    if support_status in {"partial", "unchecked"}:
         return "partial_evidence"
-    if support_status in {"unsupported", "ignored_noise"} and query_allows_weak_frames(query):
+    if support_status == "unsupported" and query_allows_weak_frames(query):
         return "weak_frame_allowed_by_query"
     if frame.get("noise_reasons"):
         return "noise_or_front_matter_penalty"

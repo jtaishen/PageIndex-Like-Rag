@@ -811,10 +811,12 @@ class IngestSearchTest(unittest.TestCase):
                 result = run_quality_baseline(db_path, papers, use_llm=False, top_k=3)
 
             self.assertEqual(result["schema"], "quality_baseline.v1")
-            self.assertEqual(result["code_version"], "v0.39")
+            self.assertEqual(result["code_version"], "v0.40")
             self.assertTrue(result["git_commit"])
             self.assertTrue(result["feature_flags"]["review_draft_baseline"])
             self.assertTrue(result["feature_flags"]["claim_frame_quality_filtering"])
+            self.assertTrue(result["feature_flags"]["evidence_unit_artifact_coverage"])
+            self.assertTrue(result["feature_flags"]["claim_frame_structural_status"])
             self.assertTrue(result["is_current_code_baseline"])
             self.assertEqual(result["baseline_stale_reason"], "")
             self.assertEqual(result["doc_count"], 2)
@@ -824,6 +826,8 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(result["fact_audit_delta"]["schema"], "fact_audit_delta.v1")
             self.assertIn("low_quality_frame_count", result["claim_frame_verification"])
             self.assertIn("top_frame_noise_reasons", result["claim_frame_verification"])
+            self.assertIn("trace_status_counts", result["claim_frame_verification"])
+            self.assertIn("support_status_counts", result["claim_frame_verification"])
             self.assertTrue(Path(result["json_path"]).exists())
             self.assertTrue(Path(result["md_path"]).exists())
             self.assertTrue(Path(result["html_path"]).exists())
@@ -1077,7 +1081,7 @@ class IngestSearchTest(unittest.TestCase):
                     {
                         "schema": "quality_baseline.v1",
                         "baseline_id": "older-commit",
-                        "code_version": "v0.39",
+                        "code_version": "v0.40",
                         "git_commit": "0000000000000000000000000000000000000000",
                         "feature_flags": {"review_draft_baseline": True},
                         "corpus_path": str((Path.cwd() / "articles").resolve()),

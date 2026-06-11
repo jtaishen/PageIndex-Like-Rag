@@ -588,7 +588,9 @@ def _task_query_terms(query: str) -> List[str]:
 def _task_frame_score(frame: Dict[str, Any], terms: List[str]) -> float:
     quality_score = _confidence(frame.get("quality_score"), 0.6)
     support_status = str(frame.get("support_status") or "")
-    if quality_score < 0.35 or support_status in {"unsupported", "ignored_noise"}:
+    if support_status == "supported":
+        support_status = "structurally_supported"
+    if quality_score < 0.35 or support_status == "unsupported":
         return 0.0
     haystack = " ".join(
         str(frame.get(field) or "")
@@ -603,7 +605,7 @@ def _task_frame_score(frame: Dict[str, Any], terms: List[str]) -> float:
         )
     ).lower()
     term_score = sum(1.0 for term in terms if term.lower() in haystack)
-    support_score = 0.3 if frame.get("evidence_unit_ids") else 0.0
+    support_score = 0.35 if support_status == "structurally_supported" else (0.15 if frame.get("evidence_unit_ids") else 0.0)
     confidence_score = 0.2 * _confidence(frame.get("confidence"), 0.0)
     quality_boost = 0.25 * quality_score
     return term_score + support_score + confidence_score + quality_boost

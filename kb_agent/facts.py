@@ -140,11 +140,18 @@ def extract_facts(
 
         evidence_unit_result = extract_evidence_units(db_path, doc_id, force=True)
         claim_frame_result = extract_claim_frames(db_path, doc_id, force=True, use_llm=False, require_llm=False)
-        artifacts["fact_report"]["evidence_unit_count"] = (evidence_unit_result.get("evidence_units") or {}).get("count", 0)
+        evidence_units = evidence_unit_result.get("evidence_units") or {}
+        artifacts["fact_report"]["evidence_unit_count"] = evidence_units.get("count", 0)
+        artifacts["fact_report"]["source_kind_counts"] = evidence_units.get("source_kind_counts") or {}
         artifacts["fact_report"]["claim_frame_count"] = (claim_frame_result.get("claim_frames") or {}).get("count", 0)
         verifier = claim_frame_result.get("verifier") or {}
         artifacts["fact_report"]["verified_frame_rate"] = verifier.get("verified_frame_rate", 0.0)
         artifacts["fact_report"]["unsupported_frame_count"] = verifier.get("unsupported_frame_count", 0)
+        artifacts["fact_report"]["trace_status_counts"] = verifier.get("trace_status_counts") or {}
+        artifacts["fact_report"]["support_status_counts"] = verifier.get("support_status_counts") or {}
+        artifacts["fact_report"]["missing_evidence_unit_count"] = verifier.get("missing_evidence_unit_count", 0)
+        artifacts["fact_report"]["missing_node_count"] = verifier.get("missing_node_count", 0)
+        artifacts["fact_report"]["missing_source_count"] = verifier.get("missing_source_count", 0)
         artifacts["fact_report"]["low_quality_frame_count"] = verifier.get("low_quality_frame_count", 0)
         artifacts["fact_report"]["noisy_frame_count"] = verifier.get("noisy_frame_count", 0)
         artifacts["fact_report"]["ignored_noise_frame_count"] = verifier.get("ignored_noise_frame_count", 0)

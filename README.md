@@ -979,6 +979,29 @@ uv run python -m kb_agent.cli verify-claim-frames --doc-id <doc_id>
 uv run python -m kb_agent.cli search-report "任务规划方法" --search-mode hybrid --top-k 3
 ```
 
+## v0.40 EvidenceUnit 覆盖增强与 ClaimFrame 结构状态收敛
+
+v0.40 继续沿着 `Tree -> Evidence -> Claim -> Verify` 主线收敛，不改数据库 schema，不接入 reranker，也不保存 prompt、模型原文或长正文。`evidence_units.json` 现在会从 `node_index.jsonl`、`table_summaries.json`、`figures.json`、`reference_sections.json` 和 `citation_map.json` 生成短 EvidenceUnit，并记录 `source_kind_counts`，缺少可选二级 artifact 时只跳过对应来源。
+
+ClaimFrame 绑定证据时会识别 `node_id`、`source_node_id`、`evidence_node_id`、`unit_id`、`ref_id`、`source_id`、`evidence_id` 以及 `evidence` 字段中的 dict/list/list[str] 变体。无法解析的引用只写入 `unresolved_evidence_ref` warning，不会写入长 evidence。
+
+Verifier 状态收敛为两组字段：
+
+- `trace_status`: `verified` 表示 EvidenceUnit、node/source 结构链路完整，`partial` 表示有 evidence id 但 unit/node/source 有缺口，`missing` 表示没有 evidence id。
+- `support_status`: `structurally_supported`、`unchecked`、`unsupported`。其中 `structurally_supported` 只表示结构证据可追踪，不表示语义证明已经完成；旧报告里的 `supported` 会在查询侧兼容映射为 `structurally_supported`。
+
+`claim_frame_summary_for_doc`、`fact_summary`、`quality-baseline` 和 Markdown baseline 会展示 `source_kind_counts`、`trace_status_counts`、`support_status_counts`、`missing_evidence_unit_count`、`missing_node_count`、`missing_source_count`、`citation_gap_count`、低质/噪声 frame 数和 top noise reasons。LLM 增强只处理有限数量的 frame/unit，并在 `llm_enhancement` 中记录 `enhanced_frame_limit`、`context_unit_limit`、总量和 `truncated` 状态。
+
+轻量验收命令：
+
+```bash
+uv run python -m kb_agent.cli extract-facts <doc_id> --force --no-llm
+uv run python -m kb_agent.cli evidence-units <doc_id>
+uv run python -m kb_agent.cli claim-frames <doc_id>
+uv run python -m kb_agent.cli verify-claim-frames --doc-id <doc_id>
+uv run python -m kb_agent.cli search-report "任务规划方法" --search-mode hybrid --top-k 3
+```
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：

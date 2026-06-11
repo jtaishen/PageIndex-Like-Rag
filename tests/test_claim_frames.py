@@ -8,12 +8,23 @@ from pathlib import Path
 from unittest import mock
 
 from kb_agent.claim_frames import (
+    _claim_frames_payload,
+    _enhance_frames_with_llm,
     _frame_record,
+    _verify_claim_frames_payload,
+    claim_frame_summary_for_doc,
     extract_claim_frames,
+    extract_evidence_units,
     get_claim_frames,
     get_evidence_units,
     search_claim_frames,
     verify_claim_frames,
+)
+from kb_agent.claim_frame_evidence import (
+    evidence_unit_ids_for_claim,
+    unit_by_id,
+    unit_by_node_id,
+    unit_by_source_id,
 )
 from kb_agent.cli import main as cli_main
 from kb_agent.facts import extract_facts
@@ -31,8 +42,11 @@ class ClaimFrameTest(unittest.TestCase):
             fact = extract_facts(db_path, doc_id, force=True, use_llm=False)
             report = fact["fact_report"]
             self.assertGreater(report["evidence_unit_count"], 0)
+            self.assertIn("node", report["source_kind_counts"])
             self.assertGreater(report["claim_frame_count"], 0)
             self.assertGreaterEqual(report["verified_frame_rate"], 0.0)
+            self.assertIn("trace_status_counts", report)
+            self.assertIn("support_status_counts", report)
 
             units = get_evidence_units(db_path, doc_id)
             self.assertEqual(units["schema"], "evidence_units.v1")
@@ -52,6 +66,243 @@ class ClaimFrameTest(unittest.TestCase):
             self.assertGreater(verifier["verified_frame_rate"], 0.0)
             self.assertIn("low_quality_frame_count", verifier)
             self.assertIn("top_frame_noise_reasons", verifier)
+            self.assertEqual(frames["trace_status_counts"], verifier["documents"][0]["trace_status_counts"])
+            self.assertEqual(frames["support_status_counts"], verifier["documents"][0]["support_status_counts"])
+
+    def test_evidence_units_include_secondary_artifacts_without_hard_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp)
+
+            def fake_artifact(_db_path: Path, _doc_id: str, name: str, default: object) -> object:
+                if name == "node_index.jsonl":
+                    return [
+                        {
+                            "node_id": "node-1",
+                            "kind": "paragraph",
+                            "text": "本文提出任务规划方法并验证任务成功率。",
+                            "node_path": "摘要",
+                            "page_start": 1,
+                            "page_end": 1,
+                        }
+                    ]
+                if name == "table_summaries.json":
+                    return {
+                        "table_summaries": [
+                            {
+                                "table_id": "table-1",
+                                "caption": "表 1 任务成功率结果",
+                                "headers": ["方法", "任务成功率"],
+                                "results": ["本文方法更高"],
+                                "page": 3,
+                            }
+                        ]
+                    }
+                if name == "figures.json":
+                    return {"figures": [{"id": "fig-1", "caption": "图 1 方法框架", "text": "任务分解流程", "page": 2}]}
+                if name == "reference_sections.json":
+                    return {"reference_sections": [{"section_id": "refs", "references_count": 2, "page_start": 8, "page_end": 8}]}
+                if name == "citation_map.json":
+                    return {
+                        "references": [{"ref_id": "R1", "title": "任务规划研究", "raw": "R1. 任务规划研究."}],
+                        "in_text_citations": [{"ref_id": "R1", "node_id": "node-1", "context": "相关研究 [R1]"}],
+                    }
+                return default
+
+            with mock.patch(
+                "kb_agent.claim_frames.list_artifacts",
+                return_value={"artifact_dir": str(artifact_dir), "version_id": "v1"},
+            ), mock.patch("kb_agent.claim_frames._artifact_content", side_effect=fake_artifact):
+                result = extract_evidence_units(Path("unused.sqlite"), "doc-1", force=True)
+
+            payload = result["evidence_units"]
+            kinds = payload["source_kind_counts"]
+            self.assertGreaterEqual(payload["count"], 5)
+            self.assertEqual(kinds["node"], 1)
+            self.assertEqual(kinds["table"], 1)
+            self.assertEqual(kinds["figure"], 1)
+            self.assertGreaterEqual(kinds["reference"], 1)
+            self.assertGreaterEqual(kinds["citation"], 1)
+            artifact_units = [unit for unit in payload["units"] if unit["source_kind"] in {"table", "figure", "reference"}]
+            self.assertTrue(any("source_without_node" in unit["warnings"] for unit in artifact_units))
+            self.assertTrue(all(len(unit["summary"]) <= 183 for unit in payload["units"]))
+
+    def test_evidence_ref_binding_variants_report_unresolved_refs(self) -> None:
+        units = [
+            {"unit_id": "eu-node", "node_id": "node-1", "source_id": "node-1"},
+            {"unit_id": "eu-source", "node_id": "node-2", "source_id": "source-1"},
+            {"unit_id": "eu-ref", "node_id": "", "source_id": "R1"},
+        ]
+        claim = {
+            "node_id": "node-1",
+            "source_node_id": "node-2",
+            "evidence_node_id": "missing-node",
+            "unit_id": "eu-node",
+            "source_id": "source-1",
+            "ref_id": "R1",
+            "evidence": [
+                {"unit_id": "missing-unit"},
+                {"evidence_id": "source-1"},
+                {"source_id": "R1"},
+                {"ref_id": "R1"},
+                "loose citation text",
+            ],
+        }
+
+        ids, warnings = evidence_unit_ids_for_claim(
+            claim,
+            unit_by_node_id(units),
+            unit_by_id(units),
+            unit_by_source_id(units),
+        )
+
+        self.assertEqual(ids, ["eu-node", "eu-source", "eu-ref"])
+        self.assertEqual(warnings, ["unresolved_evidence_ref"])
+
+    def test_claim_frame_verifier_separates_trace_and_support_status(self) -> None:
+        claim_frames = {
+            "schema": "claim_frames.v1",
+            "version_id": "v1",
+            "frames": [
+                {"frame_id": "verified", "claim_type": "method", "short_claim": "提出任务规划方法。", "evidence_unit_ids": ["eu-node"], "confidence": 0.8},
+                {"frame_id": "missing-node", "claim_type": "method", "short_claim": "方法依赖额外节点。", "evidence_unit_ids": ["eu-missing-node"], "confidence": 0.8},
+                {"frame_id": "missing-unit", "claim_type": "result", "short_claim": "结果有引用但 unit 缺失。", "evidence_unit_ids": ["eu-absent"], "confidence": 0.8},
+                {"frame_id": "unsupported", "claim_type": "result", "short_claim": "完全没有证据。", "evidence_unit_ids": [], "confidence": 0.8},
+            ],
+        }
+        evidence_units = {
+            "schema": "evidence_units.v1",
+            "version_id": "v1",
+            "units": [
+                {"unit_id": "eu-node", "node_id": "node-1", "source_kind": "node", "source_id": "node-1", "text_excerpt": "任务规划方法。"},
+                {
+                    "unit_id": "eu-missing-node",
+                    "node_id": "node-missing",
+                    "source_kind": "node",
+                    "source_id": "node-missing",
+                    "text_excerpt": "额外节点。",
+                },
+            ],
+        }
+
+        def fake_artifact(_db_path: Path, _doc_id: str, name: str, default: object) -> object:
+            if name == "node_index.jsonl":
+                return [{"node_id": "node-1"}]
+            if name == "citation_map.json":
+                return {"references": [], "relations": []}
+            return default
+
+        with mock.patch("kb_agent.claim_frames._artifact_content", side_effect=fake_artifact):
+            verifier = _verify_claim_frames_payload(Path("unused.sqlite"), "doc-1", claim_frames, evidence_units)
+
+        by_id = {item["frame_id"]: item for item in verifier["items"]}
+        self.assertEqual(by_id["verified"]["trace_status"], "verified")
+        self.assertEqual(by_id["verified"]["support_status"], "structurally_supported")
+        self.assertEqual(by_id["missing-node"]["trace_status"], "partial")
+        self.assertEqual(by_id["missing-node"]["support_status"], "unchecked")
+        self.assertEqual(by_id["missing-unit"]["trace_status"], "partial")
+        self.assertEqual(by_id["missing-unit"]["support_status"], "unchecked")
+        self.assertEqual(by_id["unsupported"]["trace_status"], "missing")
+        self.assertEqual(by_id["unsupported"]["support_status"], "unsupported")
+        self.assertEqual(verifier["verified_frame_count"], 1)
+        self.assertEqual(verifier["unsupported_frame_count"], 1)
+        self.assertEqual(verifier["trace_status_counts"], {"verified": 1, "partial": 2, "missing": 1})
+        self.assertEqual(verifier["support_status_counts"], {"structurally_supported": 1, "unchecked": 2, "unsupported": 1})
+        self.assertEqual(verifier["missing_evidence_unit_count"], 1)
+        self.assertEqual(verifier["missing_node_count"], 1)
+
+    def test_llm_enhancement_records_truncation_metadata(self) -> None:
+        frames = [
+            {
+                "frame_id": f"frame-{index}",
+                "claim_type": "method",
+                "short_claim": f"本文提出第 {index} 个任务规划方法。",
+                "evidence_unit_ids": ["eu-1"],
+                "trace_status": "verified",
+                "support_status": "structurally_supported",
+                "warnings": [],
+                "quality_score": 0.8,
+            }
+            for index in range(25)
+        ]
+        units = [{"unit_id": f"eu-{index}", "unit_type": "paragraph", "summary": "任务规划方法", "keywords": ["任务规划"]} for index in range(61)]
+
+        with mock.patch("kb_agent.claim_frames.generate_json_object", return_value={"frames": [], "_llm_metadata": {"retry_count": 0}}):
+            enhanced, metadata = _enhance_frames_with_llm({"title": "测试论文"}, frames, units)
+
+        payload = _claim_frames_payload(
+            "doc-1",
+            "v1",
+            enhanced,
+            evidence_unit_count=len(units),
+            warnings=metadata["enhancement_warnings"],
+            llm_used=True,
+            llm_error="",
+            llm_metadata=metadata,
+        )
+        self.assertTrue(payload["llm_enhancement"]["used"])
+        self.assertTrue(payload["llm_enhancement"]["truncated"])
+        self.assertEqual(payload["llm_enhancement"]["enhanced_frame_limit"], 24)
+        self.assertEqual(payload["llm_enhancement"]["context_unit_limit"], 60)
+        self.assertIn("llm_frame_enhancement_truncated", payload["warnings"])
+        self.assertIn("llm_unit_context_truncated", payload["warnings"])
+
+    def test_claim_frame_summary_exposes_demo_metrics(self) -> None:
+        frames = {
+            "schema": "claim_frames.v1",
+            "frames": [
+                {
+                    "frame_id": "frame-1",
+                    "claim_type": "method",
+                    "short_claim": "本文提出任务规划方法。",
+                    "trace_status": "verified",
+                    "support_status": "structurally_supported",
+                    "support_reason": "evidence_units_verified",
+                    "source": "claim",
+                    "quality_score": 0.92,
+                    "frame_quality": "high",
+                    "noise_reasons": [],
+                    "evidence_unit_ids": ["eu-1"],
+                    "confidence": 0.85,
+                    "warnings": [],
+                }
+            ],
+            "claim_type_counts": {"method": 1},
+            "warnings": [],
+        }
+        verifier = {
+            "verified_frame_rate": 1.0,
+            "unsupported_frame_count": 0,
+            "trace_status_counts": {"verified": 1},
+            "support_status_counts": {"structurally_supported": 1},
+            "missing_evidence_unit_count": 0,
+            "missing_node_count": 0,
+            "missing_source_count": 0,
+            "citation_gap_count": 0,
+            "low_quality_frame_count": 0,
+            "noisy_frame_count": 0,
+            "ignored_noise_frame_count": 0,
+            "top_frame_noise_reasons": [],
+            "warnings": [],
+        }
+        evidence_units = {
+            "schema": "evidence_units.v1",
+            "count": 1,
+            "source_kind_counts": {"node": 1},
+            "units": [{"unit_id": "eu-1", "source_kind": "node"}],
+        }
+
+        with mock.patch("kb_agent.claim_frames.get_claim_frames", return_value=frames), mock.patch(
+            "kb_agent.claim_frames._artifact_content",
+            return_value=verifier,
+        ), mock.patch("kb_agent.claim_frames._ensure_evidence_units", return_value=evidence_units):
+            summary = claim_frame_summary_for_doc(Path("unused.sqlite"), "doc-1")
+
+        self.assertTrue(summary["available"])
+        self.assertEqual(summary["evidence_unit_count"], 1)
+        self.assertEqual(summary["source_kind_counts"], {"node": 1})
+        self.assertEqual(summary["trace_status_counts"], {"verified": 1})
+        self.assertEqual(summary["support_status_counts"], {"structurally_supported": 1})
+        self.assertEqual(summary["top_frames"][0]["trace_status"], "verified")
 
     def test_claim_frame_llm_success_and_failure_keep_rule_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -177,7 +428,7 @@ class ClaimFrameTest(unittest.TestCase):
 
         self.assertEqual(result["count"], 1)
         self.assertEqual(result["items"][0]["frame_id"], supported["frame_id"])
-        self.assertEqual(result["items"][0]["support_status"], "supported")
+        self.assertEqual(result["items"][0]["support_status"], "structurally_supported")
 
     def test_cli_claim_frame_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
