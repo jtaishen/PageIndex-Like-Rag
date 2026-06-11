@@ -28,6 +28,13 @@ from .benchmark import (
     list_eval_suites,
     run_benchmark,
 )
+from .claim_frames import (
+    extract_claim_frames,
+    extract_evidence_units,
+    get_claim_frames,
+    get_evidence_units,
+    verify_claim_frames,
+)
 from .cli_summaries import (
     benchmark_cli_summary,
     case_cli_summary,
@@ -289,6 +296,24 @@ def dispatch_command(args: Any, db_path: Path) -> None:
             require_llm=args.require_llm,
         )
         _print_json(fact_summary(result))
+    elif args.command == "extract-evidence-units":
+        _print_json(extract_evidence_units(db_path, args.doc_id, force=args.force))
+    elif args.command == "evidence-units":
+        _print_json(get_evidence_units(db_path, args.doc_id))
+    elif args.command == "extract-claim-frames":
+        _print_json(
+            extract_claim_frames(
+                db_path,
+                args.doc_id,
+                force=args.force,
+                use_llm=not args.no_llm,
+                require_llm=args.require_llm,
+            )
+        )
+    elif args.command == "claim-frames":
+        _print_json(get_claim_frames(db_path, args.doc_id))
+    elif args.command == "verify-claim-frames":
+        _print_json(verify_claim_frames(db_path, doc_ids=args.doc_id or None))
     elif args.command == "claims":
         _print_json(get_claims(db_path, args.doc_id))
     elif args.command == "entities":

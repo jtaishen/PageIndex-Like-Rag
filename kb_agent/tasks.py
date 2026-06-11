@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from .artifacts import get_citation_map, get_doc_card, get_innovations, get_parse_quality
+from .claim_frames import claim_frame_summary_for_doc, extract_claim_frames, get_claim_frames, get_evidence_units
 from .config import DEFAULT_DB_PATH, PROJECT_ROOT, llm_compare_evidence_per_doc
 from .fact_audit import fact_audit_summary
 from .facts import fact_summary_for_doc
@@ -376,10 +377,11 @@ def _prepare_paper_contexts(db_path: Path, selected: List[Dict[str, Any]]) -> tu
             innovation, insight_warnings = _read_or_extract_insights(db_path, doc_id)
             citation_map = get_citation_map(db_path, doc_id)
             facts = fact_summary_for_doc(db_path, doc_id)
+            claim_frames, evidence_units, claim_frame_warnings = _read_or_extract_claim_frame_context(db_path, doc_id)
         except (FileNotFoundError, KeyError, ValueError) as exc:
             warnings.append(f"paper_prepare_failed:{doc_id}:{exc}")
             continue
-        warnings.extend(insight_warnings)
+        warnings.extend([*insight_warnings, *claim_frame_warnings])
         contexts.append(
             {
                 "doc_id": doc_id,
@@ -392,6 +394,8 @@ def _prepare_paper_contexts(db_path: Path, selected: List[Dict[str, Any]]) -> tu
                 "innovation": innovation,
                 "citation_map": citation_map,
                 "facts": facts,
+                "claim_frames": claim_frames,
+                "evidence_units": evidence_units,
                 "route_score": item.get("score"),
                 "node_matches": item.get("node_matches"),
             }
@@ -414,6 +418,25 @@ def _read_or_extract_insights(db_path: Path, doc_id: str) -> tuple[Dict[str, Any
     return result["innovation"], warnings
 
 
+def _read_or_extract_claim_frame_context(db_path: Path, doc_id: str) -> tuple[Dict[str, Any], Dict[str, Any], List[str]]:
+    warnings: List[str] = []
+    try:
+        frames = get_claim_frames(db_path, doc_id)
+        units = get_evidence_units(db_path, doc_id)
+        summary = claim_frame_summary_for_doc(db_path, doc_id)
+        if frames.get("schema") == "claim_frames.v1" and units.get("schema") == "evidence_units.v1":
+            return {**frames, "summary": summary}, units, warnings
+    except (FileNotFoundError, KeyError, ValueError):
+        pass
+    try:
+        result = extract_claim_frames(db_path, doc_id, force=True, use_llm=False, require_llm=False)
+        warnings.append(f"claim_frames_rule_refreshed:{doc_id}")
+        return result["claim_frames"], get_evidence_units(db_path, doc_id), warnings
+    except Exception as exc:
+        warnings.append(f"claim_frames_unavailable:{doc_id}:{exc}")
+        return {"schema": "claim_frames.v1", "status": "skipped", "frames": [], "summary": {"available": False}}, {"units": []}, warnings
+
+
 def _collect_dimension_evidence(
     db_path: Path,
     query: str,
@@ -428,7 +451,9 @@ def _collect_dimension_evidence(
         terms = " ".join(str(term) for term in dimension["search_terms"])
         search_query = f"{query} {terms}"
         for context in contexts:
-            evidence = _search_doc_evidence(db_path, context["doc_id"], search_query, top_k=4, search_mode=search_mode)
+            frame_evidence = _claim_frame_evidence_for_dimension(context, dimension_id, search_query, limit=3)
+            searched = _search_doc_evidence(db_path, context["doc_id"], search_query, top_k=4, search_mode=search_mode)
+            evidence = _dedupe_evidence([*frame_evidence, *searched])[:4]
             if not evidence:
                 evidence = _innovation_evidence_for_dimension(context, dimension_id)[:3]
             result[dimension_id][context["doc_id"]] = evidence[:4]
@@ -449,12 +474,134 @@ def _collect_section_evidence(
         search_query = f"{topic} {terms}"
         evidence: List[Dict[str, Any]] = []
         for context in contexts:
+            evidence.extend(_claim_frame_evidence_for_section(context, section_id, search_query, limit=3))
             evidence.extend(_search_doc_evidence(db_path, context["doc_id"], search_query, top_k=3, search_mode=search_mode))
         compacted, report = _compact_section_evidence(evidence, max_items=12)
         result[section_id] = compacted
         by_section[section_id] = report
     quality = _section_evidence_quality(by_section, result)
     return result, quality
+
+
+DIMENSION_FRAME_TYPES = {
+    "problem_setting": {"problem", "claim"},
+    "method_paradigm": {"method", "claim"},
+    "evaluation_protocol": {"result", "citation"},
+    "innovation_overlap": {"method", "claim", "result"},
+    "limitations": {"limitation"},
+    "evidence_strength": {"result", "citation"},
+}
+
+SECTION_FRAME_TYPES = {
+    "background_problem": {"problem", "claim"},
+    "method_paradigms": {"method", "claim"},
+    "coordination_mechanisms": {"method", "claim"},
+    "evaluation_evidence": {"result", "citation"},
+    "limitations_future": {"limitation"},
+}
+
+
+def _claim_frame_evidence_for_dimension(
+    context: Dict[str, Any],
+    dimension_id: str,
+    query: str,
+    *,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    wanted = DIMENSION_FRAME_TYPES.get(dimension_id, {"claim"})
+    return _claim_frame_evidence(context, query, wanted_types=wanted, limit=limit)
+
+
+def _claim_frame_evidence_for_section(
+    context: Dict[str, Any],
+    section_id: str,
+    query: str,
+    *,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    wanted = SECTION_FRAME_TYPES.get(section_id, {"claim", "method", "result"})
+    return _claim_frame_evidence(context, query, wanted_types=wanted, limit=limit)
+
+
+def _claim_frame_evidence(
+    context: Dict[str, Any],
+    query: str,
+    *,
+    wanted_types: set[str],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    frames = (context.get("claim_frames") or {}).get("frames") or []
+    units = (context.get("evidence_units") or {}).get("units") or []
+    unit_by_id = {str(unit.get("unit_id") or ""): unit for unit in units if isinstance(unit, dict)}
+    terms = _task_query_terms(query)
+    candidates = []
+    for frame in frames:
+        if not isinstance(frame, dict):
+            continue
+        claim_type = str(frame.get("claim_type") or "")
+        if claim_type not in wanted_types:
+            continue
+        score = _task_frame_score(frame, terms)
+        if score <= 0 and terms:
+            continue
+        candidates.append((score, frame))
+    candidates.sort(key=lambda item: (-float(item[0]), -float(item[1].get("confidence") or 0.0), str(item[1].get("frame_id") or "")))
+    evidence = []
+    for _, frame in candidates[:limit]:
+        evidence.append(_frame_to_evidence_item(context, frame, unit_by_id))
+    return _dedupe_evidence(evidence)
+
+
+def _frame_to_evidence_item(
+    context: Dict[str, Any],
+    frame: Dict[str, Any],
+    unit_by_id: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    unit_ids = [str(item) for item in frame.get("evidence_unit_ids") or [] if str(item)]
+    unit = next((unit_by_id[unit_id] for unit_id in unit_ids if unit_id in unit_by_id), {})
+    return {
+        "doc_id": context["doc_id"],
+        "title": context.get("title") or context["doc_id"],
+        "path": context.get("path") or "",
+        "node_id": unit.get("node_id") or "",
+        "node_path": unit.get("node_path") or "",
+        "page_range": unit.get("page_range") or [],
+        "excerpt": frame.get("short_claim") or unit.get("summary") or "",
+        "summary": frame.get("short_claim") or unit.get("summary") or "",
+        "evidence_type": frame.get("claim_type") or unit.get("unit_type") or "claim_frame",
+        "confidence": frame.get("confidence", 0.0),
+        "claim_frame_id": frame.get("frame_id") or "",
+        "evidence_unit_ids": unit_ids,
+        "source": "claim_frame",
+    }
+
+
+def _task_query_terms(query: str) -> List[str]:
+    terms = []
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,}", query):
+        terms.append(token)
+        if re.fullmatch(r"[\u4e00-\u9fff]{4,}", token):
+            terms.extend(token[index : index + 2] for index in range(0, len(token) - 1))
+    return _unique_strings(terms)[:16]
+
+
+def _task_frame_score(frame: Dict[str, Any], terms: List[str]) -> float:
+    haystack = " ".join(
+        str(frame.get(field) or "")
+        for field in (
+            "short_claim",
+            "problem",
+            "method",
+            "dataset_or_setting",
+            "metric_or_signal",
+            "result_or_gain",
+            "limitation",
+        )
+    ).lower()
+    term_score = sum(1.0 for term in terms if term.lower() in haystack)
+    support_score = 0.3 if frame.get("evidence_unit_ids") else 0.0
+    confidence_score = 0.2 * _confidence(frame.get("confidence"), 0.0)
+    return term_score + support_score + confidence_score
 
 
 def _search_doc_evidence(db_path: Path, doc_id: str, query: str, top_k: int, search_mode: str = "hybrid") -> List[Dict[str, Any]]:
@@ -1469,6 +1616,7 @@ def _selected_papers_artifact(
         citation_map = context.get("citation_map") or {}
         innovation = context.get("innovation") or {}
         facts = context.get("facts") or {}
+        claim_frame_summary = (context.get("claim_frames") or {}).get("summary") or {}
         papers.append(
             {
                 "doc_id": context["doc_id"],
@@ -1486,6 +1634,10 @@ def _selected_papers_artifact(
                 "entity_count": facts.get("entity_count", 0),
                 "relation_count": facts.get("relation_count", 0),
                 "table_backed_fact_count": facts.get("table_backed_fact_count", 0),
+                "claim_frame_available": bool(claim_frame_summary.get("available")),
+                "claim_frame_count": claim_frame_summary.get("frame_count", (context.get("claim_frames") or {}).get("count", 0)),
+                "verified_frame_rate": claim_frame_summary.get("verified_frame_rate", 0.0),
+                "unsupported_frame_count": claim_frame_summary.get("unsupported_frame_count", 0),
                 "route_score": context.get("route_score"),
                 "node_matches": context.get("node_matches"),
             }

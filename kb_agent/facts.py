@@ -134,6 +134,22 @@ def extract_facts(
     artifacts = _build_fact_artifacts(doc_id, version_id, card, quality, facts, llm_error)
     _write_fact_artifacts(artifact_dir, artifacts)
     _replace_fact_rows(db_path, doc_id, version_id, facts)
+    claim_frame_result: Dict[str, Any] = {}
+    try:
+        from .claim_frames import extract_claim_frames, extract_evidence_units
+
+        evidence_unit_result = extract_evidence_units(db_path, doc_id, force=True)
+        claim_frame_result = extract_claim_frames(db_path, doc_id, force=True, use_llm=False, require_llm=False)
+        artifacts["fact_report"]["evidence_unit_count"] = (evidence_unit_result.get("evidence_units") or {}).get("count", 0)
+        artifacts["fact_report"]["claim_frame_count"] = (claim_frame_result.get("claim_frames") or {}).get("count", 0)
+        verifier = claim_frame_result.get("verifier") or {}
+        artifacts["fact_report"]["verified_frame_rate"] = verifier.get("verified_frame_rate", 0.0)
+        write_json(artifact_dir / "fact_report.json", artifacts["fact_report"])
+    except Exception as exc:
+        artifacts["fact_report"]["warnings"] = _unique_strings(
+            [*(artifacts["fact_report"].get("warnings") or []), f"claim_frame_artifacts_failed:{exc}"]
+        )
+        write_json(artifact_dir / "fact_report.json", artifacts["fact_report"])
     return {
         "schema": "fact_extraction_result.v1",
         "doc_id": doc_id,
@@ -150,6 +166,7 @@ def extract_facts(
         "relations": artifacts["relations"],
         "fact_graph": artifacts["fact_graph"],
         "fact_report": artifacts["fact_report"],
+        "claim_frame_result": claim_frame_result,
         "llm_error": llm_error,
     }
 

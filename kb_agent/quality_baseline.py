@@ -17,6 +17,7 @@ from .artifacts import get_doc_card, get_parse_quality, get_parse_report
 from .baseline_renderers import baseline_html, baseline_markdown
 from .baseline_runtime import LLMBaselineRuntime, null_stage
 from .benchmark import create_eval_suite, generate_case_study, run_benchmark
+from .claim_frames import verify_claim_frames
 from .config import DATA_DIR, PROJECT_ROOT, baseline_llm_stage_timeout_seconds, baseline_llm_timeout_seconds, deepseek_timeout_seconds
 from .embeddings import (
     EmbeddingError,
@@ -41,7 +42,7 @@ from .utils import compact_whitespace, read_json as _read_json, stable_id, uniqu
 
 
 BASELINE_SCHEMA = "quality_baseline.v1"
-CODE_VERSION = "v0.37"
+CODE_VERSION = "v0.38"
 BASELINE_FEATURE_FLAGS = {
     "review_draft_baseline": True,
     "baseline_staleness": True,
@@ -55,6 +56,8 @@ BASELINE_FEATURE_FLAGS = {
     "openai_compatible_embedding": True,
     "bge_hybrid_calibration": True,
     "doc_card_noise_filtering": True,
+    "evidence_unit_claim_frame_chain": True,
+    "claim_frame_verifier": True,
 }
 BASELINE_DIR = DATA_DIR / "eval"
 EVAL_SET_DIR = DATA_DIR / "eval_sets"
@@ -109,6 +112,18 @@ def run_quality_baseline(
         llm_doc_ids=llm_doc_ids,
     )
     fact_audit_after = fact_audit_summary(db_path, doc_ids=doc_ids) if doc_ids else {}
+    claim_frame_verification = verify_claim_frames(db_path, doc_ids=doc_ids) if doc_ids else {
+        "schema": "claim_frame_verifier_result.v1",
+        "status": "skipped",
+        "doc_count": 0,
+        "frame_count": 0,
+        "verified_frame_count": 0,
+        "verified_frame_rate": 0.0,
+        "unsupported_frame_count": 0,
+        "low_confidence_frame_count": 0,
+        "missing_evidence_unit_count": 0,
+        "warnings": ["no_ready_documents"],
+    }
     embedding = _embedding_baseline(db_path, doc_ids, embedding_provider=embedding_provider, embedding_model=embedding_model)
     with _embedding_search_env(embedding):
         eval_set = _write_baseline_eval_set(doc_reports)
@@ -138,8 +153,20 @@ def run_quality_baseline(
         "warnings": ["no_ready_documents_for_graph"],
     }
     llm_baseline = _llm_baseline_summary(llm, insights, tree, tasks, graph, enabled=use_llm, runtime=llm_runtime.summary())
-    recommendations = _recommendations(doc_reports, parser_comparison, embedding, benchmark, tree, tasks, memory, graph)
-    warnings.extend(_baseline_warnings(doc_reports, parser_comparison, embedding, benchmark, tasks, memory, graph, llm_baseline))
+    recommendations = _recommendations(doc_reports, parser_comparison, embedding, benchmark, tree, tasks, memory, graph, claim_frame_verification)
+    warnings.extend(
+        _baseline_warnings(
+            doc_reports,
+            parser_comparison,
+            embedding,
+            benchmark,
+            tasks,
+            memory,
+            graph,
+            llm_baseline,
+            claim_frame_verification,
+        )
+    )
     baseline_id = stable_id("quality_baseline", str(root), ",".join(doc_ids), started, length=12)
     git_commit = _current_git_commit()
     report = {
@@ -164,6 +191,7 @@ def run_quality_baseline(
         "documents": doc_reports,
         "insights_and_facts": insights,
         "fact_audit_delta": _fact_audit_delta(fact_audit_before, fact_audit_after),
+        "claim_frame_verification": claim_frame_verification,
         "embedding": embedding,
         "eval_set": eval_set,
         "eval_suite": _suite_summary(suite),
@@ -227,6 +255,7 @@ def latest_quality_baseline(
         review_diagnostics = review.get("llm_diagnostics") or {}
         tree_delta = (payload.get("tree_search") or {}).get("comparison_summary") or {}
         fact_delta = payload.get("fact_audit_delta") or {}
+        claim_frame_verification = payload.get("claim_frame_verification") or {}
         llm_baseline = payload.get("llm_baseline") or {}
         stage_summary = llm_baseline.get("stage_summary") or {}
         llm_facts = llm_baseline.get("insights_and_facts") or {}
@@ -286,6 +315,14 @@ def latest_quality_baseline(
                 "duplicate_evidence_removed": review.get("duplicate_evidence_removed", 0),
                 "citation_gap_count_before": fact_delta.get("citation_gap_count_before", 0),
                 "citation_gap_count_after": fact_delta.get("citation_gap_count_after", 0),
+                "evidence_unit_count": sum(
+                    int(item.get("evidence_unit_count") or 0)
+                    for item in (payload.get("insights_and_facts") or {}).get("items") or []
+                    if isinstance(item, dict)
+                ),
+                "claim_frame_count": claim_frame_verification.get("frame_count", 0),
+                "verified_frame_rate": claim_frame_verification.get("verified_frame_rate", 0.0),
+                "unsupported_frame_count": claim_frame_verification.get("unsupported_frame_count", 0),
                 "tree_trace_completeness_before": tree_delta.get("rule_trace_completeness_avg", 0.0),
                 "tree_trace_completeness_after": tree_delta.get("llm_trace_completeness_avg", 0.0),
                 "weak_doc_count": sum(1 for item in payload.get("documents") or [] if item.get("quality_level") == "weak"),
@@ -818,6 +855,9 @@ def _prepare_insights_and_facts(
                     "claim_count": llm_summary.get("claim_count", 0),
                     "entity_count": llm_summary.get("entity_count", 0),
                     "relation_count": llm_summary.get("relation_count", 0),
+                    "evidence_unit_count": llm_summary.get("evidence_unit_count", 0),
+                    "claim_frame_count": llm_summary.get("claim_frame_count", 0),
+                    "verified_frame_rate": llm_summary.get("verified_frame_rate", 0.0),
                     "source": llm_summary.get("source", ""),
                     "llm_used": llm_summary.get("llm_used", False),
                     "llm_error": llm_summary.get("llm_error", ""),
@@ -881,6 +921,9 @@ def _extract_fact_summary(db_path: Path, doc_id: str, *, use_llm: bool) -> Dict[
         "claim_count": fact_report.get("claim_count", 0),
         "entity_count": fact_report.get("entity_count", 0),
         "relation_count": fact_report.get("relation_count", 0),
+        "evidence_unit_count": fact_report.get("evidence_unit_count", 0),
+        "claim_frame_count": fact_report.get("claim_frame_count", 0),
+        "verified_frame_rate": fact_report.get("verified_frame_rate", 0.0),
         "noise_filtered_count": fact_report.get("noise_filtered_count", 0),
         "entity_noise_filtered_count": fact_report.get("entity_noise_filtered_count", 0),
         "long_claim_trimmed_count": fact_report.get("long_claim_trimmed_count", 0),
@@ -912,6 +955,9 @@ def _merge_insight_fact_summaries(rule_summary: Dict[str, Any], llm_parts: Dict[
         "claim_count": fact.get("claim_count", rule_summary.get("claim_count", 0)),
         "entity_count": fact.get("entity_count", rule_summary.get("entity_count", 0)),
         "relation_count": fact.get("relation_count", rule_summary.get("relation_count", 0)),
+        "evidence_unit_count": fact.get("evidence_unit_count", rule_summary.get("evidence_unit_count", 0)),
+        "claim_frame_count": fact.get("claim_frame_count", rule_summary.get("claim_frame_count", 0)),
+        "verified_frame_rate": fact.get("verified_frame_rate", rule_summary.get("verified_frame_rate", 0.0)),
         "noise_filtered_count": fact.get("noise_filtered_count", rule_summary.get("noise_filtered_count", 0)),
         "entity_noise_filtered_count": fact.get("entity_noise_filtered_count", rule_summary.get("entity_noise_filtered_count", 0)),
         "long_claim_trimmed_count": fact.get("long_claim_trimmed_count", rule_summary.get("long_claim_trimmed_count", 0)),
@@ -1455,6 +1501,7 @@ def _recommendations(
     tasks: Dict[str, Any],
     memory: Dict[str, Any],
     graph: Dict[str, Any],
+    claim_frame_verification: Dict[str, Any],
 ) -> List[str]:
     items = []
     if any(doc.get("quality_level") == "weak" for doc in documents):
@@ -1473,6 +1520,8 @@ def _recommendations(
         items.append("memory 评测需要复核；确认没有论文资产进入长期记忆。")
     if graph.get("conflict_count", 0) or graph.get("isolated_fact_count", 0):
         items.append("Claim Graph 存在冲突或孤立事实；用 graph-neighborhood 回到 evidence packet 核验。")
+    if int(claim_frame_verification.get("unsupported_frame_count") or 0) > 0:
+        items.append("ClaimFrame 存在无证据支撑项；运行 verify-claim-frames 并回到 EvidenceUnit 检查来源节点。")
     if not items:
         items.append("当前基线未发现阻塞项；下一步可扩展到 10-30 篇真实论文并重跑 benchmark。")
     return _unique_strings(items)
@@ -1627,6 +1676,7 @@ def _baseline_warnings(
     memory: Dict[str, Any],
     graph: Dict[str, Any],
     llm_baseline: Dict[str, Any],
+    claim_frame_verification: Dict[str, Any],
 ) -> List[str]:
     warnings = []
     if not documents:
@@ -1643,6 +1693,7 @@ def _baseline_warnings(
     warnings.extend(memory.get("warnings") or [])
     warnings.extend(graph.get("warnings") or [])
     warnings.extend(llm_baseline.get("warnings") or [])
+    warnings.extend(claim_frame_verification.get("warnings") or [])
     return _unique_strings(str(item) for item in warnings)
 
 

@@ -1028,6 +1028,25 @@ def _search_report_warnings(results: List[SearchResult], mode: str, db_path: Pat
 
 
 def _fact_matches(db_path: Path, query: str, doc_id: Optional[str], top_k: int) -> Dict[str, object]:
+    claim_frame_matches: Dict[str, object] = {
+        "schema": "claim_frame_search.v1",
+        "available": False,
+        "count": 0,
+        "items": [],
+        "warnings": ["claim_frame_search_not_run"],
+    }
+    try:
+        from .claim_frames import search_claim_frames
+
+        claim_frame_matches = search_claim_frames(db_path, query, doc_ids=[doc_id] if doc_id else None, top_k=top_k)
+    except Exception as exc:
+        claim_frame_matches = {
+            "schema": "claim_frame_search.v1",
+            "available": False,
+            "count": 0,
+            "items": [],
+            "warnings": [f"claim_frame_search_unavailable:{exc}"],
+        }
     try:
         from .facts import fact_search
 
@@ -1038,6 +1057,7 @@ def _fact_matches(db_path: Path, query: str, doc_id: Optional[str], top_k: int) 
             "available": False,
             "count": 0,
             "items": [],
+            "claim_frame_matches": claim_frame_matches,
             "warnings": [f"fact_search_unavailable:{exc}"],
         }
     return {
@@ -1045,6 +1065,7 @@ def _fact_matches(db_path: Path, query: str, doc_id: Optional[str], top_k: int) 
         "available": True,
         "count": result.get("count", 0),
         "items": result.get("items", [])[:top_k],
+        "claim_frame_matches": claim_frame_matches,
         "table_backed_count": sum(1 for item in result.get("items", [])[:top_k] if item.get("source_kind") == "table"),
         "text_backed_count": sum(1 for item in result.get("items", [])[:top_k] if item.get("source_kind") != "table"),
         "warnings": [],

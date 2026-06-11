@@ -202,6 +202,25 @@ def build_parser() -> argparse.ArgumentParser:
     facts_parser.add_argument("--no-llm", action="store_true", help="Use rule-based fact extraction only")
     facts_parser.add_argument("--require-llm", action="store_true", help="Fail if DeepSeek cannot be called")
 
+    evidence_units_parser = subparsers.add_parser("extract-evidence-units", help="Extract normalized EvidenceUnit artifacts")
+    evidence_units_parser.add_argument("doc_id")
+    evidence_units_parser.add_argument("--force", action="store_true")
+
+    evidence_units_show_parser = subparsers.add_parser("evidence-units", help="Show extracted EvidenceUnit artifact")
+    evidence_units_show_parser.add_argument("doc_id")
+
+    claim_frames_parser = subparsers.add_parser("extract-claim-frames", help="Extract ClaimFrame artifacts")
+    claim_frames_parser.add_argument("doc_id")
+    claim_frames_parser.add_argument("--force", action="store_true")
+    claim_frames_parser.add_argument("--no-llm", action="store_true", help="Use rule-based ClaimFrame extraction only")
+    claim_frames_parser.add_argument("--require-llm", action="store_true", help="Fail if DeepSeek cannot be called")
+
+    claim_frames_show_parser = subparsers.add_parser("claim-frames", help="Show extracted ClaimFrame artifact")
+    claim_frames_show_parser.add_argument("doc_id")
+
+    verify_claim_frames_parser = subparsers.add_parser("verify-claim-frames", help="Verify ClaimFrames against EvidenceUnits and nodes")
+    verify_claim_frames_parser.add_argument("--doc-id", action="append", default=[], help="Limit to one document id; repeatable")
+
     claims_parser = subparsers.add_parser("claims", help="Show extracted claims artifact")
     claims_parser.add_argument("doc_id")
 

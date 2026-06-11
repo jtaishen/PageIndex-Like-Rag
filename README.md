@@ -1,9 +1,9 @@
 # PageIndex-Like RAG MVP
 
-这是一个基于 OpenCode 的 PageIndex-like 论文知识库智能体 MVP。当前目标是跑通论文入库、结构化工件、章节树检索和 evidence packet 的核心闭环：
+这是一个基于 OpenCode 的 PageIndex-like 论文知识库智能体 MVP。当前目标是跑通论文入库、结构化工件、章节树检索和 EvidenceUnit / ClaimFrame 的核心闭环：
 
 ```text
-parse -> normalize -> tree -> artifacts -> indexes -> evidence packet -> CLI / MCP 工具
+parse -> normalize -> tree -> artifacts -> indexes -> EvidenceUnit -> ClaimFrame -> Verifier -> CLI / MCP 工具
 ```
 
 ## 当前能力
@@ -15,8 +15,8 @@ parse -> normalize -> tree -> artifacts -> indexes -> evidence packet -> CLI / M
 - 对中文论文常见结构做规则识别，包括摘要、关键词、第 X 章、`1.1`/`1.1.1` 小节、结论、参考文献、图和表。
 - 将文档保存为 `documents` 和 `doc_nodes`。
 - 使用 SQLite FTS5 做全文检索，并支持本地 embedding + hybrid rerank。
-- 返回带 `doc_id`、`node_id`、`node_path`、页码和 excerpt 的 evidence packet。
-- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`parse-report`、`layout`、`tables`、`table-content`、`table-summaries`、`embed`、`search-report`、`eval-search`、`eval-review`、`eval-memory`、`eval-facts`、`audit-facts`、`fact-conflicts`、`graph-build`、`graph-neighborhood`、`graph-export`、`graph-report`、`quality-baseline`、`latest-quality-baseline`、`eval-suite`、`benchmark`、`analyze-failures`、`case-study`、`query-log`、`query-stats`、`feedback-put`、`feedback-to-eval`、`eval-dashboard`、`tune-search`、`search-profile`、`extract`、`innovations`、`citations`、`extract-facts`、`claims`、`entities`、`relations`、`fact-search`。
+- 返回带 `doc_id`、`node_id`、`node_path`、页码和 excerpt 的 evidence packet，并可派生 EvidenceUnit、ClaimFrame 与 verifier 报告。
+- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`parse-report`、`layout`、`tables`、`table-content`、`table-summaries`、`embed`、`search-report`、`eval-search`、`eval-review`、`eval-memory`、`eval-facts`、`audit-facts`、`fact-conflicts`、`graph-build`、`graph-neighborhood`、`graph-export`、`graph-report`、`quality-baseline`、`latest-quality-baseline`、`eval-suite`、`benchmark`、`analyze-failures`、`case-study`、`query-log`、`query-stats`、`feedback-put`、`feedback-to-eval`、`eval-dashboard`、`tune-search`、`search-profile`、`extract`、`innovations`、`citations`、`extract-facts`、`extract-evidence-units`、`evidence-units`、`extract-claim-frames`、`claim-frames`、`verify-claim-frames`、`claims`、`entities`、`relations`、`fact-search`。
 - 支持跨论文比较和综述规划任务工件，生成比较矩阵、综述大纲、章节证据表和下一步行动。
 - 支持长期 memory 写入门控、任务进度记忆、任务恢复和任务进度压缩。
 - 支持人工反馈闭环，可将用户评分、期望 doc/node/keyword 转为搜索评测集。
@@ -944,6 +944,25 @@ uv run --extra pdf python -m kb_agent.cli quality-baseline articles --embedding-
 uv run python -m kb_agent.cli latest-quality-baseline --real-only --limit 1
 ```
 
+## v0.38 EvidenceUnit / ClaimFrame / Verifier 主链
+
+v0.38 对齐新版技术方案的 `Tree -> Evidence -> Claim -> Verify` 主线，不新增数据库 schema。系统会从已有 `doc_nodes`、表格/图表/引用工件和 facts 派生三个文档级 artifact：`evidence_units.json`、`claim_frames.json`、`claim_frame_verifier.json`。这些 artifact 只保存短摘要、关键词、ID、指标和 warning，不保存完整正文、prompt 或模型原文。
+
+`extract-facts` 完成后会自动尝试生成 EvidenceUnit 和 ClaimFrame；失败只记录 warning，不影响原有 claims/entities/relations。`compare`、`generate-review` 和 `search-report` 会优先利用 ClaimFrame 组织证据链，缺失时回退到原来的节点检索和 fact_search。
+
+常用命令：
+
+```bash
+uv run python -m kb_agent.cli extract-facts <doc_id> --force --no-llm
+uv run python -m kb_agent.cli evidence-units <doc_id>
+uv run python -m kb_agent.cli extract-claim-frames <doc_id> --force --no-llm
+uv run python -m kb_agent.cli claim-frames <doc_id>
+uv run python -m kb_agent.cli verify-claim-frames --doc-id <doc_id>
+uv run python -m kb_agent.cli search-report "任务规划方法" --search-mode hybrid --top-k 3
+```
+
+`quality-baseline` 会额外记录 `claim_frame_count`、`verified_frame_rate`、`unsupported_frame_count` 和 `missing_evidence_unit_count`。完整 baseline 仍按需手动运行，不作为每次提交的硬要求。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
@@ -1041,7 +1060,7 @@ DeepSeek 官方 OpenCode 接入方式：
 推荐工具调用顺序：
 
 ```text
-kb_sync -> kb_build_semantic_index -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_get_layout_blocks -> kb_get_figures -> kb_get_tables -> kb_get_table_content -> kb_get_table_summaries -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_extract_facts -> kb_get_claims -> kb_get_entities -> kb_get_relations -> kb_get_fact_graph -> kb_fact_search -> kb_audit_facts -> kb_get_fact_conflicts -> kb_build_knowledge_graph -> kb_get_graph_neighborhood -> kb_run_quality_baseline -> kb_get_latest_quality_baseline -> kb_classify_query -> kb_tree_search -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> kb_eval_search -> kb_eval_review -> kb_eval_memory -> kb_eval_facts -> kb_create_eval_suite -> kb_run_benchmark -> kb_analyze_failures -> kb_generate_case_study -> kb_get_query_stats -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
+kb_sync -> kb_build_semantic_index -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_get_layout_blocks -> kb_get_figures -> kb_get_tables -> kb_get_table_content -> kb_get_table_summaries -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_extract_facts -> kb_extract_evidence_units -> kb_get_evidence_units -> kb_extract_claim_frames -> kb_get_claim_frames -> kb_verify_claim_frames -> kb_get_claims -> kb_get_entities -> kb_get_relations -> kb_get_fact_graph -> kb_fact_search -> kb_audit_facts -> kb_get_fact_conflicts -> kb_build_knowledge_graph -> kb_get_graph_neighborhood -> kb_run_quality_baseline -> kb_get_latest_quality_baseline -> kb_classify_query -> kb_tree_search -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> kb_eval_search -> kb_eval_review -> kb_eval_memory -> kb_eval_facts -> kb_create_eval_suite -> kb_run_benchmark -> kb_analyze_failures -> kb_generate_case_study -> kb_get_query_stats -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
 ```
 
 当用户明确指出某次结果好坏时，推荐追加：

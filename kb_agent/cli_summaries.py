@@ -53,6 +53,9 @@ def fact_summary(result: dict) -> dict:
         "relation_count": report.get("relation_count", relations.get("count")),
         "low_confidence_count": report.get("low_confidence_count"),
         "no_evidence_count": report.get("no_evidence_count"),
+        "evidence_unit_count": report.get("evidence_unit_count", 0),
+        "claim_frame_count": report.get("claim_frame_count", 0),
+        "verified_frame_rate": report.get("verified_frame_rate", 0.0),
         "warnings": report.get("warnings") or [],
         "llm_error": result.get("llm_error", ""),
     }
@@ -229,6 +232,7 @@ def graph_build_cli_summary(result: dict) -> dict:
 def quality_baseline_cli_summary(result: dict) -> dict:
     benchmark = result.get("benchmark") or {}
     embedding = result.get("embedding") or {}
+    claim_frame_verification = result.get("claim_frame_verification") or {}
     real_embedding = embedding.get("sentence_transformers") or {}
     llm_status = result.get("llm_status") or {}
     llm_baseline = result.get("llm_baseline") or {}
@@ -304,6 +308,10 @@ def quality_baseline_cli_summary(result: dict) -> dict:
         "duplicate_evidence_removed": review_task.get("duplicate_evidence_removed", 0),
         "citation_gap_count_before": (result.get("fact_audit_delta") or {}).get("citation_gap_count_before", 0),
         "citation_gap_count_after": (result.get("fact_audit_delta") or {}).get("citation_gap_count_after", 0),
+        "claim_frame_count": claim_frame_verification.get("frame_count", 0),
+        "verified_frame_rate": claim_frame_verification.get("verified_frame_rate", 0.0),
+        "unsupported_frame_count": claim_frame_verification.get("unsupported_frame_count", 0),
+        "missing_evidence_unit_count": claim_frame_verification.get("missing_evidence_unit_count", 0),
         "tree_trace_completeness_before": ((result.get("tree_search") or {}).get("comparison_summary") or {}).get("rule_trace_completeness_avg", 0.0),
         "tree_trace_completeness_after": ((result.get("tree_search") or {}).get("comparison_summary") or {}).get("llm_trace_completeness_avg", 0.0),
         "compare_task_id": ((result.get("tasks") or {}).get("compare") or {}).get("task_id", ""),

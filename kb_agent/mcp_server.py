@@ -25,6 +25,13 @@ from .benchmark import (
     list_eval_suites,
     run_benchmark,
 )
+from .claim_frames import (
+    extract_claim_frames,
+    extract_evidence_units,
+    get_claim_frames,
+    get_evidence_units,
+    verify_claim_frames,
+)
 from .config import resolve_db_path
 from .embeddings import build_semantic_index, semantic_index_status
 from .eval import eval_facts, eval_memory, eval_review, eval_search
@@ -501,6 +508,50 @@ if FastMCP is not None:
             packet.to_dict()
             for packet in get_evidence(resolve_db_path(db_path), doc_id, node_ids)
         ]
+
+    @mcp.tool()
+    def kb_extract_evidence_units(
+        doc_id: str,
+        force: bool = False,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build normalized EvidenceUnit artifacts for one document."""
+        return extract_evidence_units(resolve_db_path(db_path), doc_id, force=force)
+
+    @mcp.tool()
+    def kb_get_evidence_units(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return normalized EvidenceUnit artifacts for one document."""
+        return get_evidence_units(resolve_db_path(db_path), doc_id)
+
+    @mcp.tool()
+    def kb_extract_claim_frames(
+        doc_id: str,
+        force: bool = False,
+        use_llm: bool = True,
+        require_llm: bool = False,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build ClaimFrame artifacts from facts, insights, tables, citations, and EvidenceUnits."""
+        return extract_claim_frames(
+            resolve_db_path(db_path),
+            doc_id,
+            force=force,
+            use_llm=use_llm,
+            require_llm=require_llm,
+        )
+
+    @mcp.tool()
+    def kb_get_claim_frames(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return ClaimFrame artifacts for one document."""
+        return get_claim_frames(resolve_db_path(db_path), doc_id)
+
+    @mcp.tool()
+    def kb_verify_claim_frames(
+        doc_ids: Optional[List[str]] = None,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Verify ClaimFrames against EvidenceUnits, nodes, confidence, and citation map coverage."""
+        return verify_claim_frames(resolve_db_path(db_path), doc_ids=doc_ids)
 
     @mcp.tool()
     def kb_get_doc_card(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:

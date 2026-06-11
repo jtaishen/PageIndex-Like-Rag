@@ -30,6 +30,9 @@ ARTIFACT_WHITELIST = {
     "relations.json",
     "fact_graph.json",
     "fact_report.json",
+    "evidence_units.json",
+    "claim_frames.json",
+    "claim_frame_verifier.json",
 }
 
 
