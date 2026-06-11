@@ -18,7 +18,14 @@ from .baseline_renderers import baseline_html, baseline_markdown
 from .baseline_runtime import LLMBaselineRuntime, null_stage
 from .benchmark import create_eval_suite, generate_case_study, run_benchmark
 from .config import DATA_DIR, PROJECT_ROOT, baseline_llm_stage_timeout_seconds, baseline_llm_timeout_seconds, deepseek_timeout_seconds
-from .embeddings import EmbeddingError, build_semantic_index, semantic_index_status, sentence_transformers_available
+from .embeddings import (
+    EmbeddingError,
+    build_semantic_index,
+    resolve_embedding_model,
+    resolve_embedding_provider,
+    semantic_index_status,
+    sentence_transformers_available,
+)
 from .eval import eval_memory
 from .fact_audit import fact_audit_summary
 from .facts import extract_facts
@@ -34,7 +41,7 @@ from .utils import compact_whitespace, read_json as _read_json, stable_id, uniqu
 
 
 BASELINE_SCHEMA = "quality_baseline.v1"
-CODE_VERSION = "v0.35"
+CODE_VERSION = "v0.36"
 BASELINE_FEATURE_FLAGS = {
     "review_draft_baseline": True,
     "baseline_staleness": True,
@@ -45,6 +52,7 @@ BASELINE_FEATURE_FLAGS = {
     "parser_quality_comparison": True,
     "doc_card_summary_fields": True,
     "document_routing_explanations": True,
+    "openai_compatible_embedding": True,
 }
 BASELINE_DIR = DATA_DIR / "eval"
 EVAL_SET_DIR = DATA_DIR / "eval_sets"
@@ -57,6 +65,7 @@ def run_quality_baseline(
     force: bool = True,
     top_k: int = 5,
     use_llm: bool = False,
+    embedding_provider: Optional[str] = None,
     embedding_model: Optional[str] = None,
     llm_timeout_seconds: Optional[int] = None,
     llm_stage_timeout_seconds: Optional[int] = None,
@@ -98,7 +107,7 @@ def run_quality_baseline(
         llm_doc_ids=llm_doc_ids,
     )
     fact_audit_after = fact_audit_summary(db_path, doc_ids=doc_ids) if doc_ids else {}
-    embedding = _embedding_baseline(db_path, doc_ids, embedding_model=embedding_model)
+    embedding = _embedding_baseline(db_path, doc_ids, embedding_provider=embedding_provider, embedding_model=embedding_model)
     with _embedding_search_env(embedding):
         eval_set = _write_baseline_eval_set(doc_reports)
         suite = create_eval_suite(db_path, f"quality_baseline_{int(started)}", input_json=Path(eval_set["path"]))
@@ -277,7 +286,9 @@ def latest_quality_baseline(
                 "tree_trace_completeness_before": tree_delta.get("rule_trace_completeness_avg", 0.0),
                 "tree_trace_completeness_after": tree_delta.get("llm_trace_completeness_avg", 0.0),
                 "weak_doc_count": sum(1 for item in payload.get("documents") or [] if item.get("quality_level") == "weak"),
-                "real_embedding_status": (payload.get("embedding") or {}).get("sentence_transformers", {}).get("status", ""),
+                "real_embedding_provider": (payload.get("embedding") or {}).get("real_embedding_provider", ""),
+                "real_embedding_status": (payload.get("embedding") or {}).get("real_embedding_status")
+                or (payload.get("embedding") or {}).get("sentence_transformers", {}).get("status", ""),
                 "real_embedding_model": (payload.get("embedding") or {}).get("real_embedding_model", ""),
                 "real_embedding_dim": (payload.get("embedding") or {}).get("real_embedding_dim", 0),
                 "real_embedding_node_coverage": (payload.get("embedding") or {}).get("real_embedding_node_coverage", 0.0),
@@ -408,7 +419,7 @@ def _baseline_limitations(payload: Dict[str, Any]) -> List[str]:
     limitations: List[str] = []
     if int(payload.get("doc_count") or 0) < 3:
         limitations.append("small_corpus")
-    if embedding.get("real_embedding_status") == "skipped" or embedding.get("sentence_transformers", {}).get("status") == "skipped":
+    if embedding.get("real_embedding_status") != "completed":
         limitations.append("real_embedding_not_enabled")
     if int(llm.get("timeout_count") or runtime.get("timeout_count") or 0) > 0:
         limitations.append("llm_timeout")
@@ -912,17 +923,27 @@ def _merge_insight_fact_summaries(rule_summary: Dict[str, Any], llm_parts: Dict[
     return merged
 
 
-def _embedding_baseline(db_path: Path, doc_ids: List[str], *, embedding_model: Optional[str]) -> Dict[str, Any]:
+def _embedding_baseline(
+    db_path: Path,
+    doc_ids: List[str],
+    *,
+    embedding_provider: Optional[str],
+    embedding_model: Optional[str],
+) -> Dict[str, Any]:
+    real_provider = _baseline_real_embedding_provider(embedding_provider)
+    real_model = resolve_embedding_model(real_provider, embedding_model)
     result: Dict[str, Any] = {
         "schema": "embedding_baseline.v1",
         "doc_ids": doc_ids,
         "hash": {},
         "sentence_transformers": {},
+        "openai_compatible": {},
+        "real_embedding_provider": real_provider,
         "hybrid_embedding_provider": "hash",
         "hybrid_embedding_model": "hash-ngram-v1",
         "hybrid_embedding_ready": False,
         "real_embedding_status": "skipped",
-        "real_embedding_model": embedding_model or "",
+        "real_embedding_model": real_model,
         "real_embedding_dim": 0,
         "real_embedding_node_coverage": 0.0,
         "real_embedding_doc_coverage": 0.0,
@@ -932,6 +953,7 @@ def _embedding_baseline(db_path: Path, doc_ids: List[str], *, embedding_model: O
     if not doc_ids:
         result["hash"] = {"status": "skipped", "reason": "no_ready_documents"}
         result["sentence_transformers"] = {"status": "skipped", "reason": "no_ready_documents"}
+        result["openai_compatible"] = {"status": "skipped", "reason": "no_ready_documents"}
         result["warnings"].append("embedding_skipped:no_ready_documents")
         return _finalize_embedding_baseline(result)
     try:
@@ -940,6 +962,32 @@ def _embedding_baseline(db_path: Path, doc_ids: List[str], *, embedding_model: O
     except Exception as exc:
         result["hash"] = {"status": "failed", "error": str(exc)}
         result["warnings"].append("hash_embedding_failed")
+    if real_provider == "hash":
+        result["sentence_transformers"] = {"status": "skipped", "reason": "real_embedding_provider_is_hash"}
+        result["openai_compatible"] = {"status": "skipped", "reason": "real_embedding_provider_is_hash"}
+        result["warnings"].append("real_embedding_not_enabled")
+        return _finalize_embedding_baseline(result)
+    if real_provider == "openai-compatible":
+        result["sentence_transformers"] = {"status": "skipped", "reason": "real_embedding_provider_openai_compatible"}
+        try:
+            build = build_semantic_index(
+                db_path,
+                doc_ids=doc_ids or None,
+                force=True,
+                provider="openai-compatible",
+                model=embedding_model,
+            )
+            status = semantic_index_status(db_path, provider="openai-compatible", model=build.get("model"))
+            result["openai_compatible"] = {"status": "completed", "build": build, "status_report": status}
+        except EmbeddingError as exc:
+            result["openai_compatible"] = {"status": "skipped", "reason": str(exc)}
+            result["warnings"].append("real_embedding_skipped")
+        except Exception as exc:
+            result["openai_compatible"] = {"status": "failed", "error": str(exc)}
+            result["warnings"].append("real_embedding_failed")
+        return _finalize_embedding_baseline(result)
+
+    result["openai_compatible"] = {"status": "skipped", "reason": "real_embedding_provider_sentence_transformers"}
     if not _baseline_sentence_transformers_available():
         result["sentence_transformers"] = {
             "status": "skipped",
@@ -968,9 +1016,12 @@ def _embedding_baseline(db_path: Path, doc_ids: List[str], *, embedding_model: O
 
 
 def _finalize_embedding_baseline(result: Dict[str, Any]) -> Dict[str, Any]:
-    real = result.get("sentence_transformers") or {}
+    real_provider = str(result.get("real_embedding_provider") or "sentence-transformers")
+    real_key = "openai_compatible" if real_provider == "openai-compatible" else "sentence_transformers"
+    real = result.get(real_key) or {}
     hash_part = result.get("hash") or {}
     real_status = str(real.get("status") or "skipped")
+    result["real_embedding_provider"] = real_provider
     result["real_embedding_status"] = real_status
     real_status_report = real.get("status_report") if isinstance(real.get("status_report"), dict) else {}
     real_build = real.get("build") if isinstance(real.get("build"), dict) else {}
@@ -986,7 +1037,7 @@ def _finalize_embedding_baseline(result: Dict[str, Any]) -> Dict[str, Any]:
         real_status_report.get("document_coverage") or real_build.get("document_coverage") or 0.0
     )
     if real_status == "completed":
-        result["hybrid_embedding_provider"] = "sentence-transformers"
+        result["hybrid_embedding_provider"] = real_provider
         result["hybrid_embedding_model"] = result["real_embedding_model"]
         result["hybrid_embedding_ready"] = bool(real_status_report.get("ready", True))
         result["embedding_rebuild_needed"] = bool(real_status_report.get("needs_rebuild", False))
@@ -1001,6 +1052,12 @@ def _finalize_embedding_baseline(result: Dict[str, Any]) -> Dict[str, Any]:
             result["warnings"].append("hybrid_uses_hash_embedding")
     result["warnings"] = _unique_strings(result.get("warnings") or [])
     return result
+
+
+def _baseline_real_embedding_provider(embedding_provider: Optional[str]) -> str:
+    if not embedding_provider:
+        return "sentence-transformers"
+    return resolve_embedding_provider(embedding_provider)
 
 
 def _baseline_sentence_transformers_available() -> bool:
@@ -1395,8 +1452,8 @@ def _recommendations(
         items.append("存在弱解析论文；优先使用 Docling 重建 PDF 工件，并复查章节树和表格内容。")
     if any(provider.get("status") == "skipped" for provider in parser_comparison.get("providers") or [] if provider.get("provider") in {"docling", "grobid"}):
         items.append("Docling 或 GROBID 未完成真实对比；补齐依赖/服务后重跑 quality-baseline。")
-    if (embedding.get("sentence_transformers") or {}).get("status") != "completed":
-        items.append("真实 embedding 尚未完成；安装 sentence-transformers 并指定适合中文论文的模型后重跑。")
+    if embedding.get("real_embedding_status") != "completed":
+        items.append("真实 embedding 尚未完成；配置 sentence-transformers 或 openai-compatible/bge-m3 后重跑。")
     if (benchmark.get("summary") or {}).get("tree", {}).get("benchmark_score", 0) < (benchmark.get("summary") or {}).get("fts", {}).get("benchmark_score", 0):
         items.append("tree 检索未优于 fts；需要复核 query intent、章节树质量和 value function 权重。")
     if any(not item.get("evidence_count") for item in tree.get("items") or []):

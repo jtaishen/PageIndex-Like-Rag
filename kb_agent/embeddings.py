@@ -7,20 +7,24 @@ import math
 import os
 import re
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from . import db
 from .config import load_env_file
 from .utils import compact_whitespace
 
 
-EMBEDDING_PROVIDERS = {"hash", "sentence-transformers"}
+EMBEDDING_PROVIDERS = {"hash", "sentence-transformers", "openai-compatible"}
 DEFAULT_EMBEDDING_PROVIDER = "hash"
 DEFAULT_HASH_MODEL = "hash-ngram-v1"
 DEFAULT_HASH_DIM = 256
 DEFAULT_SENTENCE_TRANSFORMERS_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+DEFAULT_OPENAI_COMPATIBLE_EMBEDDING_MODEL = "bge-m3"
+DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS = 45
 
 
 class EmbeddingError(RuntimeError):
@@ -85,6 +89,62 @@ class SentenceTransformersProvider(EmbeddingProvider):
         return values
 
 
+class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
+    def __init__(self, model: Optional[str] = None) -> None:
+        config = _openai_compatible_embedding_config(model=model)
+        model_name = str(config["model"])
+        base_url = str(config["base_url"])
+        api_key = str(config["api_key"])
+        if not base_url:
+            raise EmbeddingError("KB_EMBEDDING_BASE_URL is not configured.")
+        if not api_key:
+            raise EmbeddingError("KB_EMBEDDING_API_KEY is not configured.")
+        self._endpoint = f"{base_url.rstrip('/')}/embeddings"
+        self._api_key = api_key
+        self._timeout_seconds = int(config["timeout_seconds"])
+        super().__init__(name="openai-compatible", model=model_name, dim=0)
+
+    def embed(self, text: str) -> List[float]:
+        return self.embed_batch([text], batch_size=1)[0]
+
+    def embed_batch(self, texts: List[str], batch_size: int = 16) -> List[List[float]]:
+        del batch_size
+        if not texts:
+            return []
+        payload = json.dumps({"model": self.model, "input": texts}, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            self._endpoint,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:  # nosec B310
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            detail = _read_error_detail(exc)
+            message = f"openai-compatible embeddings request failed: HTTP {exc.code}"
+            if detail:
+                message = f"{message}: {detail}"
+            raise EmbeddingError(_redact_embedding_secret(message)) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise EmbeddingError(
+                _redact_embedding_secret(f"openai-compatible embeddings request failed: {exc}")
+            ) from exc
+
+        try:
+            response_payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise EmbeddingError("openai-compatible embeddings response is not valid JSON.") from exc
+        vectors = _parse_openai_embedding_vectors(response_payload, expected_count=len(texts))
+        if self.dim <= 0 and vectors:
+            self.dim = len(vectors[0])
+        return vectors
+
+
 def resolve_embedding_provider(provider: Optional[str] = None) -> str:
     load_env_file()
     requested = (provider or os.environ.get("KB_EMBEDDING_PROVIDER") or DEFAULT_EMBEDDING_PROVIDER).strip().lower()
@@ -98,6 +158,8 @@ def resolve_embedding_model(provider: str, model: Optional[str] = None) -> str:
     load_env_file()
     if provider == "hash":
         return DEFAULT_HASH_MODEL
+    if provider == "openai-compatible":
+        return model or os.environ.get("KB_EMBEDDING_MODEL") or DEFAULT_OPENAI_COMPATIBLE_EMBEDDING_MODEL
     return model or os.environ.get("KB_EMBEDDING_MODEL") or DEFAULT_SENTENCE_TRANSFORMERS_MODEL
 
 
@@ -105,7 +167,45 @@ def get_embedding_provider(provider: Optional[str] = None, model: Optional[str] 
     resolved = resolve_embedding_provider(provider)
     if resolved == "hash":
         return HashEmbeddingProvider()
+    if resolved == "openai-compatible":
+        return OpenAICompatibleEmbeddingProvider(resolve_embedding_model(resolved, model))
     return SentenceTransformersProvider(resolve_embedding_model(resolved, model))
+
+
+def _openai_compatible_embedding_config(model: Optional[str] = None) -> Dict[str, object]:
+    load_env_file()
+    base_url = (os.environ.get("KB_EMBEDDING_BASE_URL") or os.environ.get("DEEPSEEK_BASE_URL") or "").rstrip("/")
+    api_key = os.environ.get("KB_EMBEDDING_API_KEY") or os.environ.get("DEEPSEEK_API_KEY") or ""
+    model_name = model or os.environ.get("KB_EMBEDDING_MODEL") or DEFAULT_OPENAI_COMPATIBLE_EMBEDDING_MODEL
+    return {
+        "model": model_name,
+        "base_url": base_url,
+        "api_key": api_key,
+        "timeout_seconds": _env_int("KB_EMBEDDING_TIMEOUT_SECONDS", DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS),
+        "configured": bool(base_url and api_key),
+        "base_url_configured": bool(base_url),
+        "api_key_configured": bool(api_key),
+        "base_url_source": _first_env_source(["KB_EMBEDDING_BASE_URL", "DEEPSEEK_BASE_URL"]),
+        "api_key_source": _first_env_source(["KB_EMBEDDING_API_KEY", "DEEPSEEK_API_KEY"]),
+    }
+
+
+def openai_compatible_embedding_status(model: Optional[str] = None) -> Dict[str, object]:
+    config = _openai_compatible_embedding_config(model=model)
+    missing = []
+    if not config["base_url_configured"]:
+        missing.append("KB_EMBEDDING_BASE_URL")
+    if not config["api_key_configured"]:
+        missing.append("KB_EMBEDDING_API_KEY")
+    return {
+        "configured": bool(config["configured"]),
+        "base_url_configured": bool(config["base_url_configured"]),
+        "api_key_configured": bool(config["api_key_configured"]),
+        "base_url_source": config["base_url_source"],
+        "api_key_source": config["api_key_source"],
+        "timeout_seconds": config["timeout_seconds"],
+        "missing_config": missing,
+    }
 
 
 def content_hash(text: str) -> str:
@@ -156,6 +256,10 @@ def build_semantic_index(
             document_jobs.append((row, text, digest))
         for batch in _batched(document_jobs, batch_size):
             vectors = _embed_batch(resolved, [text for _row, text, _digest in batch], batch_size=batch_size)
+            if len(vectors) != len(batch):
+                raise EmbeddingError(
+                    f"Embedding provider returned {len(vectors)} vectors for {len(batch)} document inputs."
+                )
             for (row, _text, digest), vector in zip(batch, vectors):
                 db.upsert_document_embedding(
                     conn,
@@ -180,6 +284,8 @@ def build_semantic_index(
             node_jobs.append((row, text, digest))
         for batch in _batched(node_jobs, batch_size):
             vectors = _embed_batch(resolved, [text for _row, text, _digest in batch], batch_size=batch_size)
+            if len(vectors) != len(batch):
+                raise EmbeddingError(f"Embedding provider returned {len(vectors)} vectors for {len(batch)} node inputs.")
             for (row, _text, digest), vector in zip(batch, vectors):
                 db.upsert_node_embedding(
                     conn,
@@ -247,7 +353,18 @@ def semantic_index_status(db_path: Path, provider: Optional[str] = None, model: 
     document_coverage = _coverage(counts["document_count"], document_total)
     node_coverage = _coverage(counts["node_count"], node_total)
     needs_rebuild = counts["document_count"] < document_total or counts["node_count"] < node_total
-    package_available = True if provider_name == "hash" else sentence_transformers_available()
+    if provider_name == "sentence-transformers":
+        package_available = sentence_transformers_available()
+        provider_status: Dict[str, object] = {"configured": package_available}
+        install_command = "" if package_available else "uv sync --extra embeddings"
+    elif provider_name == "openai-compatible":
+        package_available = True
+        provider_status = openai_compatible_embedding_status(model=model_name)
+        install_command = ""
+    else:
+        package_available = True
+        provider_status = {"configured": True}
+        install_command = ""
     return {
         "schema": "semantic_index_status.v1",
         "provider": provider_name,
@@ -255,7 +372,7 @@ def semantic_index_status(db_path: Path, provider: Optional[str] = None, model: 
         "dim": dim,
         "ready": counts["node_count"] > 0,
         "package_available": package_available,
-        "install_command": "" if package_available else "uv sync --extra embeddings",
+        "install_command": install_command,
         "document_total": document_total,
         "node_total": node_total,
         "missing_document_embeddings": max(0, document_total - counts["document_count"]),
@@ -263,6 +380,7 @@ def semantic_index_status(db_path: Path, provider: Optional[str] = None, model: 
         "document_coverage": document_coverage,
         "node_coverage": node_coverage,
         "needs_rebuild": needs_rebuild,
+        **provider_status,
         **counts,
     }
 
@@ -322,6 +440,85 @@ def sentence_transformers_available() -> bool:
         return importlib.util.find_spec("sentence_transformers") is not None
     except (ImportError, ValueError):
         return False
+
+
+def _parse_openai_embedding_vectors(payload: Any, *, expected_count: int) -> List[List[float]]:
+    if not isinstance(payload, dict):
+        raise EmbeddingError("openai-compatible embeddings response must be a JSON object.")
+    data = payload.get("data")
+    if not isinstance(data, list):
+        raise EmbeddingError("openai-compatible embeddings response missing data list.")
+    if len(data) != expected_count:
+        raise EmbeddingError(
+            f"openai-compatible embeddings response returned {len(data)} vectors for {expected_count} inputs."
+        )
+    use_indexes = all(isinstance(item, dict) and "index" in item for item in data)
+    indexed: Dict[int, List[float]] = {}
+    ordered: List[List[float]] = []
+    for position, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise EmbeddingError("openai-compatible embeddings data item must be an object.")
+        vector = _coerce_embedding_vector(item.get("embedding"), position)
+        if use_indexes:
+            try:
+                index = int(item.get("index"))
+            except (TypeError, ValueError) as exc:
+                raise EmbeddingError("openai-compatible embeddings data item has invalid index.") from exc
+            indexed[index] = vector
+        else:
+            ordered.append(vector)
+    if use_indexes:
+        expected_indexes = set(range(expected_count))
+        if set(indexed) != expected_indexes:
+            raise EmbeddingError("openai-compatible embeddings response indexes do not match inputs.")
+        ordered = [indexed[index] for index in range(expected_count)]
+    return ordered
+
+
+def _coerce_embedding_vector(raw: Any, position: int) -> List[float]:
+    if not isinstance(raw, list) or not raw:
+        raise EmbeddingError(f"openai-compatible embeddings data item {position} has an empty embedding.")
+    try:
+        return _normalize_vector(float(item) for item in raw)
+    except (TypeError, ValueError) as exc:
+        raise EmbeddingError(f"openai-compatible embeddings data item {position} has non-numeric values.") from exc
+
+
+def _read_error_detail(exc: urllib.error.HTTPError) -> str:
+    try:
+        raw = exc.read()
+    except Exception:
+        return ""
+    try:
+        return raw.decode("utf-8", errors="replace")[:500]
+    except Exception:
+        return ""
+
+
+def _redact_embedding_secret(text: str) -> str:
+    load_env_file()
+    redacted = text
+    for key in ("KB_EMBEDDING_API_KEY", "DEEPSEEK_API_KEY"):
+        secret = os.environ.get(key)
+        if secret:
+            redacted = redacted.replace(secret, "[REDACTED]")
+    return redacted
+
+
+def _first_env_source(names: List[str]) -> str:
+    for name in names:
+        if os.environ.get(name):
+            return name
+    return ""
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
 
 
 def _coverage(count: int, total: int) -> float:

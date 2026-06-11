@@ -168,6 +168,7 @@ def dispatch_command(args: Any, db_path: Path) -> None:
                     force=not args.no_force,
                     top_k=args.top_k,
                     use_llm=args.with_llm,
+                    embedding_provider=args.embedding_provider,
                     embedding_model=args.embedding_model,
                     llm_timeout_seconds=args.llm_timeout_seconds,
                     llm_stage_timeout_seconds=args.llm_stage_timeout_seconds,

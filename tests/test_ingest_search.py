@@ -13,6 +13,7 @@ import tempfile
 import time
 import types
 import unittest
+import urllib.error
 from unittest import mock
 from pathlib import Path
 
@@ -41,7 +42,13 @@ from kb_agent.benchmark import (
     run_benchmark,
 )
 from kb_agent.cli import main as cli_main
-from kb_agent.embeddings import HashEmbeddingProvider, build_semantic_index, semantic_index_status
+from kb_agent.embeddings import (
+    EmbeddingError,
+    HashEmbeddingProvider,
+    OpenAICompatibleEmbeddingProvider,
+    build_semantic_index,
+    semantic_index_status,
+)
 from kb_agent.eval import eval_facts, eval_memory, eval_review, eval_search
 from kb_agent.fact_audit import audit_facts, fact_conflict_summary, get_fact_conflicts
 from kb_agent.facts import extract_facts, fact_search, get_claims, get_entities, get_fact_graph, get_relations
@@ -65,6 +72,22 @@ from kb_agent.search import build_search_report, get_evidence, search_documents,
 from kb_agent.search_profile import apply_search_profile, get_search_profile, list_search_profiles, tune_search
 from kb_agent.tasks import COMPARE_DIMENSIONS, compare_papers, generate_review_plan, get_task_artifact
 from kb_agent.tree_search import tree_search
+
+
+class _FakeHTTPResponse:
+    def __init__(self, payload) -> None:  # type: ignore[no-untyped-def]
+        self.payload = payload
+
+    def __enter__(self):  # type: ignore[no-untyped-def]
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:  # type: ignore[no-untyped-def]
+        return False
+
+    def read(self) -> bytes:
+        if isinstance(self.payload, bytes):
+            return self.payload
+        return json.dumps(self.payload).encode("utf-8")
 
 
 class IngestSearchTest(unittest.TestCase):
@@ -788,7 +811,7 @@ class IngestSearchTest(unittest.TestCase):
                 result = run_quality_baseline(db_path, papers, use_llm=False, top_k=3)
 
             self.assertEqual(result["schema"], "quality_baseline.v1")
-            self.assertEqual(result["code_version"], "v0.35")
+            self.assertEqual(result["code_version"], "v0.36")
             self.assertTrue(result["git_commit"])
             self.assertTrue(result["feature_flags"]["review_draft_baseline"])
             self.assertTrue(result["is_current_code_baseline"])
@@ -1017,7 +1040,7 @@ class IngestSearchTest(unittest.TestCase):
                     {
                         "schema": "quality_baseline.v1",
                         "baseline_id": "older-commit",
-                        "code_version": "v0.35",
+                        "code_version": "v0.36",
                         "git_commit": "0000000000000000000000000000000000000000",
                         "feature_flags": {"review_draft_baseline": True},
                         "corpus_path": str((Path.cwd() / "articles").resolve()),
@@ -1180,6 +1203,60 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(embedding["hybrid_embedding_model"], "fake-real-model")
             self.assertFalse(embedding["embedding_rebuild_needed"])
             self.assertIn("auto", result["benchmark"]["compare_modes"])
+            benchmark_payload = json.loads(Path(result["benchmark"]["path"]).read_text(encoding="utf-8"))
+            self.assertEqual(benchmark_payload["mode_results"]["hybrid"]["fallback_rate"], 0.0)
+
+    def test_quality_baseline_uses_openai_compatible_embedding_when_requested(self) -> None:
+        def fake_urlopen(request, timeout=0):  # type: ignore[no-untyped-def]
+            del timeout
+            body = json.loads((request.data or b"{}").decode("utf-8"))
+            vectors = [{"index": index, "embedding": [1.0, 0.0, 0.0]} for index, _text in enumerate(body["input"])]
+            return _FakeHTTPResponse({"data": vectors})
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {
+                "KB_EMBEDDING_BASE_URL": "http://localhost:3000/v1",
+                "KB_EMBEDDING_API_KEY": "sk-test-secret",
+                "KB_EMBEDDING_MODEL": "bge-m3",
+            },
+            clear=False,
+        ), mock.patch("kb_agent.embeddings.urllib.request.urlopen", side_effect=fake_urlopen):
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "robot.txt").write_text(
+                "摘要：本文研究服务机器人任务规划方法。\n"
+                "关键词：服务机器人；任务规划\n\n"
+                "1 方法设计\n"
+                "本文提出技能库驱动的任务规划框架。\n\n"
+                "2 实验结果\n"
+                "实验结果表明任务成功率提升。\n",
+                encoding="utf-8",
+            )
+
+            result = run_quality_baseline(
+                db_path,
+                papers,
+                use_llm=False,
+                top_k=2,
+                embedding_provider="openai-compatible",
+                embedding_model="bge-m3",
+            )
+
+            embedding = result["embedding"]
+            self.assertEqual(embedding["openai_compatible"]["status"], "completed")
+            self.assertEqual(embedding["sentence_transformers"]["status"], "skipped")
+            self.assertEqual(embedding["real_embedding_provider"], "openai-compatible")
+            self.assertEqual(embedding["real_embedding_status"], "completed")
+            self.assertEqual(embedding["real_embedding_model"], "bge-m3")
+            self.assertEqual(embedding["real_embedding_dim"], 3)
+            self.assertEqual(embedding["real_embedding_node_coverage"], 1.0)
+            self.assertEqual(embedding["hybrid_embedding_provider"], "openai-compatible")
+            self.assertEqual(embedding["hybrid_embedding_model"], "bge-m3")
+            self.assertFalse(embedding["embedding_rebuild_needed"])
+            self.assertNotIn("sk-test-secret", json.dumps(result))
             benchmark_payload = json.loads(Path(result["benchmark"]["path"]).read_text(encoding="utf-8"))
             self.assertEqual(benchmark_payload["mode_results"]["hybrid"]["fallback_rate"], 0.0)
 
@@ -2336,6 +2413,149 @@ class IngestSearchTest(unittest.TestCase):
                     "--status",
                 ])
             self.assertIn("fake-model-v1", stdout.getvalue())
+
+    def test_openai_compatible_embedding_provider_builds_index_and_status(self) -> None:
+        def fake_urlopen(request, timeout=0):  # type: ignore[no-untyped-def]
+            body = json.loads((request.data or b"{}").decode("utf-8"))
+            self.assertEqual(request.full_url, "http://localhost:3000/v1/embeddings")
+            self.assertEqual(body["model"], "bge-m3")
+            self.assertEqual(timeout, 7)
+            vectors = [
+                {"index": index, "embedding": [1.0, 0.0, 0.0] if index % 2 == 0 else [0.0, 1.0, 0.0]}
+                for index, _text in enumerate(body["input"])
+            ]
+            return _FakeHTTPResponse({"data": vectors})
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {
+                "KB_EMBEDDING_BASE_URL": "http://localhost:3000/v1",
+                "KB_EMBEDDING_API_KEY": "sk-test-secret",
+                "KB_EMBEDDING_MODEL": "bge-m3",
+                "KB_EMBEDDING_TIMEOUT_SECONDS": "7",
+            },
+            clear=False,
+        ), mock.patch("kb_agent.embeddings.urllib.request.urlopen", side_effect=fake_urlopen):
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "robot.txt").write_text(
+                "摘要：本文研究服务机器人任务规划方法。\n\n"
+                "第一章 方法\n本文提出技能库驱动的任务规划框架。\n",
+                encoding="utf-8",
+            )
+            sync_directory(papers, db_path, doc_card_use_llm=False)
+
+            result = build_semantic_index(db_path, provider="openai-compatible", model="bge-m3", batch_size=2, force=True)
+
+            self.assertEqual(result["provider"], "openai-compatible")
+            self.assertEqual(result["model"], "bge-m3")
+            self.assertEqual(result["dim"], 3)
+            self.assertEqual(result["node_coverage"], 1.0)
+            self.assertEqual(result["document_coverage"], 1.0)
+            status = semantic_index_status(db_path, provider="openai-compatible", model="bge-m3")
+            self.assertTrue(status["ready"])
+            self.assertTrue(status["configured"])
+            self.assertTrue(status["api_key_configured"])
+            self.assertEqual(status["base_url_source"], "KB_EMBEDDING_BASE_URL")
+            self.assertNotIn("sk-test-secret", json.dumps(status))
+
+    def test_openai_compatible_embedding_provider_rejects_bad_responses(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "KB_EMBEDDING_BASE_URL": "http://localhost:3000/v1",
+                "KB_EMBEDDING_API_KEY": "sk-test-secret",
+                "KB_EMBEDDING_MODEL": "bge-m3",
+            },
+            clear=False,
+        ):
+            provider = OpenAICompatibleEmbeddingProvider("bge-m3")
+            with mock.patch(
+                "kb_agent.embeddings.urllib.request.urlopen",
+                return_value=_FakeHTTPResponse(b"{not json"),
+            ):
+                with self.assertRaisesRegex(EmbeddingError, "not valid JSON"):
+                    provider.embed_batch(["a", "b"])
+
+            with mock.patch(
+                "kb_agent.embeddings.urllib.request.urlopen",
+                return_value=_FakeHTTPResponse({"data": [{"index": 0, "embedding": [1.0, 0.0]}]}),
+            ):
+                with self.assertRaisesRegex(EmbeddingError, "returned 1 vectors for 2 inputs"):
+                    provider.embed_batch(["a", "b"])
+
+            with mock.patch(
+                "kb_agent.embeddings.urllib.request.urlopen",
+                return_value=_FakeHTTPResponse({"data": [{"index": 0, "embedding": []}]}),
+            ):
+                with self.assertRaisesRegex(EmbeddingError, "empty embedding"):
+                    provider.embed_batch(["a"])
+
+            def failing_urlopen(_request, timeout=0):  # type: ignore[no-untyped-def]
+                del timeout
+                raise urllib.error.HTTPError(
+                    "http://localhost:3000/v1/embeddings",
+                    500,
+                    "server error",
+                    hdrs=None,
+                    fp=io.BytesIO(b"bad sk-test-secret"),
+                )
+
+            with mock.patch("kb_agent.embeddings.urllib.request.urlopen", side_effect=failing_urlopen):
+                with self.assertRaises(EmbeddingError) as ctx:
+                    provider.embed_batch(["a"])
+                self.assertIn("[REDACTED]", str(ctx.exception))
+                self.assertNotIn("sk-test-secret", str(ctx.exception))
+
+    def test_hybrid_search_uses_openai_compatible_vector_candidates(self) -> None:
+        def fake_urlopen(request, timeout=0):  # type: ignore[no-untyped-def]
+            del timeout
+            body = json.loads((request.data or b"{}").decode("utf-8"))
+            data = []
+            for index, text in enumerate(body["input"]):
+                if "目标节点" in text or "语义查询" in text:
+                    embedding = [1.0, 0.0]
+                else:
+                    embedding = [0.0, 1.0]
+                data.append({"index": index, "embedding": embedding})
+            return _FakeHTTPResponse({"data": data})
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {
+                "KB_EMBEDDING_PROVIDER": "openai-compatible",
+                "KB_EMBEDDING_BASE_URL": "http://localhost:3000/v1",
+                "KB_EMBEDDING_API_KEY": "sk-test-secret",
+                "KB_EMBEDDING_MODEL": "bge-m3",
+            },
+            clear=False,
+        ), mock.patch("kb_agent.embeddings.urllib.request.urlopen", side_effect=fake_urlopen):
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "target.txt").write_text(
+                "摘要：本文提出目标节点方法，用于机器人协同规划。\n\n"
+                "第一章 方法\n目标节点方法通过共享任务图完成协作。\n",
+                encoding="utf-8",
+            )
+            (papers / "other.txt").write_text(
+                "摘要：本文研究普通调度规则。\n\n第一章 方法\n普通调度规则依赖人工配置。\n",
+                encoding="utf-8",
+            )
+            sync_directory(papers, db_path, doc_card_use_llm=False)
+            build_semantic_index(db_path, provider="openai-compatible", model="bge-m3", force=True)
+
+            results = search_nodes(db_path, "语义查询", top_k=2, search_mode="hybrid")
+            report = build_search_report(db_path, "语义查询", top_k=2, search_mode="hybrid")
+
+            self.assertGreaterEqual(len(results), 1)
+            self.assertIn("target", results[0].path)
+            self.assertIn("vector", results[0].rank_reason)
+            self.assertNotIn("missing_embedding_index", report["warnings"])
+            self.assertEqual(report["embedding_status"]["provider"], "openai-compatible")
 
     def test_hybrid_search_falls_back_without_embedding_index(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -891,6 +891,38 @@ uv run --extra pdf python -m kb_agent.cli quality-baseline articles --top-k 3
 uv run python -m kb_agent.cli latest-quality-baseline --real-only --limit 1
 ```
 
+## v0.36 BGE-M3 真实 Embedding 接入
+
+v0.36 将已验证可用的 `bge-m3` 接入为 OpenAI-compatible 远程 embedding provider。provider 名称为 `openai-compatible`，默认模型为 `bge-m3`；向量继续写入现有 SQLite `provider/model/vector_json` 字段，不新增数据库 schema。`search`、`docs` 和 `search-report` 不新增参数，仍通过 `KB_EMBEDDING_PROVIDER` 选择 hybrid 使用的向量 provider。
+
+推荐配置：
+
+```text
+KB_EMBEDDING_PROVIDER=openai-compatible
+KB_EMBEDDING_BASE_URL=http://your-openai-compatible-gateway/v1
+KB_EMBEDDING_API_KEY=sk-your-key-here
+KB_EMBEDDING_MODEL=bge-m3
+KB_EMBEDDING_TIMEOUT_SECONDS=45
+```
+
+如果没有配置 `KB_EMBEDDING_BASE_URL` 或 `KB_EMBEDDING_API_KEY`，系统会回退读取 `DEEPSEEK_BASE_URL` / `DEEPSEEK_API_KEY`。报告和错误信息只显示配置状态，不保存或打印 API key。endpoint 固定拼接为 `{base_url}/embeddings`，因此 base URL 应填写到 `/v1`，不要再追加 `/embeddings`。
+
+轻量真实验收：
+
+```bash
+KB_EMBEDDING_PROVIDER=openai-compatible KB_EMBEDDING_MODEL=bge-m3 uv run python -m kb_agent.cli embed --provider openai-compatible --model bge-m3 --status
+KB_EMBEDDING_PROVIDER=openai-compatible KB_EMBEDDING_MODEL=bge-m3 uv run python -m kb_agent.cli embed --provider openai-compatible --model bge-m3 --force
+KB_EMBEDDING_PROVIDER=openai-compatible KB_EMBEDDING_MODEL=bge-m3 uv run python -m kb_agent.cli search-report "任务规划方法" --search-mode hybrid --top-k 3
+```
+
+如果要把 BGE-M3 纳入 baseline，可显式指定：
+
+```bash
+uv run --extra pdf python -m kb_agent.cli quality-baseline articles --embedding-provider openai-compatible --embedding-model bge-m3 --top-k 3
+```
+
+`bge_reranker` 当前不作为 v0.36 的硬依赖；如果远程 `/rerank` 服务不可用，检索链路仍保持 FTS + embedding hybrid 兜底。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
