@@ -1,44 +1,41 @@
 ---
 name: paper-qa
-description: 在候选论文中执行树搜索、证据抽取与可追溯问答。
+description: 证据优先论文问答 workflow；用于回答单篇或多篇论文中的具体问题，并要求返回可追溯证据。
 ---
 
-使用步骤：
+# Paper QA Workflow
 
-1. 先调用 `kb_search_docs` 获取候选文档；默认使用 hybrid，若需要复现旧行为则传入 `search_mode="fts"`。
-2. 如果 hybrid 缺少 embedding 或检索效果差，先调用 `kb_build_semantic_index`，再重新检索。
-3. 若问题依赖解析可靠性，先调用 `kb_get_parse_quality`、`kb_get_parse_report` 和 `kb_get_layout_blocks` 查看质量等级、解析链、fallback warning 和版面块数量；涉及图表时追加 `kb_get_figures` 或 `kb_get_tables`，涉及实验指标、性能对比或表格结论时追加 `kb_get_table_content` 和 `kb_get_table_summaries`。
-4. 若问题涉及创新点、引用关系、局限性或综述准备，先调用 `kb_extract_doc_insights`，再读取 `kb_get_innovations` / `kb_get_citation_map`。
-5. 若需要结构化事实、方法实体、指标实体、表格指标或跨论文事实复盘，调用 `kb_extract_facts`，再读取 `kb_get_claims` / `kb_get_entities` / `kb_get_relations` / `kb_get_fact_graph`，或用 `kb_fact_search` 搜索事实层；只看表格事实时给 `kb_fact_search` 传入 `source="table"`。
-6. 若需要判断事实层可信度，调用 `kb_audit_facts` 和 `kb_get_fact_conflicts`，只使用其中的冲突数量、fact_id、node_id、warning 和建议动作。
-7. 若需要复盘 claim/entity/relation 的证据链，调用 `kb_build_knowledge_graph`，再用 `kb_get_graph_neighborhood` 查看相关 claim、entity、relation、conflict 和 evidence 节点；图谱只用于导航。
-8. 对普通内容问答，先调用 `kb_classify_query`，再调用 `kb_tree_search` 定位章节、段落或图表节点；如果只需要旧版扁平节点结果，再调用 `kb_search_tree`。
-9. 调用 `kb_get_evidence` 获取 evidence packet。
-10. 对跨论文比较，调用 `kb_compare` 并读取比较矩阵中的 evidence。
-11. 对综述草稿，调用 `kb_generate_review`、`kb_draft_review`、`kb_check_review_citations`，必要时再 `kb_assemble_review`。
-12. 仅基于 evidence packet、事实层 evidence ID、论文理解工件或任务工件中的 evidence 字段回答。
-13. 若证据不足，明确说明不足，不要补写没有来源的结论。
-14. 如果用户要求复盘质量，调用 `kb_get_query_stats` 或 `kb_eval_search`；如果是综述任务，调用 `kb_eval_review`；如果复盘事实层或表格指标可靠性，调用 `kb_eval_facts` 或 `kb_audit_facts`。
-15. 如果用户指出某次结果正确、错误、证据不足或检索遗漏，调用 `kb_put_feedback` 记录评分、标签、期望 doc/node/keyword 和短评论。
-16. 需要沉淀评测集时，调用 `kb_build_eval_set_from_feedback`，再用 `kb_eval_search` 比较 `hybrid/tree/fts`。
-17. 需要复盘趋势时，调用 `kb_eval_dashboard`，只使用其中的统计、warning 和建议动作。
-18. 需要调优检索策略时，调用 `kb_tune_search`，保存 profile 后再调用 `kb_apply_search_profile`；只有用户要求或任务明确需要时，才传入 `search_mode="auto"`。
-19. 需要验证 PageIndex-like 树检索是否优于扁平检索时，调用 `kb_create_eval_suite`、`kb_run_benchmark`、`kb_analyze_failures` 和 `kb_generate_case_study`；报告只用于复盘，不作为论文内容证据。
-20. 需要判断真实论文集整体质量时，调用 `kb_run_quality_baseline`，再根据报告中的 parser、embedding、benchmark、task、memory 和 claim graph 建议动作继续处理。
+## 适用场景
 
-输出要求：
+用户询问论文内容、方法、实验、局限、引用或跨论文事实时使用。若用户要生成综述、比较矩阵或质量报告，改用对应 workflow。
+
+## 必调工具顺序
+
+1. `kb_search_docs`：路由候选论文，默认 `search_mode="hybrid"`；用户要求树检索或证据更强时可用 `search_mode="tree"`。
+2. `kb_classify_query`：判断 query intent，决定是否偏向方法、实验、局限、引用或比较。
+3. `kb_tree_search`：在候选 doc 内找章节、段落、图表或表格证据节点。
+4. `kb_get_evidence`：读取最终 evidence packet。
+5. `kb_answer`：只基于 evidence 生成回答；证据不足时必须说明不足。
+
+## 可选工具
+
+- `kb_get_parse_quality` / `kb_get_parse_report`：当证据质量可疑、PDF 弱解析或用户问高风险结论时调用。
+- `kb_get_claim_frames` / `kb_verify_claim_frames`：当问题需要主张级证据链、方法贡献或实验结论时调用。
+- `kb_get_table_content` / `kb_get_table_summaries`：当问题涉及指标、实验表格或性能对比时调用。
+
+## 停止条件
+
+- 至少拿到一个带 `doc_id`、`node_id`、`node_path` 或 `page_range` 的证据来源后再回答。
+- 如果没有足够证据，停止生成结论，改为说明缺口和建议下一步检索。
+
+## 输出要求
 
 - 简要回答用户问题。
-- 列出关键证据来源，包括文档标题、章节路径和节点 ID。
-- 对创新点、实验结论、局限性等高风险结论标注不确定性。
-- 若使用 `innovation.json` 或 `citation_map.json`，说明工件状态是 `extracted` 还是 `partial`。
-- 若使用 `claims.json`、`entities.json`、`relations.json` 或 `fact_graph.json`，说明事实层状态、`source_kind` 和 evidence 绑定情况；表格事实需要说明 table_id 与置信度。
-- 若使用 fact audit 或 fact conflicts，说明它们只是事实层风险提示，正式结论仍需回到 evidence packet。
-- 若使用 Claim Graph，说明 graph_id、冲突数、孤立事实数和邻域节点 ID；正式结论仍需回到 evidence packet。
-- 若解析质量是 `weak` 或 `fallback_used` 为 true，说明证据可能受解析质量影响。
-- 若出现 `page_only_tree`、`weak_layout_blocks` 或图表 caption 缺失，建议用户用 Docling 重新同步后再做高风险结论。
-- 若使用综述草稿，说明 `citation_check.json` 中是否存在 missing refs 或 unsupported paragraphs。
-- 不把论文正文、长 excerpt、evidence packet 或草稿正文写入反馈、日志或 memory。
-- 若使用 `auto` 检索，说明 active profile 名称和实际 resolved search mode。
-- 若引用 benchmark 或 case-study 结果，只说明指标、ID、warning 和建议动作，不复述其中的检索正文。
-- 若引用 quality baseline，只说明 baseline_id、报告路径、指标、warning 和建议动作，不复述论文正文或 evidence 内容。
+- 列出关键证据来源：文档标题、章节路径、节点 ID、页码范围。
+- 对创新点、实验结果、局限性等高风险结论标注不确定性。
+- 若使用 ClaimFrame，说明 `support_status`、`trace_status` 和相关 `evidence_unit_ids`。
+
+## 禁止事项
+
+- 不基于聊天记忆或模型常识补写论文结论。
+- 不把论文正文、长 excerpt、完整 evidence packet 或完整 prompt 写入 memory、feedback、query log 或报告摘要。

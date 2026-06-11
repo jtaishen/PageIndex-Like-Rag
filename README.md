@@ -1033,6 +1033,20 @@ uv run python -m compileall -q kb_agent
 git diff --check
 ```
 
+## v0.42 OpenCode MCP Workflow 固化
+
+v0.42 将 OpenCode 侧的 MCP 使用方式从单一超长工具清单，整理为按任务类型选择的固定 workflow。每个 workflow 都写在 `.opencode/skills/` 中，包含适用场景、必调工具顺序、可选工具、停止条件、输出要求和禁止事项。
+
+本轮不改 MCP 工具名、数据库 schema、CLI 参数或核心算法。OpenCode agent 后续应先判断任务类型，再选择 `ingest-papers`、`paper-qa`、`paper-insight`、`compare-papers`、`review-writing`、`quality-review`、`task-resume` 或 `memory-hygiene`。任务恢复 workflow 会接入 v0.41 的 `memory_compile_context`，优先从任务工件与长期偏好编译短上下文包。
+
+轻量验收命令：
+
+```bash
+uv run python -m unittest discover -s tests -p 'test_opencode_workflows.py' -v
+uv run python -m unittest discover -s tests
+git diff --check
+```
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
@@ -1125,30 +1139,36 @@ DeepSeek 官方 OpenCode 接入方式：
 
 ## OpenCode 使用方式
 
-`.opencode/skills/paper-qa/SKILL.md` 约束 agent 先检索文档、再检索树节点、最后只基于 evidence packet 回答。
-
-推荐工具调用顺序：
+OpenCode 配置见 [opencode.json](/Users/jtai/Desktop/PageIndex-Like-Rag/opencode.json)，其中 `paper-kb` MCP server 已配置为：
 
 ```text
-kb_sync -> kb_build_semantic_index -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_get_layout_blocks -> kb_get_figures -> kb_get_tables -> kb_get_table_content -> kb_get_table_summaries -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_extract_facts -> kb_extract_evidence_units -> kb_get_evidence_units -> kb_extract_claim_frames -> kb_get_claim_frames -> kb_verify_claim_frames -> kb_get_claims -> kb_get_entities -> kb_get_relations -> kb_get_fact_graph -> kb_fact_search -> kb_audit_facts -> kb_get_fact_conflicts -> kb_build_knowledge_graph -> kb_get_graph_neighborhood -> kb_run_quality_baseline -> kb_get_latest_quality_baseline -> kb_classify_query -> kb_tree_search -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> kb_eval_search -> kb_eval_review -> kb_eval_memory -> kb_eval_facts -> kb_create_eval_suite -> kb_run_benchmark -> kb_analyze_failures -> kb_generate_case_study -> kb_get_query_stats -> memory_resume_task -> memory_compile_context -> memory_remember_task -> kb_get_task_artifact
+uv run --extra mcp python -m kb_agent.mcp_server
 ```
 
-当用户明确指出某次结果好坏时，推荐追加：
+`.opencode/skills/` 将 MCP 工具整理成固定 workflow，OpenCode 应按任务类型选择 skill，而不是从完整工具清单中自由拼接。
+
+| 任务类型 | 触发意图示例 | Skill | 主要 MCP 工具链 | 输出结果 |
+| --- | --- | --- | --- | --- |
+| 入库与质量检查 | “同步这些论文”“检查 PDF 解析质量” | `ingest-papers` | `kb_sync -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_get_layout_blocks` | 同步结果、解析质量、重解析建议 |
+| 证据优先问答 | “这篇论文的方法是什么”“有没有实验指标” | `paper-qa` | `kb_search_docs -> kb_classify_query -> kb_tree_search -> kb_get_evidence -> kb_answer` | 带文档、章节、节点和页码的回答 |
+| 单篇论文理解 | “提炼这篇论文创新点”“抽取主张证据链” | `paper-insight` | `kb_get_doc_card -> kb_extract_doc_insights -> kb_extract_facts -> kb_extract_evidence_units -> kb_extract_claim_frames -> kb_verify_claim_frames` | doc card、innovation、citation、facts、EvidenceUnit、ClaimFrame、Verifier |
+| 跨论文比较 | “比较这些论文的方法差异” | `compare-papers` | `kb_search_docs -> kb_extract_facts -> kb_extract_claim_frames -> kb_verify_claim_frames -> kb_compare -> kb_audit_facts` | 比较矩阵、证据覆盖、事实风险和 open questions |
+| 综述写作 | “生成综述提纲和草稿” | `review-writing` | `kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> kb_get_task_artifact` | review task、章节草稿、引用检查、总稿路径、修订动作 |
+| 质量复盘 | “评估检索质量”“跑真实 baseline” | `quality-review` | `kb_create_eval_suite -> kb_run_benchmark -> kb_run_quality_baseline -> kb_eval_dashboard -> kb_get_latest_quality_baseline` | benchmark、baseline、dashboard、warning 和 next actions |
+| 任务恢复与记忆 | “继续上次综述任务”“保存当前进度” | `task-resume` / `memory-hygiene` | `memory_resume_task -> memory_compile_context -> kb_get_task_artifact -> memory_remember_task -> memory_compact` | task_id、短上下文包、任务状态、缺口、建议命令和压缩任务记忆 |
+
+所有 workflow 都遵守 evidence-first：正式结论必须回到 evidence packet、EvidenceUnit、ClaimFrame 或任务工件中的 evidence 字段。论文正文、长 excerpt、完整 evidence、完整 prompt、API key 和综述正文不能写入长期 memory、query log、feedback 或普通报告摘要。
+
+当用户明确指出某次结果好坏时，可追加：
 
 ```text
 kb_get_query_log -> kb_put_feedback -> kb_build_eval_set_from_feedback -> kb_eval_search -> kb_eval_dashboard
 ```
 
-调优检索策略时，推荐追加：
+调优检索策略时，可追加：
 
 ```text
 kb_build_eval_set_from_feedback -> kb_eval_search -> kb_tune_search -> kb_apply_search_profile -> search_mode="auto"
-```
-
-验证 PageIndex-like 树检索是否有效时，推荐追加：
-
-```text
-kb_create_eval_suite -> kb_run_benchmark -> kb_analyze_failures -> kb_generate_case_study -> kb_eval_dashboard
 ```
 
 ## 测试
