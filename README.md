@@ -963,6 +963,22 @@ uv run python -m kb_agent.cli search-report "任务规划方法" --search-mode h
 
 `quality-baseline` 会额外记录 `claim_frame_count`、`verified_frame_rate`、`unsupported_frame_count` 和 `missing_evidence_unit_count`。完整 baseline 仍按需手动运行，不作为每次提交的硬要求。
 
+## v0.39 ClaimFrame 质量收敛与证据链降噪
+
+v0.39 不新增数据库 schema，也不扩展前端或 reranker 链路，重点收敛 v0.38 主链质量。ClaimFrame 生成会为每个 frame 写入短字段 `quality_score`、`frame_quality`、`noise_reasons` 和 `support_reason`，用于识别 front matter、路径碎片、重复图表 caption、参考文献元信息和无证据弱来源。
+
+`search-report` 的 `claim_frame_matches` 会优先返回 supported 且高质量的 ClaimFrame，并展示 `matched_fields`、`selection_reasons`、`quality_score`、`support_status` 和 `fallback_reason`。低质量或 unsupported frame 默认不会进入普通方法/结果查询的 top matches；当查询明确涉及局限、风险、未支持、验证或证据问题时才会作为弱候选参与解释。
+
+Doc Card 规则摘要和 ClaimFrame 共用轻量文本清洗规则，减少期刊页眉、网络首发、ISSN/CN、引用格式、DOI 和重复 caption 对 `description`、`method_summary`、`innovation_summary` 的污染。`quality-baseline` 和 `latest-quality-baseline` 会额外展示 `low_quality_frame_count`、`noisy_frame_count`、`ignored_noise_frame_count` 和 `top_frame_noise_reasons`。
+
+轻量验收命令：
+
+```bash
+uv run python -m kb_agent.cli extract-facts <doc_id> --force --no-llm
+uv run python -m kb_agent.cli verify-claim-frames --doc-id <doc_id>
+uv run python -m kb_agent.cli search-report "任务规划方法" --search-mode hybrid --top-k 3
+```
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：

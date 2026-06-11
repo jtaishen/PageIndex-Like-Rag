@@ -144,6 +144,11 @@ def extract_facts(
         artifacts["fact_report"]["claim_frame_count"] = (claim_frame_result.get("claim_frames") or {}).get("count", 0)
         verifier = claim_frame_result.get("verifier") or {}
         artifacts["fact_report"]["verified_frame_rate"] = verifier.get("verified_frame_rate", 0.0)
+        artifacts["fact_report"]["unsupported_frame_count"] = verifier.get("unsupported_frame_count", 0)
+        artifacts["fact_report"]["low_quality_frame_count"] = verifier.get("low_quality_frame_count", 0)
+        artifacts["fact_report"]["noisy_frame_count"] = verifier.get("noisy_frame_count", 0)
+        artifacts["fact_report"]["ignored_noise_frame_count"] = verifier.get("ignored_noise_frame_count", 0)
+        artifacts["fact_report"]["top_frame_noise_reasons"] = verifier.get("top_frame_noise_reasons", [])
         write_json(artifact_dir / "fact_report.json", artifacts["fact_report"])
     except Exception as exc:
         artifacts["fact_report"]["warnings"] = _unique_strings(

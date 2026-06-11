@@ -811,9 +811,10 @@ class IngestSearchTest(unittest.TestCase):
                 result = run_quality_baseline(db_path, papers, use_llm=False, top_k=3)
 
             self.assertEqual(result["schema"], "quality_baseline.v1")
-            self.assertEqual(result["code_version"], "v0.38")
+            self.assertEqual(result["code_version"], "v0.39")
             self.assertTrue(result["git_commit"])
             self.assertTrue(result["feature_flags"]["review_draft_baseline"])
+            self.assertTrue(result["feature_flags"]["claim_frame_quality_filtering"])
             self.assertTrue(result["is_current_code_baseline"])
             self.assertEqual(result["baseline_stale_reason"], "")
             self.assertEqual(result["doc_count"], 2)
@@ -821,6 +822,8 @@ class IngestSearchTest(unittest.TestCase):
             self.assertFalse(result["is_real_corpus"])
             self.assertTrue(result["corpus_fingerprint"])
             self.assertEqual(result["fact_audit_delta"]["schema"], "fact_audit_delta.v1")
+            self.assertIn("low_quality_frame_count", result["claim_frame_verification"])
+            self.assertIn("top_frame_noise_reasons", result["claim_frame_verification"])
             self.assertTrue(Path(result["json_path"]).exists())
             self.assertTrue(Path(result["md_path"]).exists())
             self.assertTrue(Path(result["html_path"]).exists())
@@ -1006,6 +1009,40 @@ class IngestSearchTest(unittest.TestCase):
             self.assertIn("deepseek_summary_failed:request_failed", card["summary_warnings"])
             self.assertIn("模型失败", card["method_summary"])
 
+    def test_doc_card_rule_summary_filters_front_matter_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            papers = root / "papers"
+            papers.mkdir()
+            db_path = root / "kb.sqlite"
+            (papers / "noise.txt").write_text(
+                "网络首发时间：2026-01-01 ISSN 1000-0000 CN 11-0000 引用格式：某某. 任务规划研究[J].\n"
+                "基金项目：示例基金。DOI: 10.0000/example\n\n"
+                "摘要：本文研究服务机器人任务规划方法，解决任务分解和工具调用问题。\n"
+                "关键词：任务规划；服务机器人\n\n"
+                "1 方法设计\n"
+                "本文提出结合大语言模型和技能库的任务规划框架，支持复杂任务分解。\n\n"
+                "2 创新点\n"
+                "系统将工具调用约束和任务状态反馈统一到可验证的规划链路。\n\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch("kb_agent.ingest.get_llm_settings", return_value=None):
+                report = sync_directory(papers, db_path)
+
+            self.assertEqual(report["indexed"], 1)
+            doc_id = str(search_documents(db_path, "服务机器人任务规划", top_k=1)[0]["doc_id"])
+            card = get_doc_card(db_path, doc_id)
+            combined = " ".join(
+                str(card.get(field) or "")
+                for field in ("description", "method_summary", "innovation_summary", "limitation_summary")
+            )
+            self.assertIn("任务规划", card["description"])
+            self.assertIn("任务规划框架", card["method_summary"])
+            self.assertNotIn("网络首发", combined)
+            self.assertNotIn("ISSN", combined.upper())
+            self.assertNotIn("引用格式", combined)
+
     def test_latest_quality_baseline_marks_old_reports_stale(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1040,7 +1077,7 @@ class IngestSearchTest(unittest.TestCase):
                     {
                         "schema": "quality_baseline.v1",
                         "baseline_id": "older-commit",
-                        "code_version": "v0.38",
+                        "code_version": "v0.39",
                         "git_commit": "0000000000000000000000000000000000000000",
                         "feature_flags": {"review_draft_baseline": True},
                         "corpus_path": str((Path.cwd() / "articles").resolve()),

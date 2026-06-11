@@ -54,6 +54,15 @@ class CliSummariesTest(unittest.TestCase):
                     "budget_exhausted": True,
                 },
                 "warnings": ["llm_timeout"],
+                "claim_frame_verification": {
+                    "frame_count": 4,
+                    "verified_frame_rate": 0.75,
+                    "unsupported_frame_count": 1,
+                    "low_quality_frame_count": 2,
+                    "noisy_frame_count": 1,
+                    "ignored_noise_frame_count": 1,
+                    "top_frame_noise_reasons": ["front_matter"],
+                },
             }
         )
 
@@ -63,6 +72,8 @@ class CliSummariesTest(unittest.TestCase):
         self.assertEqual(result["llm_timeout_count"], 2)
         self.assertEqual(result["llm_hard_timeout_count"], 1)
         self.assertTrue(result["llm_budget_exhausted"])
+        self.assertEqual(result["low_quality_frame_count"], 2)
+        self.assertEqual(result["top_frame_noise_reasons"], ["front_matter"])
         self.assertEqual(result["warning_count"], 1)
 
     def test_eval_summary_names_are_public_and_consistent(self) -> None:

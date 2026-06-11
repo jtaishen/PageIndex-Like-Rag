@@ -7,8 +7,22 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from . import db
-from .artifacts import get_artifact, get_citation_map, get_doc_card, list_artifacts
+from .artifacts import get_artifact, get_doc_card, list_artifacts
+from .claim_frame_quality import (
+    LOW_FRAME_QUALITY_SCORE,
+    MIN_FRAME_QUALITY_SCORE,
+    existing_frame_quality,
+    frame_fallback_reason,
+    frame_quality,
+    frame_quality_summary,
+    frame_selection_reasons,
+    query_allows_weak_frames,
+    should_skip_low_quality_frame,
+    top_frame_noise_reasons,
+    top_noise_reasons,
+)
 from .llm import LLMError, generate_json_object, llm_payload_metadata
+from .text_quality import short_research_text
 from .utils import compact_whitespace, excerpt as _excerpt, stable_id, unique_strings as _unique_strings, write_json
 
 
@@ -249,6 +263,8 @@ def claim_frame_summary_for_doc(db_path: Path, doc_id: str) -> Dict[str, Any]:
                 "claim_type": item.get("claim_type"),
                 "short_claim": item.get("short_claim"),
                 "support_status": item.get("support_status"),
+                "quality_score": item.get("quality_score", 0.0),
+                "frame_quality": item.get("frame_quality", ""),
                 "evidence_unit_ids": item.get("evidence_unit_ids") or [],
                 "confidence": item.get("confidence"),
             }
@@ -284,22 +300,29 @@ def search_claim_frames(
         for frame in frames_payload.get("frames") or []:
             if not isinstance(frame, dict):
                 continue
-            score = _frame_match_score(frame, terms)
+            verifier_item = verified_by_id.get(str(frame.get("frame_id") or "")) or {}
+            support_status = str(verifier_item.get("support_status") or frame.get("support_status") or "")
+            score = _frame_match_score(frame, terms, query=query, support_status=support_status)
             if score <= 0:
                 continue
-            verifier_item = verified_by_id.get(str(frame.get("frame_id") or "")) or {}
             items.append(
                 {
                     "frame_id": frame.get("frame_id"),
                     "doc_id": frame.get("doc_id"),
                     "claim_type": frame.get("claim_type"),
                     "short_claim": frame.get("short_claim"),
-                    "support_status": verifier_item.get("support_status") or frame.get("support_status"),
+                    "support_status": support_status,
+                    "support_reason": verifier_item.get("support_reason") or frame.get("support_reason", ""),
                     "evidence_unit_ids": frame.get("evidence_unit_ids") or [],
                     "source_claim_ids": frame.get("source_claim_ids") or [],
                     "confidence": frame.get("confidence"),
+                    "quality_score": frame.get("quality_score", 0.0),
+                    "frame_quality": frame.get("frame_quality", ""),
+                    "noise_reasons": frame.get("noise_reasons") or [],
                     "score": round(score, 3),
                     "matched_fields": _matched_frame_fields(frame, terms),
+                    "selection_reasons": frame_selection_reasons(frame, support_status),
+                    "fallback_reason": frame_fallback_reason(frame, support_status, query),
                     "warnings": _unique_strings([*(frame.get("warnings") or []), *(verifier_item.get("warnings") or [])]),
                 }
             )
@@ -515,16 +538,22 @@ def _frame_record(
     problem: str = "",
     method: str = "",
 ) -> Dict[str, Any]:
-    short_claim = _excerpt(text, MAX_CLAIM_CHARS)
+    short_claim = short_research_text(text, MAX_CLAIM_CHARS)
     if not short_claim:
         return {}
     inferred = _infer_frame_fields(short_claim, claim_type)
     if problem:
-        inferred["problem"] = _excerpt(problem, 180)
+        inferred["problem"] = short_research_text(problem, 180)
     if method:
-        inferred["method"] = _excerpt(method, 180)
+        inferred["method"] = short_research_text(method, 180)
     clean_evidence = _unique_strings(evidence_unit_ids)
+    quality = frame_quality(short_claim, clean_evidence, source=source, claim_type=claim_type, confidence=confidence)
+    if should_skip_low_quality_frame(source, clean_evidence, quality):
+        return {}
     warnings = [] if clean_evidence else ["missing_evidence_unit"]
+    warnings.extend(f"noise:{reason}" for reason in quality["noise_reasons"])
+    if quality["quality_score"] < LOW_FRAME_QUALITY_SCORE:
+        warnings.append("low_quality_frame")
     return {
         "frame_id": stable_id("cf", version_id, claim_type, short_claim, ",".join(clean_evidence), index, length=14),
         "doc_id": doc_id,
@@ -542,6 +571,10 @@ def _frame_record(
         "source": source,
         "confidence": round(confidence, 3),
         "support_status": "supported" if clean_evidence else "unsupported",
+        "support_reason": "evidence_units_bound" if clean_evidence else "missing_evidence_unit",
+        "quality_score": quality["quality_score"],
+        "frame_quality": quality["frame_quality"],
+        "noise_reasons": quality["noise_reasons"],
         "warnings": warnings,
     }
 
@@ -595,11 +628,21 @@ def _enhance_frames_with_llm(
         if not frame:
             continue
         for field in ("problem", "method", "dataset_or_setting", "metric_or_signal", "result_or_gain", "limitation"):
-            value = compact_whitespace(str(raw.get(field) or ""))
+            value = short_research_text(raw.get(field), 180)
             if value:
-                frame[field] = _excerpt(value, 180)
+                frame[field] = value
         if raw.get("confidence") is not None:
             frame["confidence"] = round(max(0.0, min(1.0, _confidence(raw.get("confidence"), frame.get("confidence", 0.6)))), 3)
+        quality = frame_quality(
+            str(frame.get("short_claim") or ""),
+            [str(item) for item in frame.get("evidence_unit_ids") or []],
+            source=str(frame.get("source") or ""),
+            claim_type=str(frame.get("claim_type") or ""),
+            confidence=_confidence(frame.get("confidence"), 0.6),
+        )
+        frame["quality_score"] = quality["quality_score"]
+        frame["frame_quality"] = quality["frame_quality"]
+        frame["noise_reasons"] = quality["noise_reasons"]
         frame["warnings"] = _unique_strings([*(frame.get("warnings") or []), *[str(item) for item in raw.get("warnings") or []]])
     return list(by_id.values()), llm_payload_metadata(payload)
 
@@ -619,6 +662,9 @@ def _verify_claim_frames_payload(
     verified_count = 0
     unsupported_count = 0
     low_confidence_count = 0
+    low_quality_count = 0
+    noisy_count = 0
+    ignored_noise_count = 0
     missing_unit_count = 0
     missing_node_count = 0
     citation_gap_count = 0
@@ -629,6 +675,15 @@ def _verify_claim_frames_payload(
         evidence_unit_ids = _unique_strings(frame.get("evidence_unit_ids") or [])
         existing_units = [unit_by_id[unit_id] for unit_id in evidence_unit_ids if unit_id in unit_by_id]
         missing_units = [unit_id for unit_id in evidence_unit_ids if unit_id not in unit_by_id]
+        computed_quality = existing_frame_quality(frame, evidence_unit_ids)
+        quality_score = _confidence(computed_quality.get("quality_score"), 0.6)
+        noise_reasons = _unique_strings(computed_quality.get("noise_reasons") or [])
+        if quality_score < LOW_FRAME_QUALITY_SCORE:
+            low_quality_count += 1
+            warnings.append("low_quality_frame")
+        if noise_reasons:
+            noisy_count += 1
+            warnings.extend(f"noise:{reason}" for reason in noise_reasons)
         if missing_units:
             missing_unit_count += len(missing_units)
             warnings.append("missing_evidence_unit")
@@ -649,11 +704,18 @@ def _verify_claim_frames_payload(
             warnings.append("citation_frame_without_citation_map")
         if existing_units and not missing_units and not missing_nodes:
             support_status = "supported"
+            support_reason = "evidence_units_verified"
             verified_count += 1
         elif existing_units:
             support_status = "partial"
+            support_reason = "partial_evidence_unit_match"
+        elif quality_score < MIN_FRAME_QUALITY_SCORE or noise_reasons:
+            support_status = "ignored_noise"
+            support_reason = "low_quality_or_noise_without_evidence"
+            ignored_noise_count += 1
         else:
             support_status = "unsupported"
+            support_reason = "no_evidence_unit_found"
             unsupported_count += 1
             warnings.append("unsupported_frame")
         items.append(
@@ -661,10 +723,14 @@ def _verify_claim_frames_payload(
                 "frame_id": frame.get("frame_id"),
                 "claim_type": frame.get("claim_type"),
                 "support_status": support_status,
+                "support_reason": support_reason,
                 "evidence_unit_count": len(existing_units),
                 "missing_evidence_unit_ids": missing_units,
                 "missing_node_ids": _unique_strings(missing_nodes),
                 "confidence": frame.get("confidence"),
+                "quality_score": round(quality_score, 3),
+                "frame_quality": computed_quality.get("frame_quality", ""),
+                "noise_reasons": noise_reasons,
                 "warnings": _unique_strings(warnings),
             }
         )
@@ -676,6 +742,10 @@ def _verify_claim_frames_payload(
         warnings.append("missing_evidence_units")
     if low_confidence_count:
         warnings.append("low_confidence_claim_frames")
+    if low_quality_count:
+        warnings.append("low_quality_claim_frames")
+    if ignored_noise_count:
+        warnings.append("ignored_noise_claim_frames")
     if citation_gap_count:
         warnings.append("citation_frame_gaps")
     return {
@@ -688,9 +758,14 @@ def _verify_claim_frames_payload(
         "verified_frame_rate": round(verified_count / max(1, frame_count), 4),
         "unsupported_frame_count": unsupported_count,
         "low_confidence_frame_count": low_confidence_count,
+        "low_quality_frame_count": low_quality_count,
+        "noisy_frame_count": noisy_count,
+        "ignored_noise_frame_count": ignored_noise_count,
         "missing_evidence_unit_count": missing_unit_count,
         "missing_node_count": missing_node_count,
         "citation_gap_count": citation_gap_count,
+        "quality_summary": frame_quality_summary(claim_frames.get("frames") or []),
+        "top_frame_noise_reasons": top_frame_noise_reasons(claim_frames.get("frames") or []),
         "items": items,
         "warnings": warnings,
         "created_at": time.time(),
@@ -716,6 +791,10 @@ def _claim_frames_payload(
         "count": len(frames),
         "evidence_unit_count": evidence_unit_count,
         "claim_type_counts": _count_by_field(frames, "claim_type"),
+        "quality_summary": frame_quality_summary(frames),
+        "noisy_frame_count": sum(1 for frame in frames if frame.get("noise_reasons")),
+        "low_quality_frame_count": sum(1 for frame in frames if _confidence(frame.get("quality_score"), 0.6) < LOW_FRAME_QUALITY_SCORE),
+        "top_frame_noise_reasons": top_frame_noise_reasons(frames),
         "frames": frames,
         "llm_used": llm_used,
         "llm_error": llm_error,
@@ -931,7 +1010,11 @@ def _query_terms(query: str) -> List[str]:
     return _unique_strings(terms)[:16]
 
 
-def _frame_match_score(frame: Dict[str, Any], terms: List[str]) -> float:
+def _frame_match_score(frame: Dict[str, Any], terms: List[str], *, query: str = "", support_status: str = "") -> float:
+    quality_score = _confidence(frame.get("quality_score"), 0.6)
+    status = support_status or str(frame.get("support_status") or "")
+    if not query_allows_weak_frames(query) and (quality_score < MIN_FRAME_QUALITY_SCORE or status in {"unsupported", "ignored_noise"}):
+        return 0.0
     text_by_field = {
         "short_claim": str(frame.get("short_claim") or ""),
         "problem": str(frame.get("problem") or ""),
@@ -957,6 +1040,15 @@ def _frame_match_score(frame: Dict[str, Any], terms: List[str]) -> float:
         score += weights[field] * hits
     score += 0.2 * len(frame.get("evidence_unit_ids") or [])
     score += 0.3 * _confidence(frame.get("confidence"), 0.0)
+    score += 0.5 * quality_score
+    if status == "supported":
+        score += 0.4
+    elif status == "partial":
+        score += 0.15
+    elif status in {"unsupported", "ignored_noise"}:
+        score -= 1.2 if not query_allows_weak_frames(query) else 0.3
+    if frame.get("noise_reasons"):
+        score -= 0.3 * len(frame.get("noise_reasons") or [])
     return score
 
 
@@ -979,7 +1071,11 @@ def _verifier_totals(documents: List[Dict[str, Any]]) -> Dict[str, Any]:
         "verified_frame_rate": round(verified / max(1, frame_count), 4),
         "unsupported_frame_count": sum(int(doc.get("unsupported_frame_count") or 0) for doc in documents),
         "low_confidence_frame_count": sum(int(doc.get("low_confidence_frame_count") or 0) for doc in documents),
+        "low_quality_frame_count": sum(int(doc.get("low_quality_frame_count") or 0) for doc in documents),
+        "noisy_frame_count": sum(int(doc.get("noisy_frame_count") or 0) for doc in documents),
+        "ignored_noise_frame_count": sum(int(doc.get("ignored_noise_frame_count") or 0) for doc in documents),
         "missing_evidence_unit_count": sum(int(doc.get("missing_evidence_unit_count") or 0) for doc in documents),
         "missing_node_count": sum(int(doc.get("missing_node_count") or 0) for doc in documents),
         "citation_gap_count": sum(int(doc.get("citation_gap_count") or 0) for doc in documents),
+        "top_frame_noise_reasons": top_noise_reasons(documents),
     }

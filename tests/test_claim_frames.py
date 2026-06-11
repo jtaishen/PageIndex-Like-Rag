@@ -8,9 +8,11 @@ from pathlib import Path
 from unittest import mock
 
 from kb_agent.claim_frames import (
+    _frame_record,
     extract_claim_frames,
     get_claim_frames,
     get_evidence_units,
+    search_claim_frames,
     verify_claim_frames,
 )
 from kb_agent.cli import main as cli_main
@@ -41,11 +43,15 @@ class ClaimFrameTest(unittest.TestCase):
             self.assertEqual(frames["schema"], "claim_frames.v1")
             self.assertTrue(any(frame["evidence_unit_ids"] for frame in frames["frames"]))
             self.assertTrue(all(len(frame["short_claim"]) <= 243 for frame in frames["frames"]))
+            self.assertIn("quality_summary", frames)
+            self.assertTrue(all("quality_score" in frame and "frame_quality" in frame for frame in frames["frames"]))
 
             verifier = verify_claim_frames(db_path, doc_ids=[doc_id])
             self.assertEqual(verifier["schema"], "claim_frame_verifier_result.v1")
             self.assertGreater(verifier["frame_count"], 0)
             self.assertGreater(verifier["verified_frame_rate"], 0.0)
+            self.assertIn("low_quality_frame_count", verifier)
+            self.assertIn("top_frame_noise_reasons", verifier)
 
     def test_claim_frame_llm_success_and_failure_keep_rule_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -95,6 +101,8 @@ class ClaimFrameTest(unittest.TestCase):
             self.assertEqual(frame_matches["schema"], "claim_frame_search.v1")
             self.assertGreaterEqual(frame_matches["count"], 1)
             self.assertIn("evidence_unit_ids", frame_matches["items"][0])
+            self.assertIn("quality_score", frame_matches["items"][0])
+            self.assertIn("selection_reasons", frame_matches["items"][0])
 
             compare = compare_papers(db_path, "任务规划方法比较", top_k_docs=2, use_llm=False)
             evidence = [
@@ -112,6 +120,64 @@ class ClaimFrameTest(unittest.TestCase):
                 for item in artifact.get("evidence") or []
             ]
             self.assertTrue(any(item.get("claim_frame_id") for item in section_evidence))
+
+    def test_claim_frame_quality_filters_front_matter_and_ranks_supported_frames(self) -> None:
+        supported = _frame_record(
+            "doc-1",
+            "v1",
+            "method",
+            "本文提出任务规划方法，结合技能库完成复杂任务分解。",
+            ["eu-1"],
+            source="claim",
+            source_claim_ids=["claim-1"],
+            confidence=0.82,
+            index=0,
+        )
+        noisy = _frame_record(
+            "doc-1",
+            "v1",
+            "result",
+            "网络首发 ISSN 1000-0000 引用格式 图 3 图书馆接待服务场景 图 3 图书馆接待服务场景",
+            [],
+            source="table_summary",
+            source_claim_ids=["table-1"],
+            confidence=0.6,
+            index=1,
+        )
+
+        self.assertTrue(supported)
+        self.assertGreaterEqual(supported["quality_score"], 0.75)
+        self.assertEqual(noisy, {})
+
+        weak = dict(supported)
+        weak.update(
+            {
+                "frame_id": "weak",
+                "short_claim": "任务规划方法 图 3 图书馆接待服务场景 图 3 图书馆接待服务场景",
+                "evidence_unit_ids": [],
+                "support_status": "unsupported",
+                "quality_score": 0.2,
+                "frame_quality": "low",
+                "noise_reasons": ["repeated_caption"],
+            }
+        )
+        with mock.patch("kb_agent.claim_frames._ready_doc_ids", return_value=["doc-1"]), mock.patch(
+            "kb_agent.claim_frames.get_claim_frames",
+            return_value={"schema": "claim_frames.v1", "frames": [weak, supported]},
+        ), mock.patch(
+            "kb_agent.claim_frames._artifact_content",
+            return_value={
+                "items": [
+                    {"frame_id": "weak", "support_status": "unsupported", "warnings": ["unsupported_frame"]},
+                    {"frame_id": supported["frame_id"], "support_status": "supported", "warnings": []},
+                ]
+            },
+        ):
+            result = search_claim_frames(Path("unused.sqlite"), "任务规划方法", top_k=3)
+
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["items"][0]["frame_id"], supported["frame_id"])
+        self.assertEqual(result["items"][0]["support_status"], "supported")
 
     def test_cli_claim_frame_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

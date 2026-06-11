@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -24,6 +23,7 @@ from .parsers import (
 )
 from .tree import build_document_tree, tree_to_dict
 from .llm import LLMError, generate_json_object, get_llm_settings
+from .text_quality import clean_research_text, is_research_noise_text
 from .utils import sha256_file, stable_id, write_json, write_jsonl
 
 
@@ -746,7 +746,7 @@ def _short_summary(value: object, max_chars: int) -> str:
     if not isinstance(value, str):
         return ""
     compacted = " ".join(value.split())
-    source = _clean_doc_card_text(compacted) if _is_doc_card_noise_text(compacted) else compacted
+    source = clean_research_text(compacted) if _is_doc_card_noise_text(compacted) else compacted
     cleaned = _text_excerpt(source, max_chars)
     banned_markers = ("```", "prompt", "原文：", "正文：")
     if any(marker.lower() in cleaned.lower() for marker in banned_markers):
@@ -756,57 +756,17 @@ def _short_summary(value: object, max_chars: int) -> str:
     return cleaned
 
 
-_DOC_CARD_NOISE_MARKERS = (
-    "网络首发",
-    "引用格式",
-    "issn",
-    "cn ",
-    "journal of",
-    "中图分类号",
-    "文献标志码",
-    "收稿日期",
-    "基金项目",
-    "资助",
-    "版权所有",
-    "copyright",
-    "http://",
-    "https://",
-    "www.",
-)
-
-
 def _content_excerpt(text: str, max_chars: int) -> str:
     cleaned = _clean_doc_card_text(text)
-    return _text_excerpt(cleaned or text, max_chars)
+    return _text_excerpt(cleaned, max_chars) if cleaned else ""
 
 
 def _clean_doc_card_text(text: object) -> str:
-    raw = str(text or "")
-    pieces = re.split(r"[\n\r。；;]+", raw)
-    kept: List[str] = []
-    for piece in pieces:
-        compacted = " ".join(piece.split())
-        if not compacted:
-            continue
-        if _is_doc_card_noise_text(compacted):
-            continue
-        kept.append(compacted)
-    return " ".join(kept)
+    return clean_research_text(text)
 
 
 def _is_doc_card_noise_text(text: object, *, heading: str = "", page: Optional[int] = None) -> bool:
-    compacted = " ".join(str(text or "").split())
-    if not compacted:
-        return False
-    lowered = f"{heading} {compacted}".lower()
-    marker_count = sum(1 for marker in _DOC_CARD_NOISE_MARKERS if marker in lowered)
-    if marker_count >= 1 and (page in {None, 0, 1, 2} or len(compacted) < 260 or marker_count >= 2):
-        return True
-    if re.search(r"第\s*\d+\s*页|page\s+\d+", lowered):
-        return True
-    if re.search(r"^(题目|作者|引用格式|基金项目|收稿日期)[:：]", compacted):
-        return True
-    return False
+    return is_research_noise_text(text, heading=heading, page=page)
 
 
 def _text_excerpt(text: str, max_chars: int) -> str:

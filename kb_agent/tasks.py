@@ -586,6 +586,10 @@ def _task_query_terms(query: str) -> List[str]:
 
 
 def _task_frame_score(frame: Dict[str, Any], terms: List[str]) -> float:
+    quality_score = _confidence(frame.get("quality_score"), 0.6)
+    support_status = str(frame.get("support_status") or "")
+    if quality_score < 0.35 or support_status in {"unsupported", "ignored_noise"}:
+        return 0.0
     haystack = " ".join(
         str(frame.get(field) or "")
         for field in (
@@ -601,7 +605,8 @@ def _task_frame_score(frame: Dict[str, Any], terms: List[str]) -> float:
     term_score = sum(1.0 for term in terms if term.lower() in haystack)
     support_score = 0.3 if frame.get("evidence_unit_ids") else 0.0
     confidence_score = 0.2 * _confidence(frame.get("confidence"), 0.0)
-    return term_score + support_score + confidence_score
+    quality_boost = 0.25 * quality_score
+    return term_score + support_score + confidence_score + quality_boost
 
 
 def _search_doc_evidence(db_path: Path, doc_id: str, query: str, top_k: int, search_mode: str = "hybrid") -> List[Dict[str, Any]]:
