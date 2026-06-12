@@ -63,7 +63,17 @@ class CliSummariesTest(unittest.TestCase):
                             "conflicting_claim_count": 0,
                             "insufficient_claim_count": 0,
                             "warnings": [],
-                        }
+                        },
+                        "claim_alignment_summary": {
+                            "available": True,
+                            "group_count": 2,
+                            "method_family_group_count": 1,
+                            "conflicting_group_count": 0,
+                            "research_gap_count": 1,
+                            "relation_count": 2,
+                            "relation_type_counts": {"same_method_family": 1, "incomparable": 1},
+                            "warnings": ["claim_alignment_insufficient_evidence"],
+                        },
                     },
                     "review": {
                         "answer_plan_summary": {
@@ -74,7 +84,17 @@ class CliSummariesTest(unittest.TestCase):
                             "conflicting_claim_count": 1,
                             "insufficient_claim_count": 2,
                             "warnings": ["answer_plan_conflicting_claims"],
-                        }
+                        },
+                        "claim_alignment_summary": {
+                            "available": True,
+                            "group_count": 1,
+                            "method_family_group_count": 0,
+                            "conflicting_group_count": 1,
+                            "research_gap_count": 0,
+                            "relation_count": 1,
+                            "relation_type_counts": {"contradicts": 1},
+                            "warnings": ["claim_alignment_conflicts"],
+                        },
                     },
                 },
                 "warnings": ["llm_timeout"],
@@ -130,6 +150,14 @@ class CliSummariesTest(unittest.TestCase):
         self.assertEqual(result["conflicting_claim_count"], 1)
         self.assertEqual(result["insufficient_claim_count"], 2)
         self.assertEqual(result["answer_plan_warning_counts"], {"answer_plan_conflicting_claims": 1})
+        self.assertTrue(result["claim_alignment_available"])
+        self.assertEqual(result["claim_alignment_group_count"], 3)
+        self.assertEqual(result["claim_relation_count"], 3)
+        self.assertEqual(result["claim_relation_type_counts"], {"same_method_family": 1, "incomparable": 1, "contradicts": 1})
+        self.assertEqual(result["method_family_group_count"], 1)
+        self.assertEqual(result["conflicting_group_count"], 1)
+        self.assertEqual(result["research_gap_count"], 1)
+        self.assertEqual(result["claim_alignment_warnings"], ["claim_alignment_insufficient_evidence", "claim_alignment_conflicts"])
         self.assertTrue(result["compiled_context_available"])
         self.assertEqual(result["compiled_context_schema"], "memory_context.v1")
         self.assertEqual(result["selected_memory_count"], 2)

@@ -4,10 +4,12 @@ from html import escape
 from typing import Any, Dict, Iterable, List
 
 from .answer_plan import answer_plan_rollup
+from .claim_alignment import claim_alignment_rollup
 
 
 def baseline_markdown(report: Dict[str, Any]) -> str:
     answer_plan = answer_plan_rollup(_answer_plan_summaries(report))
+    alignment = claim_alignment_rollup(_claim_alignment_summaries(report))
     lines = [
         "# Quality Baseline",
         "",
@@ -73,6 +75,7 @@ def baseline_markdown(report: Dict[str, Any]) -> str:
         f"- compare_answerability: `{(((report.get('tasks') or {}).get('compare') or {}).get('answer_plan_summary') or {}).get('answerability', '')}`",
         f"- review_answerability: `{(((report.get('tasks') or {}).get('review') or {}).get('answer_plan_summary') or {}).get('answerability', '')}`",
         f"- answer_plan_claim_counts: `strong={answer_plan['strong_claim_count']} qualified={answer_plan['qualified_claim_count']} conflicting={answer_plan['conflicting_claim_count']} insufficient={answer_plan['insufficient_claim_count']}`",
+        f"- claim_alignment_counts: `groups={alignment['group_count']} relations={alignment['relation_count']} methods={alignment['method_family_group_count']} conflicts={alignment['conflicting_group_count']} gaps={alignment['research_gap_count']}`",
         f"- top_review_blockers: `{', '.join(report.get('top_review_blockers') or [])}`",
         f"- baseline_limitations: `{', '.join(report.get('baseline_limitations') or [])}`",
         f"- llm_runtime_limitations: `{', '.join(report.get('llm_runtime_limitations') or [])}`",
@@ -124,6 +127,7 @@ def baseline_html(report: Dict[str, Any]) -> str:
     compare_answer_plan = compare.get("answer_plan_summary") or {}
     review_answer_plan = review.get("answer_plan_summary") or {}
     answer_plan = answer_plan_rollup([compare_answer_plan, review_answer_plan])
+    alignment = claim_alignment_rollup(_claim_alignment_summaries(report))
     review_draft = ((report.get("tasks") or {}).get("review_draft") or {})
     fact_delta = report.get("fact_audit_delta") or {}
     tree_summary = (report.get("tree_search") or {}).get("comparison_summary") or {}
@@ -154,6 +158,9 @@ def baseline_html(report: Dict[str, Any]) -> str:
         ("Review Answerability", review_answer_plan.get("answerability", "")),
         ("Strong Claims", answer_plan["strong_claim_count"]),
         ("Conflicting Claims", answer_plan["conflicting_claim_count"]),
+        ("Alignment Groups", alignment["group_count"]),
+        ("Claim Relations", alignment["relation_count"]),
+        ("Research Gaps", alignment["research_gap_count"]),
         ("Draft Status", review_draft.get("status", "")),
         ("Draft Skip", review_draft.get("review_draft_skip_reason", "")),
         ("Draft Quality", review_draft.get("draft_quality_level", "")),
@@ -321,3 +328,8 @@ def html_list_section(title: str, items: Iterable[Any]) -> str:
 def _answer_plan_summaries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
     tasks = report.get("tasks") or {}
     return [(tasks.get(name) or {}).get("answer_plan_summary") or {} for name in ("compare", "review")]
+
+
+def _claim_alignment_summaries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
+    tasks = report.get("tasks") or {}
+    return [(tasks.get(name) or {}).get("claim_alignment_summary") or {} for name in ("compare", "review")]

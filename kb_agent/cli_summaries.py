@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import List
 
 from .answer_plan import answer_plan_rollup
+from .claim_alignment import claim_alignment_rollup
 
 
 def extract_summary(result: dict) -> dict:
@@ -77,12 +78,15 @@ def fact_summary(result: dict) -> dict:
 def task_summary(result: dict) -> dict:
     coverage = {}
     answer_summary = {}
+    alignment_summary = {}
     if result.get("comparison_matrix"):
         coverage = result["comparison_matrix"].get("evidence_coverage", {})
         answer_summary = result["comparison_matrix"].get("answer_plan_summary", {})
+        alignment_summary = result["comparison_matrix"].get("claim_alignment_summary", {})
     elif result.get("review_outline"):
         coverage = result["review_outline"].get("evidence_coverage", {})
         answer_summary = result["review_outline"].get("answer_plan_summary", {})
+        alignment_summary = result["review_outline"].get("claim_alignment_summary", {})
     return {
         "task_id": result.get("task_id"),
         "task_type": result.get("task_type"),
@@ -98,6 +102,12 @@ def task_summary(result: dict) -> dict:
         "conflicting_claim_count": answer_summary.get("conflicting_claim_count", 0),
         "insufficient_claim_count": answer_summary.get("insufficient_claim_count", 0),
         "answer_plan_warnings": answer_summary.get("warnings") or [],
+        "claim_alignment_available": bool(alignment_summary.get("available")),
+        "claim_alignment_group_count": alignment_summary.get("group_count", 0),
+        "claim_relation_count": alignment_summary.get("relation_count", 0),
+        "method_family_group_count": alignment_summary.get("method_family_group_count", 0),
+        "conflicting_group_count": alignment_summary.get("conflicting_group_count", 0),
+        "research_gap_count": alignment_summary.get("research_gap_count", 0),
         "warning_count": len(_task_warnings(result)),
         "warnings": _task_warnings(result),
         "llm_error": result.get("llm_error", ""),
@@ -268,6 +278,12 @@ def quality_baseline_cli_summary(result: dict) -> dict:
     compare_answer_plan = compare_task.get("answer_plan_summary") or {}
     review_answer_plan = review_task.get("answer_plan_summary") or {}
     answer_plan = answer_plan_rollup([compare_answer_plan, review_answer_plan])
+    alignment = claim_alignment_rollup(
+        [
+            compare_task.get("claim_alignment_summary") or {},
+            review_task.get("claim_alignment_summary") or {},
+        ]
+    )
     review_draft = ((result.get("tasks") or {}).get("review_draft") or {})
     review_diagnostics = review_task.get("llm_diagnostics") or {}
     return {
@@ -325,6 +341,14 @@ def quality_baseline_cli_summary(result: dict) -> dict:
         "conflicting_claim_count": answer_plan["conflicting_claim_count"],
         "insufficient_claim_count": answer_plan["insufficient_claim_count"],
         "answer_plan_warning_counts": answer_plan["warning_counts"],
+        "claim_alignment_available": alignment["available"],
+        "claim_alignment_group_count": alignment["group_count"],
+        "claim_relation_count": alignment["relation_count"],
+        "claim_relation_type_counts": alignment["relation_type_counts"],
+        "method_family_group_count": alignment["method_family_group_count"],
+        "conflicting_group_count": alignment["conflicting_group_count"],
+        "research_gap_count": alignment["research_gap_count"],
+        "claim_alignment_warnings": alignment["warnings"],
         "review_draft_status": review_draft.get("status", ""),
         "review_draft_skip_reason": review_draft.get("review_draft_skip_reason", "") or review_draft.get("reason", ""),
         "review_draft_quality_level": review_draft.get("draft_quality_level", ""),

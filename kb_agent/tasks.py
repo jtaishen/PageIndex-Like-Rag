@@ -10,6 +10,12 @@ from .answer_plan import (
     answer_plan_warning_tags,
     build_answer_plan_from_evidence,
 )
+from .claim_alignment import (
+    build_claim_alignment,
+    build_claim_relations,
+    claim_alignment_summary,
+    review_alignment_sections,
+)
 from .fact_audit import fact_audit_summary
 from .knowledge_graph import graph_summary
 from .llm import generate_json_object
@@ -156,10 +162,30 @@ def compare_papers(
     matrix["duplicate_evidence_removed"] = evidence_quality["duplicate_evidence_removed"]
     answer_plan = build_answer_plan_from_evidence(query, _flatten_dimension_evidence_raw(evidence_by_dimension))
     matrix["answer_plan_summary"] = answer_plan_summary(answer_plan)
+    alignment = build_claim_alignment(query, contexts)
+    relations = build_claim_relations(alignment)
+    alignment_summary = claim_alignment_summary(alignment, relations)
+    matrix["claim_alignment"] = alignment
+    matrix["claim_relations"] = relations
+    matrix["claim_alignment_summary"] = alignment_summary
+    matrix["method_family_groups"] = alignment.get("method_family_groups") or []
+    matrix["conflicting_claim_groups"] = alignment.get("conflicting_claim_groups") or []
+    matrix["research_gap_candidates"] = alignment.get("research_gap_candidates") or []
     matrix["warnings"] = _unique_strings(
-        [*matrix.get("warnings", []), *coverage["warnings"], *answer_plan_warning_tags(matrix["answer_plan_summary"])]
+        [
+            *matrix.get("warnings", []),
+            *coverage["warnings"],
+            *answer_plan_warning_tags(matrix["answer_plan_summary"]),
+            *alignment_summary.get("warnings", []),
+        ]
     )
-    matrix["open_questions"] = _unique_strings([*matrix.get("open_questions", []), *answer_plan_open_questions(matrix["answer_plan_summary"])])
+    matrix["open_questions"] = _unique_strings(
+        [
+            *matrix.get("open_questions", []),
+            *answer_plan_open_questions(matrix["answer_plan_summary"]),
+            *_claim_alignment_open_questions(alignment_summary),
+        ]
+    )
     matrix["status"] = "partial" if matrix["warnings"] or matrix.get("source") == "rule" else "extracted"
 
     task_id = _new_task_id("compare", query, [context["doc_id"] for context in contexts])
@@ -249,10 +275,25 @@ def generate_review_plan(
     outline["duplicate_evidence_removed"] = evidence_quality["duplicate_evidence_removed"]
     answer_plan = build_answer_plan_from_evidence(topic, [item for items in section_evidence.values() for item in items])
     outline["answer_plan_summary"] = answer_plan_summary(answer_plan)
+    alignment = build_claim_alignment(topic, contexts)
+    relations = build_claim_relations(alignment)
+    alignment_sections = review_alignment_sections(alignment, relations)
+    outline.update(alignment_sections)
     outline["warnings"] = _unique_strings(
-        [*outline.get("warnings", []), *coverage["warnings"], *answer_plan_warning_tags(outline["answer_plan_summary"])]
+        [
+            *outline.get("warnings", []),
+            *coverage["warnings"],
+            *answer_plan_warning_tags(outline["answer_plan_summary"]),
+            *(alignment_sections.get("claim_alignment_summary") or {}).get("warnings", []),
+        ]
     )
-    outline["open_questions"] = _unique_strings([*outline.get("open_questions", []), *answer_plan_open_questions(outline["answer_plan_summary"])])
+    outline["open_questions"] = _unique_strings(
+        [
+            *outline.get("open_questions", []),
+            *answer_plan_open_questions(outline["answer_plan_summary"]),
+            *_claim_alignment_open_questions(outline["claim_alignment_summary"]),
+        ]
+    )
     outline["review_partial_reasons"] = _review_partial_reasons(outline, contexts, coverage)
     outline["status"] = "partial" if outline["warnings"] or outline.get("source") == "rule" else "extracted"
 
@@ -342,6 +383,14 @@ def _collect_section_evidence(
 def _search_doc_evidence(db_path: Path, doc_id: str, query: str, top_k: int, search_mode: str = "hybrid") -> List[Dict[str, Any]]:
     return _search_doc_evidence_core(db_path, doc_id, query, top_k, search_mode=search_mode)
 
+
+def _claim_alignment_open_questions(summary: Dict[str, Any]) -> List[str]:
+    questions = []
+    if int(summary.get("conflicting_group_count") or 0) > 0:
+        questions.append("ClaimFrame 跨论文对齐发现可比冲突，需要核验证据链后再写成结论。")
+    if int(summary.get("research_gap_count") or 0) > 0:
+        questions.append("部分 ClaimFrame 对齐组证据不足，可作为综述中的研究空白候选。")
+    return questions
 
 
 def _fact_audit_warning_tags(audit: Dict[str, Any]) -> List[str]:

@@ -18,6 +18,7 @@ from .artifacts import get_doc_card, get_parse_quality, get_parse_report
 from .baseline_renderers import baseline_html, baseline_markdown
 from .baseline_runtime import LLMBaselineRuntime, null_stage
 from .benchmark import create_eval_suite, generate_case_study, run_benchmark
+from .claim_alignment import claim_alignment_rollup
 from .claim_frames import verify_claim_frames
 from .config import DATA_DIR, PROJECT_ROOT, baseline_llm_stage_timeout_seconds, baseline_llm_timeout_seconds, deepseek_timeout_seconds
 from .embeddings import (
@@ -44,7 +45,7 @@ from .utils import compact_whitespace, read_json as _read_json, stable_id, uniqu
 
 
 BASELINE_SCHEMA = "quality_baseline.v1"
-CODE_VERSION = "v0.44"
+CODE_VERSION = "v0.56"
 BASELINE_FEATURE_FLAGS = {
     "review_draft_baseline": True,
     "baseline_staleness": True,
@@ -66,6 +67,7 @@ BASELINE_FEATURE_FLAGS = {
     "artifact_first_memory_compiler": True,
     "claim_frame_semantic_support": True,
     "evidence_grounded_answer_plan": True,
+    "claim_frame_alignment_relations": True,
 }
 BASELINE_DIR = DATA_DIR / "eval"
 EVAL_SET_DIR = DATA_DIR / "eval_sets"
@@ -289,6 +291,12 @@ def latest_quality_baseline(
         compare_answer_plan = compare.get("answer_plan_summary") or {}
         review_answer_plan = review.get("answer_plan_summary") or {}
         answer_plan = answer_plan_rollup([compare_answer_plan, review_answer_plan])
+        alignment = claim_alignment_rollup(
+            [
+                compare.get("claim_alignment_summary") or {},
+                review.get("claim_alignment_summary") or {},
+            ]
+        )
         review_diagnostics = review.get("llm_diagnostics") or {}
         tree_delta = (payload.get("tree_search") or {}).get("comparison_summary") or {}
         fact_delta = payload.get("fact_audit_delta") or {}
@@ -342,6 +350,14 @@ def latest_quality_baseline(
                 "conflicting_claim_count": answer_plan["conflicting_claim_count"],
                 "insufficient_claim_count": answer_plan["insufficient_claim_count"],
                 "answer_plan_warning_counts": answer_plan["warning_counts"],
+                "claim_alignment_available": alignment["available"],
+                "claim_alignment_group_count": alignment["group_count"],
+                "claim_relation_count": alignment["relation_count"],
+                "claim_relation_type_counts": alignment["relation_type_counts"],
+                "method_family_group_count": alignment["method_family_group_count"],
+                "conflicting_group_count": alignment["conflicting_group_count"],
+                "research_gap_count": alignment["research_gap_count"],
+                "claim_alignment_warnings": alignment["warnings"],
                 "review_draft_status": review_draft.get("status", ""),
                 "review_draft_skip_reason": review_draft.get("review_draft_skip_reason", "") or review_draft.get("reason", ""),
                 "review_draft_quality_level": review_draft.get("draft_quality_level", ""),
@@ -1466,6 +1482,7 @@ def _task_baseline(
             "llm_diagnostics": matrix.get("llm_diagnostics") or {},
             "duplicate_evidence_removed": matrix.get("duplicate_evidence_removed", 0),
             "answer_plan_summary": matrix.get("answer_plan_summary") or {},
+            "claim_alignment_summary": matrix.get("claim_alignment_summary") or {},
         }
     except Exception as exc:
         result["compare"] = {"status": "failed", "error": str(exc)}
@@ -1509,6 +1526,7 @@ def _task_baseline(
             "duplicate_evidence_removed": outline.get("duplicate_evidence_removed", 0),
             "review_partial_reasons": outline.get("review_partial_reasons") or [],
             "answer_plan_summary": outline.get("answer_plan_summary") or {},
+            "claim_alignment_summary": outline.get("claim_alignment_summary") or {},
         }
     except Exception as exc:
         result["review"] = {"status": "failed", "error": str(exc)}
@@ -1648,6 +1666,12 @@ def _llm_baseline_summary(
     review = tasks.get("review") or {}
     review_draft = tasks.get("review_draft") or {}
     compare_diag = compare.get("llm_diagnostics") or {}
+    alignment = claim_alignment_rollup(
+        [
+            compare.get("claim_alignment_summary") or {},
+            review.get("claim_alignment_summary") or {},
+        ]
+    )
     fact_batch_count = sum(int((item.get("llm") or {}).get("batch_count") or 0) for item in llm_fact_items)
     fact_batch_success = sum(int((item.get("llm") or {}).get("batch_success_count") or 0) for item in llm_fact_items)
     warning_tags = []
@@ -1722,6 +1746,13 @@ def _llm_baseline_summary(
             "review_fallback_sections": (review.get("llm_diagnostics") or {}).get("fallback_sections", []),
             "review_partial_reasons": review.get("review_partial_reasons") or [],
             "duplicate_evidence_removed": review.get("duplicate_evidence_removed", 0),
+            "claim_alignment_available": alignment["available"],
+            "claim_alignment_group_count": alignment["group_count"],
+            "claim_relation_count": alignment["relation_count"],
+            "claim_relation_type_counts": alignment["relation_type_counts"],
+            "method_family_group_count": alignment["method_family_group_count"],
+            "conflicting_group_count": alignment["conflicting_group_count"],
+            "research_gap_count": alignment["research_gap_count"],
             "review_draft_status": review_draft.get("status", ""),
             "review_draft_skip_reason": review_draft.get("review_draft_skip_reason", "") or review_draft.get("reason", ""),
             "review_draft_quality_level": review_draft.get("draft_quality_level", ""),

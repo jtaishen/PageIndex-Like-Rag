@@ -813,7 +813,7 @@ class IngestSearchTest(unittest.TestCase):
                 result = run_quality_baseline(db_path, papers, use_llm=False, top_k=3)
 
             self.assertEqual(result["schema"], "quality_baseline.v1")
-            self.assertEqual(result["code_version"], "v0.44")
+            self.assertEqual(result["code_version"], "v0.56")
             self.assertTrue(result["git_commit"])
             self.assertTrue(result["feature_flags"]["review_draft_baseline"])
             self.assertTrue(result["feature_flags"]["claim_frame_quality_filtering"])
@@ -822,6 +822,7 @@ class IngestSearchTest(unittest.TestCase):
             self.assertTrue(result["feature_flags"]["artifact_first_memory_compiler"])
             self.assertTrue(result["feature_flags"]["claim_frame_semantic_support"])
             self.assertTrue(result["feature_flags"]["evidence_grounded_answer_plan"])
+            self.assertTrue(result["feature_flags"]["claim_frame_alignment_relations"])
             self.assertTrue(result["is_current_code_baseline"])
             self.assertEqual(result["baseline_stale_reason"], "")
             self.assertEqual(result["doc_count"], 2)
@@ -1092,7 +1093,7 @@ class IngestSearchTest(unittest.TestCase):
                     {
                         "schema": "quality_baseline.v1",
                         "baseline_id": "older-commit",
-                        "code_version": "v0.44",
+                        "code_version": "v0.56",
                         "git_commit": "0000000000000000000000000000000000000000",
                         "feature_flags": {"review_draft_baseline": True},
                         "corpus_path": str((Path.cwd() / "articles").resolve()),
@@ -1581,6 +1582,12 @@ class IngestSearchTest(unittest.TestCase):
             self.assertIn("evidence_quality", matrix)
             self.assertIn("duplicate_evidence_removed", matrix)
             self.assertIn("answer_plan_summary", matrix)
+            self.assertEqual(matrix["claim_alignment"]["schema"], "claim_alignment.v1")
+            self.assertEqual(matrix["claim_relations"]["schema"], "claim_relations.v1")
+            self.assertIn("claim_alignment_summary", matrix)
+            self.assertIn("method_family_groups", matrix)
+            self.assertIn("conflicting_claim_groups", matrix)
+            self.assertIn("research_gap_candidates", matrix)
             dimension_ids = {item["id"] for item in matrix["dimensions"]}
             self.assertIn("problem_setting", dimension_ids)
             self.assertIn("evidence_strength", dimension_ids)
@@ -1592,6 +1599,7 @@ class IngestSearchTest(unittest.TestCase):
 
             artifact = get_task_artifact(db_path, result["task_id"], "comparison_matrix.json")
             self.assertEqual(artifact["content"]["schema"], "comparison_matrix.v1")
+            self.assertEqual(artifact["content"]["claim_alignment"]["schema"], "claim_alignment.v1")
             current = get_task_artifact(db_path, "current", "current_task.json")
             self.assertEqual(current["content"]["task_id"], result["task_id"])
 
@@ -1631,6 +1639,11 @@ class IngestSearchTest(unittest.TestCase):
             self.assertIn("duplicate_evidence_removed", outline)
             self.assertIn("review_partial_reasons", outline)
             self.assertIn("answer_plan_summary", outline)
+            self.assertIn("claim_alignment_summary", outline)
+            self.assertIn("method_lineage", outline)
+            self.assertIn("evidence_patterns", outline)
+            self.assertIn("limitation_groups", outline)
+            self.assertIn("research_gap_candidates", outline)
             self.assertIn("section_evidence/background_problem.json", result["artifact_paths"])
             background = get_task_artifact(
                 db_path,

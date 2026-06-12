@@ -21,6 +21,7 @@ description: 综述规划与草稿 workflow；用于生成综述大纲、章节�
 
 - `kb_extract_claim_frames` / `kb_verify_claim_frames`：章节证据需要主张级支撑或 citation risk 判断时调用。
 - `kb_eval_review`：用户要求复盘综述质量时调用。
+- `kb_get_task_artifact`：需要复核综述结构时读取 `review_outline.json` 中的 `method_lineage`、`limitation_groups` 和 `research_gap_candidates`。
 - `memory_remember_task`：用户要求跨 session 保存任务进度时调用。
 
 ## 停止条件
@@ -34,6 +35,7 @@ description: 综述规划与草稿 workflow；用于生成综述大纲、章节�
 
 - 汇总 review task id、章节状态、citation coverage、unsupported paragraph 数、missing refs 和关键 citation risk。
 - 汇总 `answerability`、strong/qualified/conflicting/insufficient claim 数。
+- 汇总 `claim_alignment_summary`、`method_lineage`、`evidence_patterns`、`limitation_groups` 和 `research_gap_candidates`，把证据不足的对齐组优先作为研究空白候选，而不是确定结论。
 - 给出每节 `section_revision_actions`。
 - 总稿路径只作为工件路径返回，不在聊天里粘贴长正文。
 

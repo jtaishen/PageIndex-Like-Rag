@@ -1081,6 +1081,23 @@ uv run python -m kb_agent.cli compare "任务规划方法比较" --no-llm --top-
 uv run python -m kb_agent.cli generate-review "任务规划方法研究综述" --no-llm --top-k-docs 2
 ```
 
+## v0.56 ClaimFrame 跨论文对齐与关系层
+
+v0.56 把 ClaimFrame 从单篇证据链推进到跨论文比较和综述主链路。`compare` 会在 `comparison_matrix.json` 中写入 `claim_alignment.v1`、`claim_relations.v1` 和 `claim_alignment_summary`，用于说明哪些 ClaimFrame 属于同一方法族、同一指标、可比结果、局限或冲突关系。
+
+关系类型保持轻量：`supports`、`contradicts`、`same_method_family`、`same_metric`、`improves_over`、`limitation_of`、`incomparable`。结果类 claim 只有在指标或实验设定可比时才会进入冲突判断；不可比时写成 `incomparable`，不强行合并成矛盾。
+
+`generate-review` 会在 `review_outline.json` 中补充 `claim_alignment_summary`、`method_lineage`、`evidence_patterns`、`limitation_groups` 和 `research_gap_candidates`。这些字段只保存短摘要、ID、关系类型、warning 和证据单元 ID，不保存正文、长 evidence 或 prompt。
+
+轻量验收命令：
+
+```bash
+uv run python -m kb_agent.cli compare "任务规划方法比较" --no-llm --top-k-docs 2
+uv run python -m kb_agent.cli task-artifact <task_id> comparison_matrix.json
+uv run python -m kb_agent.cli generate-review "任务规划方法研究综述" --no-llm --top-k-docs 2
+uv run python -m kb_agent.cli task-artifact <task_id> review_outline.json
+```
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
