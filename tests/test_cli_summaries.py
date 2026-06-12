@@ -8,6 +8,7 @@ from kb_agent.cli_summaries import (
     memory_eval_summary,
     quality_baseline_cli_summary,
     review_eval_summary,
+    task_summary,
 )
 
 
@@ -40,6 +41,31 @@ class CliSummariesTest(unittest.TestCase):
         self.assertEqual(result["relation_count"], 1)
         self.assertEqual(result["warnings"], [])
 
+    def test_task_summary_separates_relation_types_from_conflict_classes(self) -> None:
+        result = task_summary(
+            {
+                "task_id": "task-1",
+                "task_type": "compare",
+                "status": "partial",
+                "comparison_matrix": {
+                    "evidence_coverage": {"schema": "evidence_coverage.v1"},
+                    "claim_alignment_summary": {
+                        "available": True,
+                        "group_count": 3,
+                        "relation_count": 2,
+                        "relation_type_counts": {"supports": 1, "contradicts": 1},
+                        "conflict_classification_counts": {"supports": 1, "contradicts": 1, "incomparable": 1},
+                        "incomparable_pair_count": 1,
+                    },
+                    "warnings": [],
+                },
+            }
+        )
+
+        self.assertEqual(result["claim_relation_type_counts"], {"supports": 1, "contradicts": 1})
+        self.assertEqual(result["claim_conflict_classification_counts"], {"supports": 1, "contradicts": 1, "incomparable": 1})
+        self.assertEqual(result["claim_incomparable_pair_count"], 1)
+
     def test_quality_baseline_summary_exposes_runtime_limits(self) -> None:
         result = quality_baseline_cli_summary(
             {
@@ -71,7 +97,9 @@ class CliSummariesTest(unittest.TestCase):
                             "conflicting_group_count": 0,
                             "research_gap_count": 1,
                             "relation_count": 2,
-                            "relation_type_counts": {"same_method_family": 1, "incomparable": 1},
+                            "relation_type_counts": {"supports": 1, "same_metric": 1},
+                            "conflict_classification_counts": {"supports": 2, "incomparable": 1},
+                            "incomparable_pair_count": 1,
                             "warnings": ["claim_alignment_insufficient_evidence"],
                         },
                     },
@@ -93,6 +121,8 @@ class CliSummariesTest(unittest.TestCase):
                             "research_gap_count": 0,
                             "relation_count": 1,
                             "relation_type_counts": {"contradicts": 1},
+                            "conflict_classification_counts": {"contradicts": 1},
+                            "incomparable_pair_count": 0,
                             "warnings": ["claim_alignment_conflicts"],
                         },
                     },
@@ -153,7 +183,9 @@ class CliSummariesTest(unittest.TestCase):
         self.assertTrue(result["claim_alignment_available"])
         self.assertEqual(result["claim_alignment_group_count"], 3)
         self.assertEqual(result["claim_relation_count"], 3)
-        self.assertEqual(result["claim_relation_type_counts"], {"same_method_family": 1, "incomparable": 1, "contradicts": 1})
+        self.assertEqual(result["claim_relation_type_counts"], {"supports": 1, "same_metric": 1, "contradicts": 1})
+        self.assertEqual(result["claim_conflict_classification_counts"], {"supports": 2, "incomparable": 1, "contradicts": 1})
+        self.assertEqual(result["claim_incomparable_pair_count"], 1)
         self.assertEqual(result["method_family_group_count"], 1)
         self.assertEqual(result["conflicting_group_count"], 1)
         self.assertEqual(result["research_gap_count"], 1)

@@ -23,9 +23,16 @@ class ClaimAlignmentTest(unittest.TestCase):
         self.assertGreaterEqual(summary["method_family_group_count"], 1)
 
         relation_types = {item["relation_type"] for item in relations["relations"]}
-        self.assertIn("same_method_family", relation_types)
+        self.assertTrue(
+            relation_types
+            <= {"cites", "supports", "contradicts", "same_dataset", "same_metric", "improves_over", "ablation_of", "limitation_of"}
+        )
+        self.assertIn("supports", relation_types)
         self.assertIn("contradicts", relation_types)
-        self.assertIn("incomparable", relation_types)
+        self.assertNotIn("same_method_family", relation_types)
+        self.assertNotIn("incomparable", relation_types)
+        self.assertEqual(summary["conflict_classification_counts"]["incomparable"], 1)
+        self.assertEqual(summary["incomparable_pair_count"], 1)
 
         review = review_alignment_sections(alignment, relations)
         self.assertEqual(review["method_lineage"]["schema"], "method_lineage.v1")
@@ -43,6 +50,8 @@ class ClaimAlignmentTest(unittest.TestCase):
                     "research_gap_count": 0,
                     "relation_count": 3,
                     "relation_type_counts": {"contradicts": 1},
+                    "conflict_classification_counts": {"contradicts": 1, "supports": 2},
+                    "incomparable_pair_count": 0,
                     "warnings": ["claim_alignment_conflicts"],
                 },
                 {
@@ -52,7 +61,9 @@ class ClaimAlignmentTest(unittest.TestCase):
                     "conflicting_group_count": 0,
                     "research_gap_count": 1,
                     "relation_count": 1,
-                    "relation_type_counts": {"incomparable": 1},
+                    "relation_type_counts": {"same_metric": 1},
+                    "conflict_classification_counts": {"incomparable": 1},
+                    "incomparable_pair_count": 1,
                     "warnings": ["claim_alignment_conflicts"],
                 },
             ]
@@ -61,7 +72,9 @@ class ClaimAlignmentTest(unittest.TestCase):
         self.assertTrue(rollup["available"])
         self.assertEqual(rollup["group_count"], 3)
         self.assertEqual(rollup["relation_count"], 4)
-        self.assertEqual(rollup["relation_type_counts"], {"contradicts": 1, "incomparable": 1})
+        self.assertEqual(rollup["relation_type_counts"], {"contradicts": 1, "same_metric": 1})
+        self.assertEqual(rollup["conflict_classification_counts"], {"contradicts": 1, "supports": 2, "incomparable": 1})
+        self.assertEqual(rollup["incomparable_pair_count"], 1)
         self.assertEqual(rollup["warnings"], ["claim_alignment_conflicts"])
 
 

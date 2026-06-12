@@ -34,7 +34,7 @@ description: 跨论文比较 workflow；用于围绕主题筛选论文、生成�
 - 输出六类维度：问题设定、方法范式、数据与评测、创新点重叠、局限与失败模式、证据强度。
 - 每个关键比较结论绑定 evidence、EvidenceUnit 或 ClaimFrame。
 - 查看 `comparison_matrix.answer_plan_summary`；只有 strong/qualified claim 可以支撑关键比较结论。
-- 查看 `comparison_matrix.claim_alignment_summary`、`method_family_groups`、`conflicting_claim_groups` 和 `research_gap_candidates`；跨论文方法族、可比结果和冲突判断优先引用 typed relation。
+- 查看 `comparison_matrix.claim_alignment_summary`、`method_family_groups`、`conflicting_claim_groups` 和 `research_gap_candidates`；跨论文方法族先按对齐维度解释，结果冲突按 `comparability_checks` 中的 supports/contradicts/incomparable 分类解释，typed relation 只使用技术方案中的轻量关系类型。
 - 报告事实审计 warning、冲突数和证据缺口。
 
 ## 禁止事项
