@@ -15,7 +15,7 @@ description: 证据优先论文问答 workflow；用于回答单篇或多篇论�
 2. `kb_classify_query`：判断 query intent，决定是否偏向方法、实验、局限、引用或比较。
 3. `kb_tree_search`：在候选 doc 内找章节、段落、图表或表格证据节点。
 4. `kb_get_evidence`：读取最终 evidence packet。
-5. `kb_answer`：只基于 evidence 生成回答；证据不足时必须说明不足。
+5. `kb_answer`：只基于 evidence 生成回答；优先查看返回的 `answer_plan.answerability` 和 `answer_policy`，证据不足时必须说明不足。
 
 ## 可选工具
 
@@ -34,6 +34,7 @@ description: 证据优先论文问答 workflow；用于回答单篇或多篇论�
 - 列出关键证据来源：文档标题、章节路径、节点 ID、页码范围。
 - 对创新点、实验结果、局限性等高风险结论标注不确定性。
 - 若使用 ClaimFrame，说明 `support_status`、`trace_status`、`semantic_support_status`、`citation_risk` 和相关 `evidence_unit_ids`。
+- 若 `answerability` 为 `conflicting` 或 `insufficient_evidence`，先说明冲突/缺口，不输出强结论。
 
 ## 禁止事项
 

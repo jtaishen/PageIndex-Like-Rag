@@ -168,6 +168,7 @@ def generate_grounded_answer(
     evidence: List[Dict[str, object]],
     settings: Optional[LLMSettings] = None,
     *,
+    answer_plan: Optional[Dict[str, object]] = None,
     timeout_seconds: Optional[int] = None,
     operation: str = "",
     stage: str = "",
@@ -189,7 +190,7 @@ def generate_grounded_answer(
                     "如果证据不足，明确说明不足，并给出还需要检索什么。"
                 ),
             },
-            {"role": "user", "content": build_grounded_prompt(query, evidence)},
+            {"role": "user", "content": build_grounded_prompt(query, evidence, answer_plan=answer_plan)},
         ],
     )
     options = _resolve_runtime_options(timeout_seconds=timeout_seconds, operation=operation, stage=stage)
@@ -580,12 +581,20 @@ def _balanced_json_object_text(text: str) -> tuple[str, bool]:
     raise LLMError("DeepSeek returned truncated JSON.", error_type="truncated_json")
 
 
-def build_grounded_prompt(query: str, evidence: Iterable[Dict[str, object]]) -> str:
+def build_grounded_prompt(
+    query: str,
+    evidence: Iterable[Dict[str, object]],
+    *,
+    answer_plan: Optional[Dict[str, object]] = None,
+) -> str:
     lines = [
         f"用户问题：{query}",
         "",
-        "证据包：",
     ]
+    if answer_plan:
+        lines.extend(_format_answer_plan_for_prompt(answer_plan))
+        lines.append("")
+    lines.append("证据包：")
     for index, item in enumerate(evidence, start=1):
         title = str(item.get("title") or item.get("doc_id") or "unknown")
         node_path = str(item.get("node_path") or "")
@@ -600,3 +609,33 @@ def build_grounded_prompt(query: str, evidence: Iterable[Dict[str, object]]) -> 
         lines.append("")
     lines.append("请基于以上证据回答用户问题。")
     return "\n".join(lines)
+
+
+def _format_answer_plan_for_prompt(answer_plan: Dict[str, object]) -> List[str]:
+    lines = [
+        "回答规划：",
+        f"answerability: {answer_plan.get('answerability') or ''}",
+        f"policy: {answer_plan.get('answer_policy') or ''}",
+    ]
+    for bucket, label in (
+        ("strong_claims", "可作为正式结论"),
+        ("qualified_claims", "必须限定表达"),
+        ("conflicting_claims", "冲突证据，禁止确定表达"),
+        ("insufficient_claims", "证据不足"),
+    ):
+        items = answer_plan.get(bucket) or []
+        if not isinstance(items, list) or not items:
+            continue
+        lines.append(f"{bucket} ({label}):")
+        for item in items[:4]:
+            if not isinstance(item, dict):
+                continue
+            claim = first_words(compact_whitespace(str(item.get("short_claim") or "")), 48)
+            evidence_ids = item.get("primary_evidence_unit_ids") or item.get("evidence_unit_ids") or []
+            lines.append(
+                f"- frame_id={item.get('frame_id') or ''} "
+                f"status={item.get('semantic_support_status') or ''} "
+                f"risk={item.get('citation_risk') or ''} "
+                f"evidence_unit_ids={evidence_ids} claim={claim}"
+            )
+    return lines

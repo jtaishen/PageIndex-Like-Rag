@@ -122,6 +122,8 @@ class IngestSearchTest(unittest.TestCase):
 
             answer = answer_query(db_path, "What does it store?", top_k=2, use_llm=False)
             self.assertIn("证据", answer["answer"])
+            self.assertEqual(answer["answer_plan"]["schema"], "answer_plan.v1")
+            self.assertIn("answerability", answer)
 
     def test_sync_writes_v02_artifacts_and_doc_card(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -811,7 +813,7 @@ class IngestSearchTest(unittest.TestCase):
                 result = run_quality_baseline(db_path, papers, use_llm=False, top_k=3)
 
             self.assertEqual(result["schema"], "quality_baseline.v1")
-            self.assertEqual(result["code_version"], "v0.43")
+            self.assertEqual(result["code_version"], "v0.44")
             self.assertTrue(result["git_commit"])
             self.assertTrue(result["feature_flags"]["review_draft_baseline"])
             self.assertTrue(result["feature_flags"]["claim_frame_quality_filtering"])
@@ -819,6 +821,7 @@ class IngestSearchTest(unittest.TestCase):
             self.assertTrue(result["feature_flags"]["claim_frame_structural_status"])
             self.assertTrue(result["feature_flags"]["artifact_first_memory_compiler"])
             self.assertTrue(result["feature_flags"]["claim_frame_semantic_support"])
+            self.assertTrue(result["feature_flags"]["evidence_grounded_answer_plan"])
             self.assertTrue(result["is_current_code_baseline"])
             self.assertEqual(result["baseline_stale_reason"], "")
             self.assertEqual(result["doc_count"], 2)
@@ -1089,7 +1092,7 @@ class IngestSearchTest(unittest.TestCase):
                     {
                         "schema": "quality_baseline.v1",
                         "baseline_id": "older-commit",
-                        "code_version": "v0.43",
+                        "code_version": "v0.44",
                         "git_commit": "0000000000000000000000000000000000000000",
                         "feature_flags": {"review_draft_baseline": True},
                         "corpus_path": str((Path.cwd() / "articles").resolve()),
@@ -1577,6 +1580,7 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(len(matrix["dimensions"]), 6)
             self.assertIn("evidence_quality", matrix)
             self.assertIn("duplicate_evidence_removed", matrix)
+            self.assertIn("answer_plan_summary", matrix)
             dimension_ids = {item["id"] for item in matrix["dimensions"]}
             self.assertIn("problem_setting", dimension_ids)
             self.assertIn("evidence_strength", dimension_ids)
@@ -1606,6 +1610,7 @@ class IngestSearchTest(unittest.TestCase):
                 ])
             self.assertIn("task_id", stdout.getvalue())
             self.assertIn("comparison_matrix", stdout.getvalue())
+            self.assertIn("answerability", stdout.getvalue())
 
     def test_generate_review_plan_writes_outline_and_section_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1625,6 +1630,7 @@ class IngestSearchTest(unittest.TestCase):
             self.assertIn("evidence_quality", outline)
             self.assertIn("duplicate_evidence_removed", outline)
             self.assertIn("review_partial_reasons", outline)
+            self.assertIn("answer_plan_summary", outline)
             self.assertIn("section_evidence/background_problem.json", result["artifact_paths"])
             background = get_task_artifact(
                 db_path,

@@ -53,6 +53,30 @@ class CliSummariesTest(unittest.TestCase):
                     "hard_timeout_count": 1,
                     "budget_exhausted": True,
                 },
+                "tasks": {
+                    "compare": {
+                        "answer_plan_summary": {
+                            "available": True,
+                            "answerability": "answerable",
+                            "strong_claim_count": 2,
+                            "qualified_claim_count": 1,
+                            "conflicting_claim_count": 0,
+                            "insufficient_claim_count": 0,
+                            "warnings": [],
+                        }
+                    },
+                    "review": {
+                        "answer_plan_summary": {
+                            "available": True,
+                            "answerability": "conflicting",
+                            "strong_claim_count": 1,
+                            "qualified_claim_count": 0,
+                            "conflicting_claim_count": 1,
+                            "insufficient_claim_count": 2,
+                            "warnings": ["answer_plan_conflicting_claims"],
+                        }
+                    },
+                },
                 "warnings": ["llm_timeout"],
                 "claim_frame_verification": {
                     "frame_count": 4,
@@ -99,6 +123,13 @@ class CliSummariesTest(unittest.TestCase):
         self.assertEqual(result["contradicted_frame_count"], 0)
         self.assertEqual(result["insufficient_evidence_frame_count"], 1)
         self.assertEqual(result["citation_risk_counts"], {"safe": 2, "needs_more_evidence": 2})
+        self.assertTrue(result["answer_plan_available"])
+        self.assertEqual(result["answerability_counts"], {"answerable": 1, "conflicting": 1})
+        self.assertEqual(result["strong_claim_count"], 3)
+        self.assertEqual(result["qualified_claim_count"], 1)
+        self.assertEqual(result["conflicting_claim_count"], 1)
+        self.assertEqual(result["insufficient_claim_count"], 2)
+        self.assertEqual(result["answer_plan_warning_counts"], {"answer_plan_conflicting_claims": 1})
         self.assertTrue(result["compiled_context_available"])
         self.assertEqual(result["compiled_context_schema"], "memory_context.v1")
         self.assertEqual(result["selected_memory_count"], 2)

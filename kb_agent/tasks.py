@@ -6,6 +6,13 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from .answer_plan import (
+    answer_plan_open_questions,
+    answer_plan_summary,
+    answer_plan_warning_tags,
+    build_answer_plan_from_evidence,
+    task_semantic_score_adjustment,
+)
 from .artifacts import get_citation_map, get_doc_card, get_innovations, get_parse_quality
 from .claim_frames import claim_frame_summary_for_doc, extract_claim_frames, get_claim_frames, get_evidence_units
 from .config import DEFAULT_DB_PATH, PROJECT_ROOT, llm_compare_evidence_per_doc
@@ -150,7 +157,12 @@ def compare_papers(
     matrix["evidence_coverage"] = coverage
     matrix["evidence_quality"] = evidence_quality
     matrix["duplicate_evidence_removed"] = evidence_quality["duplicate_evidence_removed"]
-    matrix["warnings"] = _unique_strings([*matrix.get("warnings", []), *coverage["warnings"]])
+    answer_plan = build_answer_plan_from_evidence(query, _flatten_dimension_evidence_raw(evidence_by_dimension))
+    matrix["answer_plan_summary"] = answer_plan_summary(answer_plan)
+    matrix["warnings"] = _unique_strings(
+        [*matrix.get("warnings", []), *coverage["warnings"], *answer_plan_warning_tags(matrix["answer_plan_summary"])]
+    )
+    matrix["open_questions"] = _unique_strings([*matrix.get("open_questions", []), *answer_plan_open_questions(matrix["answer_plan_summary"])])
     matrix["status"] = "partial" if matrix["warnings"] or matrix.get("source") == "rule" else "extracted"
 
     task_id = _new_task_id("compare", query, [context["doc_id"] for context in contexts])
@@ -273,7 +285,12 @@ def generate_review_plan(
     outline["evidence_coverage"] = coverage
     outline["evidence_quality"] = evidence_quality
     outline["duplicate_evidence_removed"] = evidence_quality["duplicate_evidence_removed"]
-    outline["warnings"] = _unique_strings([*outline.get("warnings", []), *coverage["warnings"]])
+    answer_plan = build_answer_plan_from_evidence(topic, [item for items in section_evidence.values() for item in items])
+    outline["answer_plan_summary"] = answer_plan_summary(answer_plan)
+    outline["warnings"] = _unique_strings(
+        [*outline.get("warnings", []), *coverage["warnings"], *answer_plan_warning_tags(outline["answer_plan_summary"])]
+    )
+    outline["open_questions"] = _unique_strings([*outline.get("open_questions", []), *answer_plan_open_questions(outline["answer_plan_summary"])])
     outline["review_partial_reasons"] = _review_partial_reasons(outline, contexts, coverage)
     outline["status"] = "partial" if outline["warnings"] or outline.get("source") == "rule" else "extracted"
 
@@ -572,6 +589,13 @@ def _frame_to_evidence_item(
         "confidence": frame.get("confidence", 0.0),
         "claim_frame_id": frame.get("frame_id") or "",
         "evidence_unit_ids": unit_ids,
+        "semantic_support_status": frame.get("semantic_support_status") or "not_checked",
+        "semantic_support_score": frame.get("semantic_support_score", 0.0),
+        "semantic_support_reason": frame.get("semantic_support_reason") or "",
+        "citation_risk": frame.get("citation_risk") or "not_checked",
+        "primary_evidence_unit_ids": frame.get("primary_evidence_unit_ids") or [],
+        "weak_evidence_unit_ids": frame.get("weak_evidence_unit_ids") or [],
+        "contradictory_evidence_unit_ids": frame.get("contradictory_evidence_unit_ids") or [],
         "source": "claim_frame",
     }
 
@@ -592,6 +616,9 @@ def _task_frame_score(frame: Dict[str, Any], terms: List[str]) -> float:
         support_status = "structurally_supported"
     if quality_score < 0.35 or support_status == "unsupported":
         return 0.0
+    semantic_status = str(frame.get("semantic_support_status") or "not_checked")
+    if semantic_status == "contradicted":
+        return 0.0
     haystack = " ".join(
         str(frame.get(field) or "")
         for field in (
@@ -606,9 +633,10 @@ def _task_frame_score(frame: Dict[str, Any], terms: List[str]) -> float:
     ).lower()
     term_score = sum(1.0 for term in terms if term.lower() in haystack)
     support_score = 0.35 if support_status == "structurally_supported" else (0.15 if frame.get("evidence_unit_ids") else 0.0)
+    semantic_score = task_semantic_score_adjustment(semantic_status)
     confidence_score = 0.2 * _confidence(frame.get("confidence"), 0.0)
     quality_boost = 0.25 * quality_score
-    return term_score + support_score + confidence_score + quality_boost
+    return max(0.0, term_score + support_score + semantic_score + confidence_score + quality_boost)
 
 
 def _search_doc_evidence(db_path: Path, doc_id: str, query: str, top_k: int, search_mode: str = "hybrid") -> List[Dict[str, Any]]:

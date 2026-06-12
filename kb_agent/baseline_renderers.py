@@ -67,6 +67,9 @@ def baseline_markdown(report: Dict[str, Any]) -> str:
         f"- filtered_memory_count: `{(report.get('memory_context') or {}).get('filtered_memory_count', 0)}`",
         f"- context_char_count: `{(report.get('memory_context') or {}).get('context_char_count', 0)}`",
         f"- review_partial_reasons: `{', '.join(((report.get('tasks') or {}).get('review') or {}).get('review_partial_reasons') or [])}`",
+        f"- compare_answerability: `{(((report.get('tasks') or {}).get('compare') or {}).get('answer_plan_summary') or {}).get('answerability', '')}`",
+        f"- review_answerability: `{(((report.get('tasks') or {}).get('review') or {}).get('answer_plan_summary') or {}).get('answerability', '')}`",
+        f"- answer_plan_claim_counts: `strong={_answer_plan_total(report, 'strong_claim_count')} qualified={_answer_plan_total(report, 'qualified_claim_count')} conflicting={_answer_plan_total(report, 'conflicting_claim_count')} insufficient={_answer_plan_total(report, 'insufficient_claim_count')}`",
         f"- top_review_blockers: `{', '.join(report.get('top_review_blockers') or [])}`",
         f"- baseline_limitations: `{', '.join(report.get('baseline_limitations') or [])}`",
         f"- llm_runtime_limitations: `{', '.join(report.get('llm_runtime_limitations') or [])}`",
@@ -113,7 +116,10 @@ def baseline_markdown(report: Dict[str, Any]) -> str:
 
 
 def baseline_html(report: Dict[str, Any]) -> str:
+    compare = ((report.get("tasks") or {}).get("compare") or {})
     review = ((report.get("tasks") or {}).get("review") or {})
+    compare_answer_plan = compare.get("answer_plan_summary") or {}
+    review_answer_plan = review.get("answer_plan_summary") or {}
     review_draft = ((report.get("tasks") or {}).get("review_draft") or {})
     fact_delta = report.get("fact_audit_delta") or {}
     tree_summary = (report.get("tree_search") or {}).get("comparison_summary") or {}
@@ -140,6 +146,10 @@ def baseline_html(report: Dict[str, Any]) -> str:
         ("LLM Budget", "exhausted" if llm_baseline.get("budget_exhausted") else "ok"),
         ("Facts LLM Rate", llm_facts.get("llm_facts_success_rate", 0.0)),
         ("Compare LLM Rate", llm_tasks.get("llm_compare_dimension_success_rate", 0.0)),
+        ("Compare Answerability", compare_answer_plan.get("answerability", "")),
+        ("Review Answerability", review_answer_plan.get("answerability", "")),
+        ("Strong Claims", int(compare_answer_plan.get("strong_claim_count") or 0) + int(review_answer_plan.get("strong_claim_count") or 0)),
+        ("Conflicting Claims", int(compare_answer_plan.get("conflicting_claim_count") or 0) + int(review_answer_plan.get("conflicting_claim_count") or 0)),
         ("Draft Status", review_draft.get("status", "")),
         ("Draft Skip", review_draft.get("review_draft_skip_reason", "")),
         ("Draft Quality", review_draft.get("draft_quality_level", "")),
@@ -302,3 +312,8 @@ def html_table(title: str, headers: List[str], rows: List[List[Any]]) -> str:
 def html_list_section(title: str, items: Iterable[Any]) -> str:
     rows = "\n".join(f"<li>{escape(str(item))}</li>" for item in items)
     return f"<section class='panel'><h2>{escape(title)}</h2><ul>{rows}</ul></section>"
+
+
+def _answer_plan_total(report: Dict[str, Any], field: str) -> int:
+    tasks = report.get("tasks") or {}
+    return sum(int(((tasks.get(name) or {}).get("answer_plan_summary") or {}).get(field) or 0) for name in ("compare", "review"))

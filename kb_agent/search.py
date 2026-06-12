@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from . import db
+from .answer_plan import answer_plan_counts, build_answer_plan
 from .embeddings import (
     EmbeddingError,
     cosine_similarity,
@@ -129,6 +130,8 @@ def build_search_report(
         trace["resolved_search_mode"] = mode
         docs = trace.get("routed_documents", []) or _docs_from_tree_results(trace.get("results", []))
         docs, routing = _augment_documents_with_routing_path(db_path, docs, query, top_k=top_k, doc_id=doc_id)
+        fact_matches = _fact_matches(db_path, query, doc_id, top_k=5)
+        answer_plan = build_answer_plan(query, (fact_matches.get("claim_frame_matches") or {}), trace.get("evidence") or [])
         return {
             "schema": "search_report.v1",
             "query": query,
@@ -137,7 +140,7 @@ def build_search_report(
             "resolved_search_mode": mode,
             "effective_search_mode": "tree",
             "top_k": top_k,
-            "warnings": _unique_strings([*trace.get("warnings", []), *((auto_resolution or {}).get("warnings") or [])]),
+            "warnings": _unique_strings([*trace.get("warnings", []), *((auto_resolution or {}).get("warnings") or []), *answer_plan.get("warnings", [])]),
             "auto_resolution": auto_resolution or {},
             "embedding_status": _safe_embedding_status(db_path),
             "hybrid_query_profile": _hybrid_query_profile(query),
@@ -145,7 +148,9 @@ def build_search_report(
             "document_routing": routing,
             "results": trace.get("results", []),
             "tree_search_trace": trace,
-            "fact_matches": _fact_matches(db_path, query, doc_id, top_k=5),
+            "fact_matches": fact_matches,
+            "answer_plan": answer_plan,
+            **answer_plan_counts(answer_plan),
         }
     conn = db.connect(db_path)
     db.init_db(conn)
@@ -157,6 +162,8 @@ def build_search_report(
         routing = _document_routing_report(docs)
     finally:
         conn.close()
+    fact_matches = _fact_matches(db_path, query, doc_id, top_k=5)
+    answer_plan = build_answer_plan(query, fact_matches.get("claim_frame_matches") or {})
     return {
         "schema": "search_report.v1",
         "query": query,
@@ -165,14 +172,16 @@ def build_search_report(
         "resolved_search_mode": mode,
         "effective_search_mode": "fts" if any("fts_fallback" in item.rank_reason for item in results) else mode,
         "top_k": top_k,
-        "warnings": _unique_strings([*warnings, *((auto_resolution or {}).get("warnings") or [])]),
+        "warnings": _unique_strings([*warnings, *((auto_resolution or {}).get("warnings") or []), *answer_plan.get("warnings", [])]),
         "auto_resolution": auto_resolution or {},
         "embedding_status": _safe_embedding_status(db_path),
         "hybrid_query_profile": _hybrid_query_profile(query),
         "documents": docs,
         "document_routing": routing,
         "results": [result.__dict__ for result in results],
-        "fact_matches": _fact_matches(db_path, query, doc_id, top_k=5),
+        "fact_matches": fact_matches,
+        "answer_plan": answer_plan,
+        **answer_plan_counts(answer_plan),
     }
 
 

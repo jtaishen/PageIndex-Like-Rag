@@ -1064,6 +1064,23 @@ uv run python -m kb_agent.cli claim-frames <doc_id>
 uv run python -m kb_agent.cli search-report "任务规划方法" --search-mode hybrid --top-k 3
 ```
 
+## v0.44 Evidence-Grounded Answer Planner
+
+v0.44 在语义验证后的 ClaimFrame 之上新增 `answer_plan.v1`，把 evidence 状态转换为回答策略。`answer_plan` 不生成正文，只告诉上层回答哪些 claim 可以强说、哪些必须限定、哪些只是相关线索、哪些存在冲突或证据不足。
+
+`search-report` 会追加 `answer_plan`、`answerability`、`answer_policy` 和各类 claim 计数。`ask --json` 也会返回同样的计划；普通 `ask` 文本输出在冲突、部分可答或证据不足时会先提示回答策略。`compare` 和 `generate-review` 的任务工件会写入 `answer_plan_summary`，比较矩阵和综述大纲遇到 `conflicting_evidence` 或缺少强支撑 claim 时会保留 warning / open question。
+
+映射规则固定为：`semantically_supported + safe` 进入 `strong_claims`；`partially_supported + needs_qualification` 进入 `qualified_claims`；`related_only` 只作背景；`insufficient_evidence` 只提示证据不足；`contradicted + conflicting_evidence` 优先暴露冲突，不能写成确定结论。
+
+轻量验收命令：
+
+```bash
+uv run python -m kb_agent.cli search-report "任务规划方法" --search-mode hybrid --top-k 3
+uv run python -m kb_agent.cli ask "这些论文有哪些任务规划方法？" --no-llm --json --search-mode hybrid --top-k 3
+uv run python -m kb_agent.cli compare "任务规划方法比较" --no-llm --top-k-docs 2
+uv run python -m kb_agent.cli generate-review "任务规划方法研究综述" --no-llm --top-k-docs 2
+```
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：

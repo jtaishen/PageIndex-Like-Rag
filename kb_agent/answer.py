@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
+from .answer_plan import answer_plan_counts, build_answer_plan
 from .llm import LLMError, generate_grounded_answer
 from .query import classify_query
 from .query_log import write_query_log
@@ -41,6 +42,8 @@ def answer_query(
         for result in results:
             packets = get_evidence(db_path, result.doc_id, [result.node_id])
             evidence.extend(packet.to_dict() for packet in packets)
+    claim_frame_matches = _claim_frame_matches(db_path, query, top_k=max(top_k, 5))
+    answer_plan = build_answer_plan(query, claim_frame_matches, evidence)
 
     lines: List[str] = []
     llm_error: Optional[str] = None
@@ -48,13 +51,15 @@ def answer_query(
         lines.append("没有找到足够证据支持回答。可以先运行 `kb sync <目录>`，或换一个更具体的关键词。")
     elif use_llm:
         try:
-            lines.append(generate_grounded_answer(query, evidence))
+            lines.append(generate_grounded_answer(query, evidence, answer_plan=answer_plan))
         except LLMError as exc:
             if require_llm:
                 raise
             llm_error = str(exc)
+            lines.extend(_format_answer_plan_notice(answer_plan))
             lines.extend(_format_evidence_fallback(evidence))
     else:
+        lines.extend(_format_answer_plan_notice(answer_plan))
         lines.extend(_format_evidence_fallback(evidence))
 
     docs_used = _unique_values(str(item.get("doc_id") or "") for item in evidence)
@@ -65,6 +70,7 @@ def answer_query(
         warnings.append(f"llm_unavailable:{llm_error}")
     if not evidence:
         warnings.append("no_evidence")
+    warnings.extend(str(item) for item in answer_plan.get("warnings", []))
     intent = ""
     if tree_trace:
         intent = str(((tree_trace.get("query_profile") or {}) if isinstance(tree_trace, dict) else {}).get("intent") or "")
@@ -89,6 +95,7 @@ def answer_query(
             "llm_error": bool(llm_error),
             "resolved_search_mode": effective_search_mode,
             "profile_name": auto_resolution.get("profile_name", ""),
+            **answer_plan_counts(answer_plan),
         },
     )
 
@@ -99,6 +106,8 @@ def answer_query(
         "auto_resolution": auto_resolution,
         "answer": "\n".join(lines),
         "evidence": evidence,
+        "answer_plan": answer_plan,
+        **answer_plan_counts(answer_plan),
         "tree_search_trace": tree_trace,
         "llm_error": llm_error,
     }
@@ -121,6 +130,33 @@ def _format_evidence_fallback(evidence: List[Dict[str, object]]) -> List[str]:
         lines.append(f"{index}. {title} | {path}{page_text}\n   {excerpt}")
     lines.append("说明：当前未成功调用 DeepSeek，因此只返回可追溯证据。")
     return lines
+
+
+def _format_answer_plan_notice(answer_plan: Dict[str, Any]) -> List[str]:
+    answerability = str(answer_plan.get("answerability") or "")
+    if answerability not in {"conflicting", "insufficient_evidence", "partially_answerable"}:
+        return []
+    policy = str(answer_plan.get("answer_policy") or "")
+    if answerability == "conflicting":
+        return [f"回答策略：存在冲突证据，不能直接写成确定结论。{policy}"]
+    if answerability == "partially_answerable":
+        return [f"回答策略：当前只能给出限定性结论。{policy}"]
+    return [f"回答策略：当前证据不足。{policy}"]
+
+
+def _claim_frame_matches(db_path: Path, query: str, *, top_k: int) -> Dict[str, Any]:
+    try:
+        from .claim_frames import search_claim_frames
+
+        return search_claim_frames(db_path, query, top_k=top_k)
+    except Exception as exc:
+        return {
+            "schema": "claim_frame_search.v1",
+            "available": False,
+            "count": 0,
+            "items": [],
+            "warnings": [f"claim_frame_search_unavailable:{exc}"],
+        }
 
 
 def _unique_values(values: Iterable[str]) -> List[str]:

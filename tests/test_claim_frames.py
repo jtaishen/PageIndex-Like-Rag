@@ -487,8 +487,11 @@ class ClaimFrameTest(unittest.TestCase):
             self.assertIn("semantic_support_status", frame_matches["items"][0])
             self.assertIn("citation_risk", frame_matches["items"][0])
             self.assertIn("primary_evidence_unit_ids", frame_matches["items"][0])
+            self.assertEqual(report["answer_plan"]["schema"], "answer_plan.v1")
+            self.assertIn(report["answerability"], {"answerable", "partially_answerable", "conflicting", "insufficient_evidence"})
 
             compare = compare_papers(db_path, "任务规划方法比较", top_k_docs=2, use_llm=False)
+            self.assertIn("answer_plan_summary", compare["comparison_matrix"])
             evidence = [
                 item
                 for dimension in compare["comparison_matrix"]["dimensions"]
@@ -496,14 +499,17 @@ class ClaimFrameTest(unittest.TestCase):
                 for item in cell.get("evidence") or []
             ]
             self.assertTrue(any(item.get("claim_frame_id") for item in evidence))
+            self.assertTrue(any("semantic_support_status" in item for item in evidence if item.get("claim_frame_id")))
 
             review = generate_review_plan(db_path, "任务规划方法", top_k_docs=2, use_llm=False)
+            self.assertIn("answer_plan_summary", review["review_outline"])
             section_evidence = [
                 item
                 for artifact in review["section_evidence"].values()
                 for item in artifact.get("evidence") or []
             ]
             self.assertTrue(any(item.get("claim_frame_id") for item in section_evidence))
+            self.assertTrue(any("citation_risk" in item for item in section_evidence if item.get("claim_frame_id")))
 
     def test_claim_frame_quality_filters_front_matter_and_ranks_supported_frames(self) -> None:
         supported = _frame_record(

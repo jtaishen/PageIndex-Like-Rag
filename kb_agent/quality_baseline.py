@@ -43,7 +43,7 @@ from .utils import compact_whitespace, read_json as _read_json, stable_id, uniqu
 
 
 BASELINE_SCHEMA = "quality_baseline.v1"
-CODE_VERSION = "v0.43"
+CODE_VERSION = "v0.44"
 BASELINE_FEATURE_FLAGS = {
     "review_draft_baseline": True,
     "baseline_staleness": True,
@@ -64,6 +64,7 @@ BASELINE_FEATURE_FLAGS = {
     "claim_frame_structural_status": True,
     "artifact_first_memory_compiler": True,
     "claim_frame_semantic_support": True,
+    "evidence_grounded_answer_plan": True,
 }
 BASELINE_DIR = DATA_DIR / "eval"
 EVAL_SET_DIR = DATA_DIR / "eval_sets"
@@ -283,6 +284,10 @@ def latest_quality_baseline(
         if exclude_temp and payload.get("run_kind") == "test_fixture":
             continue
         review = ((payload.get("tasks") or {}).get("review") or {})
+        compare = ((payload.get("tasks") or {}).get("compare") or {})
+        compare_answer_plan = compare.get("answer_plan_summary") or {}
+        review_answer_plan = review.get("answer_plan_summary") or {}
+        answerability_counts = _answerability_counts([compare_answer_plan, review_answer_plan])
         review_diagnostics = review.get("llm_diagnostics") or {}
         tree_delta = (payload.get("tree_search") or {}).get("comparison_summary") or {}
         fact_delta = payload.get("fact_audit_delta") or {}
@@ -329,6 +334,19 @@ def latest_quality_baseline(
                 "review_llm_error": (((payload.get("tasks") or {}).get("review") or {}).get("llm_error") or ""),
                 "review_fallback_mode": review_diagnostics.get("mode") or "",
                 "review_partial_reasons": review.get("review_partial_reasons") or [],
+                "answer_plan_available": bool(compare_answer_plan.get("available") or review_answer_plan.get("available")),
+                "answerability_counts": answerability_counts,
+                "strong_claim_count": int(compare_answer_plan.get("strong_claim_count") or 0)
+                + int(review_answer_plan.get("strong_claim_count") or 0),
+                "qualified_claim_count": int(compare_answer_plan.get("qualified_claim_count") or 0)
+                + int(review_answer_plan.get("qualified_claim_count") or 0),
+                "conflicting_claim_count": int(compare_answer_plan.get("conflicting_claim_count") or 0)
+                + int(review_answer_plan.get("conflicting_claim_count") or 0),
+                "insufficient_claim_count": int(compare_answer_plan.get("insufficient_claim_count") or 0)
+                + int(review_answer_plan.get("insufficient_claim_count") or 0),
+                "answer_plan_warning_counts": _warning_counts(
+                    [*(compare_answer_plan.get("warnings") or []), *(review_answer_plan.get("warnings") or [])]
+                ),
                 "review_draft_status": review_draft.get("status", ""),
                 "review_draft_skip_reason": review_draft.get("review_draft_skip_reason", "") or review_draft.get("reason", ""),
                 "review_draft_quality_level": review_draft.get("draft_quality_level", ""),
@@ -1452,6 +1470,7 @@ def _task_baseline(
             "llm_error": compare.get("llm_error", ""),
             "llm_diagnostics": matrix.get("llm_diagnostics") or {},
             "duplicate_evidence_removed": matrix.get("duplicate_evidence_removed", 0),
+            "answer_plan_summary": matrix.get("answer_plan_summary") or {},
         }
     except Exception as exc:
         result["compare"] = {"status": "failed", "error": str(exc)}
@@ -1494,6 +1513,7 @@ def _task_baseline(
             "llm_diagnostics": outline.get("llm_diagnostics") or {},
             "duplicate_evidence_removed": outline.get("duplicate_evidence_removed", 0),
             "review_partial_reasons": outline.get("review_partial_reasons") or [],
+            "answer_plan_summary": outline.get("answer_plan_summary") or {},
         }
     except Exception as exc:
         result["review"] = {"status": "failed", "error": str(exc)}
@@ -1911,6 +1931,27 @@ def _memory_context_summary(report: Dict[str, Any]) -> Dict[str, Any]:
         "read_policy": report.get("read_policy") or {},
         "warnings": report.get("warnings") or [],
     }
+
+
+def _answerability_counts(summaries: Iterable[Dict[str, Any]]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for summary in summaries:
+        if not summary:
+            continue
+        value = str(summary.get("answerability") or "insufficient_evidence")
+        counts[value] = counts.get(value, 0) + 1
+    return counts
+
+
+def _warning_counts(warnings: Iterable[Any]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for warning in warnings:
+        text = str(warning)
+        if not text:
+            continue
+        key = text.split(":", 1)[0]
+        counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 

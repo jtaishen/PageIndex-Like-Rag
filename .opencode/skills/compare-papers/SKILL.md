@@ -33,6 +33,7 @@ description: 跨论文比较 workflow；用于围绕主题筛选论文、生成�
 
 - 输出六类维度：问题设定、方法范式、数据与评测、创新点重叠、局限与失败模式、证据强度。
 - 每个关键比较结论绑定 evidence、EvidenceUnit 或 ClaimFrame。
+- 查看 `comparison_matrix.answer_plan_summary`；只有 strong/qualified claim 可以支撑关键比较结论。
 - 报告事实审计 warning、冲突数和证据缺口。
 
 ## 禁止事项

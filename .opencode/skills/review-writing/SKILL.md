@@ -27,11 +27,13 @@ description: 综述规划与草稿 workflow；用于生成综述大纲、章节�
 
 - 如果 `kb_check_review_citations` 有 unsupported paragraphs，停止组装或明确标记需修改。
 - 如果关键 ClaimFrame 的 `citation_risk` 为 `needs_more_evidence` 或 `conflicting_evidence`，停止当作强结论使用并给出修订动作。
+- 如果 `review_outline.answer_plan_summary.answerability` 为 `conflicting` 或 `insufficient_evidence`，先处理 open questions，不进入强结论写作。
 - 如果 section evidence 不足，保留 open questions，不让模型自由扩写。
 
 ## 输出要求
 
 - 汇总 review task id、章节状态、citation coverage、unsupported paragraph 数、missing refs 和关键 citation risk。
+- 汇总 `answerability`、strong/qualified/conflicting/insufficient claim 数。
 - 给出每节 `section_revision_actions`。
 - 总稿路径只作为工件路径返回，不在聊天里粘贴长正文。
 

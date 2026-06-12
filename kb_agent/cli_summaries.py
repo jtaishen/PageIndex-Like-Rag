@@ -74,10 +74,13 @@ def fact_summary(result: dict) -> dict:
 
 def task_summary(result: dict) -> dict:
     coverage = {}
+    answer_summary = {}
     if result.get("comparison_matrix"):
         coverage = result["comparison_matrix"].get("evidence_coverage", {})
+        answer_summary = result["comparison_matrix"].get("answer_plan_summary", {})
     elif result.get("review_outline"):
         coverage = result["review_outline"].get("evidence_coverage", {})
+        answer_summary = result["review_outline"].get("answer_plan_summary", {})
     return {
         "task_id": result.get("task_id"),
         "task_type": result.get("task_type"),
@@ -86,6 +89,13 @@ def task_summary(result: dict) -> dict:
         "selected_paper_count": (result.get("selected_papers") or {}).get("paper_count"),
         "artifact_paths": result.get("artifact_paths", {}),
         "evidence_coverage": coverage,
+        "answerability": answer_summary.get("answerability", ""),
+        "answer_policy": answer_summary.get("answer_policy", ""),
+        "strong_claim_count": answer_summary.get("strong_claim_count", 0),
+        "qualified_claim_count": answer_summary.get("qualified_claim_count", 0),
+        "conflicting_claim_count": answer_summary.get("conflicting_claim_count", 0),
+        "insufficient_claim_count": answer_summary.get("insufficient_claim_count", 0),
+        "answer_plan_warnings": answer_summary.get("warnings") or [],
         "warning_count": len(_task_warnings(result)),
         "warnings": _task_warnings(result),
         "llm_error": result.get("llm_error", ""),
@@ -98,6 +108,26 @@ def _task_warnings(result: dict) -> list:
     if result.get("review_outline"):
         return result["review_outline"].get("warnings", [])
     return []
+
+
+def _answerability_counts(summaries: List[dict]) -> dict:
+    counts: dict = {}
+    for summary in summaries:
+        if not summary:
+            continue
+        key = summary.get("answerability") or "insufficient_evidence"
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _warning_counts(warnings: List[object]) -> dict:
+    counts: dict = {}
+    for warning in warnings:
+        key = str(warning).split(":", 1)[0]
+        if not key:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def review_summary(result: dict) -> dict:
@@ -251,7 +281,10 @@ def quality_baseline_cli_summary(result: dict) -> dict:
     stage_summary = llm_baseline.get("stage_summary") or {}
     llm_facts = llm_baseline.get("insights_and_facts") or {}
     llm_tasks = llm_baseline.get("tasks") or {}
+    compare_task = ((result.get("tasks") or {}).get("compare") or {})
     review_task = ((result.get("tasks") or {}).get("review") or {})
+    compare_answer_plan = compare_task.get("answer_plan_summary") or {}
+    review_answer_plan = review_task.get("answer_plan_summary") or {}
     review_draft = ((result.get("tasks") or {}).get("review_draft") or {})
     review_diagnostics = review_task.get("llm_diagnostics") or {}
     return {
@@ -302,6 +335,16 @@ def quality_baseline_cli_summary(result: dict) -> dict:
         "review_fallback_mode": review_diagnostics.get("mode", ""),
         "review_retry_count": review_diagnostics.get("retry_count", 0),
         "review_partial_reasons": review_task.get("review_partial_reasons") or [],
+        "answer_plan_available": bool(compare_answer_plan.get("available") or review_answer_plan.get("available")),
+        "answerability_counts": _answerability_counts([compare_answer_plan, review_answer_plan]),
+        "strong_claim_count": int(compare_answer_plan.get("strong_claim_count") or 0) + int(review_answer_plan.get("strong_claim_count") or 0),
+        "qualified_claim_count": int(compare_answer_plan.get("qualified_claim_count") or 0)
+        + int(review_answer_plan.get("qualified_claim_count") or 0),
+        "conflicting_claim_count": int(compare_answer_plan.get("conflicting_claim_count") or 0)
+        + int(review_answer_plan.get("conflicting_claim_count") or 0),
+        "insufficient_claim_count": int(compare_answer_plan.get("insufficient_claim_count") or 0)
+        + int(review_answer_plan.get("insufficient_claim_count") or 0),
+        "answer_plan_warning_counts": _warning_counts([*(compare_answer_plan.get("warnings") or []), *(review_answer_plan.get("warnings") or [])]),
         "review_draft_status": review_draft.get("status", ""),
         "review_draft_skip_reason": review_draft.get("review_draft_skip_reason", "") or review_draft.get("reason", ""),
         "review_draft_quality_level": review_draft.get("draft_quality_level", ""),

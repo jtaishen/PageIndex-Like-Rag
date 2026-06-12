@@ -21,6 +21,7 @@ description: 知识库质量复盘 workflow；用于评测检索、baseline、fa
 
 - `kb_eval_search`：直接跑查询集评测。
 - `kb_eval_facts` / `kb_audit_facts`：复盘事实层、ClaimFrame 和 citation gaps。
+- `kb_get_task_artifact`：抽查 `comparison_matrix.answer_plan_summary` 或 `review_outline.answer_plan_summary` 的 answerability 分布。
 - `kb_eval_memory`：检查 memory 污染、重复和任务恢复。
 - `kb_get_query_stats`：查看查询日志趋势。
 
@@ -32,7 +33,7 @@ description: 知识库质量复盘 workflow；用于评测检索、baseline、fa
 ## 输出要求
 
 - 输出指标、baseline id、报告路径、warning 和 next actions。
-- 区分硬问题和背景限制，例如缺证据、unsupported frame、small corpus、可选 parser 未启用。
+- 区分硬问题和背景限制，例如缺证据、unsupported frame、answerability 冲突、small corpus、可选 parser 未启用。
 
 ## 禁止事项
 
