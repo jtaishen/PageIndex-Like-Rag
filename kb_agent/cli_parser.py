@@ -301,6 +301,14 @@ def build_parser() -> argparse.ArgumentParser:
     mem_search_parser.add_argument("--scope", default=None)
     mem_search_parser.add_argument("--top-k", type=int, default=8)
 
+    mem_compile_parser = subparsers.add_parser("memory-compile", help="Compile artifact-first memory context")
+    mem_compile_parser.add_argument("query")
+    mem_compile_parser.add_argument("--intent", default="default")
+    mem_compile_parser.add_argument("--task-id", default="")
+    mem_compile_parser.add_argument("--skill-scope", default="default")
+    mem_compile_parser.add_argument("--max-items", type=int, default=8)
+    mem_compile_parser.add_argument("--max-chars", type=int, default=4000)
+
     remember_task_parser = subparsers.add_parser("remember-task", help="Store compressed progress for a task")
     remember_task_parser.add_argument("task_id")
 

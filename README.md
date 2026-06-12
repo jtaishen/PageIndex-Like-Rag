@@ -3,7 +3,7 @@
 这是一个基于 OpenCode 的 PageIndex-like 论文知识库智能体 MVP。当前目标是跑通论文入库、结构化工件、章节树检索和 EvidenceUnit / ClaimFrame 的核心闭环：
 
 ```text
-parse -> normalize -> tree -> artifacts -> indexes -> EvidenceUnit -> ClaimFrame -> Verifier -> CLI / MCP 工具
+parse -> normalize -> tree -> artifacts -> indexes -> EvidenceUnit -> ClaimFrame -> Verifier -> Memory Context -> CLI / MCP 工具
 ```
 
 ## 当前能力
@@ -16,7 +16,7 @@ parse -> normalize -> tree -> artifacts -> indexes -> EvidenceUnit -> ClaimFrame
 - 将文档保存为 `documents` 和 `doc_nodes`。
 - 使用 SQLite FTS5 做全文检索，并支持本地 embedding + hybrid rerank。
 - 返回带 `doc_id`、`node_id`、`node_path`、页码和 excerpt 的 evidence packet，并可派生 EvidenceUnit、ClaimFrame 与 verifier 报告。
-- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`parse-report`、`layout`、`tables`、`table-content`、`table-summaries`、`embed`、`search-report`、`eval-search`、`eval-review`、`eval-memory`、`eval-facts`、`audit-facts`、`fact-conflicts`、`graph-build`、`graph-neighborhood`、`graph-export`、`graph-report`、`quality-baseline`、`latest-quality-baseline`、`eval-suite`、`benchmark`、`analyze-failures`、`case-study`、`query-log`、`query-stats`、`feedback-put`、`feedback-to-eval`、`eval-dashboard`、`tune-search`、`search-profile`、`extract`、`innovations`、`citations`、`extract-facts`、`extract-evidence-units`、`evidence-units`、`extract-claim-frames`、`claim-frames`、`verify-claim-frames`、`claims`、`entities`、`relations`、`fact-search`。
+- 提供 CLI 命令，包括 `card`、`artifacts`、`quality`、`parse-report`、`layout`、`tables`、`table-content`、`table-summaries`、`embed`、`search-report`、`eval-search`、`eval-review`、`eval-memory`、`eval-facts`、`audit-facts`、`fact-conflicts`、`graph-build`、`graph-neighborhood`、`graph-export`、`graph-report`、`quality-baseline`、`latest-quality-baseline`、`eval-suite`、`benchmark`、`analyze-failures`、`case-study`、`query-log`、`query-stats`、`feedback-put`、`feedback-to-eval`、`eval-dashboard`、`tune-search`、`search-profile`、`extract`、`innovations`、`citations`、`extract-facts`、`extract-evidence-units`、`evidence-units`、`extract-claim-frames`、`claim-frames`、`verify-claim-frames`、`claims`、`entities`、`relations`、`fact-search`、`memory-compile`。
 - 支持跨论文比较和综述规划任务工件，生成比较矩阵、综述大纲、章节证据表和下一步行动。
 - 支持长期 memory 写入门控、任务进度记忆、任务恢复和任务进度压缩。
 - 支持人工反馈闭环，可将用户评分、期望 doc/node/keyword 转为搜索评测集。
@@ -187,6 +187,12 @@ uv run python -m kb_agent.cli remember-task <task_id>
 
 ```bash
 uv run python -m kb_agent.cli resume-task
+```
+
+为当前 agent 步骤编译 artifact-first 上下文：
+
+```bash
+uv run python -m kb_agent.cli memory-compile "继续写综述" --intent review --task-id <task_id> --skill-scope review --max-chars 1200
 ```
 
 压缩重复任务进度：
@@ -1002,6 +1008,31 @@ uv run python -m kb_agent.cli verify-claim-frames --doc-id <doc_id>
 uv run python -m kb_agent.cli search-report "任务规划方法" --search-mode hybrid --top-k 3
 ```
 
+## v0.41 Artifact-First Memory Compiler
+
+v0.41 把长期 memory 从“可搜索记录”推进到“可交给 agent 的短上下文包”。`compile_memory_context()` 会先读取 `.kb_state/<task_id>/` 中的任务工件，再按 skill scope、TTL、写入门控、importance/confidence、query 和 task 相关性筛选长期 memory，最终生成 `memory_context.v1`。
+
+`memory_context.v1` 只包含任务快照、artifact 引用、计数、短摘要、入选原因、过滤原因和 `compiled_context` 短文本；不保存论文正文、prompt、模型原文、长 evidence 或 API key。它不改数据库 schema，也不调用 LLM。
+
+常用命令：
+
+```bash
+uv run python -m kb_agent.cli generate-review "任务规划方法研究综述" --no-llm --top-k-docs 2
+uv run python -m kb_agent.cli remember-task <task_id>
+uv run python -m kb_agent.cli memory-compile "继续写综述" --intent review --task-id <task_id> --skill-scope review --max-chars 1200
+uv run python -m kb_agent.cli resume-task
+```
+
+`resume-task` 会返回 `compiled_context_preview`，用于让 OpenCode/Codex 继续任务时优先知道当前任务、已有 artifact、下一步行动和允许读取的长期偏好。`quality-baseline` 和 `latest-quality-baseline` 会展示 `compiled_context_available`、`selected_memory_count`、`artifact_ref_count`、`filtered_memory_count` 和 `context_char_count`。
+
+轻量验收命令：
+
+```bash
+uv run python -m unittest tests.test_memory_compiler tests.test_cli_summaries
+uv run python -m compileall -q kb_agent
+git diff --check
+```
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
@@ -1099,7 +1130,7 @@ DeepSeek 官方 OpenCode 接入方式：
 推荐工具调用顺序：
 
 ```text
-kb_sync -> kb_build_semantic_index -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_get_layout_blocks -> kb_get_figures -> kb_get_tables -> kb_get_table_content -> kb_get_table_summaries -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_extract_facts -> kb_extract_evidence_units -> kb_get_evidence_units -> kb_extract_claim_frames -> kb_get_claim_frames -> kb_verify_claim_frames -> kb_get_claims -> kb_get_entities -> kb_get_relations -> kb_get_fact_graph -> kb_fact_search -> kb_audit_facts -> kb_get_fact_conflicts -> kb_build_knowledge_graph -> kb_get_graph_neighborhood -> kb_run_quality_baseline -> kb_get_latest_quality_baseline -> kb_classify_query -> kb_tree_search -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> kb_eval_search -> kb_eval_review -> kb_eval_memory -> kb_eval_facts -> kb_create_eval_suite -> kb_run_benchmark -> kb_analyze_failures -> kb_generate_case_study -> kb_get_query_stats -> memory_remember_task -> memory_resume_task -> kb_get_task_artifact
+kb_sync -> kb_build_semantic_index -> kb_search_docs -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_get_layout_blocks -> kb_get_figures -> kb_get_tables -> kb_get_table_content -> kb_get_table_summaries -> kb_extract_doc_insights -> kb_get_innovations -> kb_get_citation_map -> kb_extract_facts -> kb_extract_evidence_units -> kb_get_evidence_units -> kb_extract_claim_frames -> kb_get_claim_frames -> kb_verify_claim_frames -> kb_get_claims -> kb_get_entities -> kb_get_relations -> kb_get_fact_graph -> kb_fact_search -> kb_audit_facts -> kb_get_fact_conflicts -> kb_build_knowledge_graph -> kb_get_graph_neighborhood -> kb_run_quality_baseline -> kb_get_latest_quality_baseline -> kb_classify_query -> kb_tree_search -> kb_search_tree -> kb_get_evidence -> kb_answer -> kb_compare -> kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> kb_eval_search -> kb_eval_review -> kb_eval_memory -> kb_eval_facts -> kb_create_eval_suite -> kb_run_benchmark -> kb_analyze_failures -> kb_generate_case_study -> kb_get_query_stats -> memory_resume_task -> memory_compile_context -> memory_remember_task -> kb_get_task_artifact
 ```
 
 当用户明确指出某次结果好坏时，推荐追加：

@@ -244,6 +244,7 @@ def quality_baseline_cli_summary(result: dict) -> dict:
     benchmark = result.get("benchmark") or {}
     embedding = result.get("embedding") or {}
     claim_frame_verification = result.get("claim_frame_verification") or {}
+    memory_context = result.get("memory_context") or {}
     real_embedding = embedding.get("sentence_transformers") or {}
     llm_status = result.get("llm_status") or {}
     llm_baseline = result.get("llm_baseline") or {}
@@ -331,6 +332,13 @@ def quality_baseline_cli_summary(result: dict) -> dict:
         "missing_node_count": claim_frame_verification.get("missing_node_count", 0),
         "missing_source_count": claim_frame_verification.get("missing_source_count", 0),
         "top_frame_noise_reasons": claim_frame_verification.get("top_frame_noise_reasons", []),
+        "compiled_context_available": bool(memory_context.get("available")),
+        "compiled_context_schema": memory_context.get("schema", ""),
+        "selected_memory_count": memory_context.get("selected_memory_count", 0),
+        "artifact_ref_count": memory_context.get("artifact_ref_count", 0),
+        "filtered_memory_count": memory_context.get("filtered_memory_count", 0),
+        "context_char_count": memory_context.get("context_char_count", 0),
+        "memory_context_warnings": memory_context.get("warnings") or [],
         "tree_trace_completeness_before": ((result.get("tree_search") or {}).get("comparison_summary") or {}).get("rule_trace_completeness_avg", 0.0),
         "tree_trace_completeness_after": ((result.get("tree_search") or {}).get("comparison_summary") or {}).get("llm_trace_completeness_avg", 0.0),
         "compare_task_id": ((result.get("tasks") or {}).get("compare") or {}).get("task_id", ""),

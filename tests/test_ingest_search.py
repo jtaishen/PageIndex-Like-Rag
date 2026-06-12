@@ -811,12 +811,13 @@ class IngestSearchTest(unittest.TestCase):
                 result = run_quality_baseline(db_path, papers, use_llm=False, top_k=3)
 
             self.assertEqual(result["schema"], "quality_baseline.v1")
-            self.assertEqual(result["code_version"], "v0.40")
+            self.assertEqual(result["code_version"], "v0.41")
             self.assertTrue(result["git_commit"])
             self.assertTrue(result["feature_flags"]["review_draft_baseline"])
             self.assertTrue(result["feature_flags"]["claim_frame_quality_filtering"])
             self.assertTrue(result["feature_flags"]["evidence_unit_artifact_coverage"])
             self.assertTrue(result["feature_flags"]["claim_frame_structural_status"])
+            self.assertTrue(result["feature_flags"]["artifact_first_memory_compiler"])
             self.assertTrue(result["is_current_code_baseline"])
             self.assertEqual(result["baseline_stale_reason"], "")
             self.assertEqual(result["doc_count"], 2)
@@ -843,6 +844,9 @@ class IngestSearchTest(unittest.TestCase):
             self.assertTrue(result["tasks"]["compare"].get("task_id"))
             self.assertTrue(result["tasks"]["review"].get("task_id"))
             self.assertEqual(result["memory"]["schema"], "memory_eval.v1")
+            self.assertEqual(result["memory_context"]["schema"], "memory_context.v1")
+            self.assertGreaterEqual(result["memory_context"]["artifact_ref_count"], 0)
+            self.assertIn("context_char_count", result["memory_context"])
             self.assertIn("claim_graph", result)
             providers = {item["provider"]: item for item in result["parser_comparison"]["providers"]}
             self.assertEqual(providers["docling"]["status"], "skipped")
@@ -1081,7 +1085,7 @@ class IngestSearchTest(unittest.TestCase):
                     {
                         "schema": "quality_baseline.v1",
                         "baseline_id": "older-commit",
-                        "code_version": "v0.40",
+                        "code_version": "v0.41",
                         "git_commit": "0000000000000000000000000000000000000000",
                         "feature_flags": {"review_draft_baseline": True},
                         "corpus_path": str((Path.cwd() / "articles").resolve()),

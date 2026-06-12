@@ -48,7 +48,7 @@ from .knowledge_graph import (
     get_graph_report,
     get_knowledge_graph,
 )
-from .memory import compact_memory, put_memory_gated as write_memory_gated, remember_task, resume_task, search_memory
+from .memory import compile_memory_context, compact_memory, put_memory_gated as write_memory_gated, remember_task, resume_task, search_memory
 from .quality_baseline import latest_quality_baseline, run_quality_baseline
 from .query import classify_query
 from .query_log import list_query_logs, query_stats
@@ -837,6 +837,27 @@ if FastMCP is not None:
     ) -> List[Dict[str, Any]]:
         """Search relevant long-term memory items."""
         return search_memory(resolve_db_path(db_path), query, scope=scope, top_k=top_k)
+
+    @mcp.tool()
+    def memory_compile_context(
+        query: str,
+        intent: str = "default",
+        task_id: str = "",
+        skill_scope: str = "default",
+        max_items: int = 8,
+        max_chars: int = 4000,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Compile artifact-first memory context for a task, intent, and skill scope."""
+        return compile_memory_context(
+            resolve_db_path(db_path),
+            intent,
+            query,
+            task_id=task_id,
+            skill_scope=skill_scope,
+            max_items=max_items,
+            max_chars=max_chars,
+        )
 
     @mcp.tool()
     def memory_remember_task(task_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:

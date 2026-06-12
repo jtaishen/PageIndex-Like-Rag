@@ -52,6 +52,12 @@ def baseline_markdown(report: Dict[str, Any]) -> str:
         f"- noisy_frame_count: `{(report.get('claim_frame_verification') or {}).get('noisy_frame_count', 0)}`",
         f"- ignored_noise_frame_count: `{(report.get('claim_frame_verification') or {}).get('ignored_noise_frame_count', 0)}`",
         f"- top_frame_noise_reasons: `{', '.join((report.get('claim_frame_verification') or {}).get('top_frame_noise_reasons') or [])}`",
+        f"- compiled_context_available: `{(report.get('memory_context') or {}).get('available', False)}`",
+        f"- compiled_context_schema: `{(report.get('memory_context') or {}).get('schema', '')}`",
+        f"- selected_memory_count: `{(report.get('memory_context') or {}).get('selected_memory_count', 0)}`",
+        f"- artifact_ref_count: `{(report.get('memory_context') or {}).get('artifact_ref_count', 0)}`",
+        f"- filtered_memory_count: `{(report.get('memory_context') or {}).get('filtered_memory_count', 0)}`",
+        f"- context_char_count: `{(report.get('memory_context') or {}).get('context_char_count', 0)}`",
         f"- review_partial_reasons: `{', '.join(((report.get('tasks') or {}).get('review') or {}).get('review_partial_reasons') or [])}`",
         f"- top_review_blockers: `{', '.join(report.get('top_review_blockers') or [])}`",
         f"- baseline_limitations: `{', '.join(report.get('baseline_limitations') or [])}`",
@@ -107,6 +113,7 @@ def baseline_html(report: Dict[str, Any]) -> str:
     llm_facts = llm_baseline.get("insights_and_facts") or {}
     llm_tasks = llm_baseline.get("tasks") or {}
     embedding = report.get("embedding") or {}
+    memory_context = report.get("memory_context") or {}
     cards = [
         ("Docs", report.get("doc_count", 0)),
         ("PDFs", report.get("pdf_count", 0)),
@@ -141,6 +148,10 @@ def baseline_html(report: Dict[str, Any]) -> str:
         ("Limitations", ", ".join(report.get("baseline_limitations") or [])),
         ("Citation Gaps", f"{fact_delta.get('citation_gap_count_before', 0)}->{fact_delta.get('citation_gap_count_after', 0)}"),
         ("Memory", (report.get("memory") or {}).get("status", "")),
+        ("Context Available", memory_context.get("available", False)),
+        ("Selected Memory", memory_context.get("selected_memory_count", 0)),
+        ("Artifact Refs", memory_context.get("artifact_ref_count", 0)),
+        ("Context Chars", memory_context.get("context_char_count", 0)),
         ("Graph Conflicts", (report.get("claim_graph") or {}).get("conflict_count", 0)),
         ("Graph Isolated", (report.get("claim_graph") or {}).get("isolated_fact_count", 0)),
     ]

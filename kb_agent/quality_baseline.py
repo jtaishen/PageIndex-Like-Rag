@@ -34,6 +34,7 @@ from .ingest import discover_files, sync_directory
 from .insights import extract_doc_insights
 from .knowledge_graph import graph_summary
 from .llm import llm_status
+from .memory import compile_memory_context
 from .parsers import pdf_adapter_statuses
 from .review import draft_review
 from .tasks import COMPARE_DIMENSIONS, compare_papers, generate_review_plan
@@ -42,7 +43,7 @@ from .utils import compact_whitespace, read_json as _read_json, stable_id, uniqu
 
 
 BASELINE_SCHEMA = "quality_baseline.v1"
-CODE_VERSION = "v0.40"
+CODE_VERSION = "v0.41"
 BASELINE_FEATURE_FLAGS = {
     "review_draft_baseline": True,
     "baseline_staleness": True,
@@ -61,6 +62,7 @@ BASELINE_FEATURE_FLAGS = {
     "claim_frame_quality_filtering": True,
     "evidence_unit_artifact_coverage": True,
     "claim_frame_structural_status": True,
+    "artifact_first_memory_compiler": True,
 }
 BASELINE_DIR = DATA_DIR / "eval"
 EVAL_SET_DIR = DATA_DIR / "eval_sets"
@@ -158,6 +160,14 @@ def run_quality_baseline(
             skip_llm_tasks=skip_llm_tasks,
         )
     memory = eval_memory(db_path)
+    memory_context = compile_memory_context(
+        db_path,
+        "review",
+        "quality baseline task recovery",
+        skill_scope="review",
+        max_items=5,
+        max_chars=1600,
+    )
     graph = graph_summary(db_path, doc_ids=doc_ids, include_conflicts=True) if doc_ids else {
         "schema": "knowledge_graph_summary.v1",
         "available": False,
@@ -211,6 +221,7 @@ def run_quality_baseline(
         "llm_baseline": llm_baseline,
         "tasks": tasks,
         "memory": _memory_summary(memory),
+        "memory_context": _memory_context_summary(memory_context),
         "claim_graph": graph,
         "recommendations": recommendations,
         "warnings": _unique_strings(warnings),
@@ -267,6 +278,7 @@ def latest_quality_baseline(
         tree_delta = (payload.get("tree_search") or {}).get("comparison_summary") or {}
         fact_delta = payload.get("fact_audit_delta") or {}
         claim_frame_verification = payload.get("claim_frame_verification") or {}
+        memory_context = payload.get("memory_context") or {}
         llm_baseline = payload.get("llm_baseline") or {}
         stage_summary = llm_baseline.get("stage_summary") or {}
         llm_facts = llm_baseline.get("insights_and_facts") or {}
@@ -343,6 +355,13 @@ def latest_quality_baseline(
                 "noisy_frame_count": claim_frame_verification.get("noisy_frame_count", 0),
                 "ignored_noise_frame_count": claim_frame_verification.get("ignored_noise_frame_count", 0),
                 "top_frame_noise_reasons": claim_frame_verification.get("top_frame_noise_reasons", []),
+                "compiled_context_available": bool(memory_context.get("available")),
+                "compiled_context_schema": memory_context.get("schema", ""),
+                "selected_memory_count": memory_context.get("selected_memory_count", 0),
+                "artifact_ref_count": memory_context.get("artifact_ref_count", 0),
+                "filtered_memory_count": memory_context.get("filtered_memory_count", 0),
+                "context_char_count": memory_context.get("context_char_count", 0),
+                "memory_context_warnings": memory_context.get("warnings") or [],
                 "tree_trace_completeness_before": tree_delta.get("rule_trace_completeness_avg", 0.0),
                 "tree_trace_completeness_after": tree_delta.get("llm_trace_completeness_avg", 0.0),
                 "weak_doc_count": sum(1 for item in payload.get("documents") or [] if item.get("quality_level") == "weak"),
@@ -1857,6 +1876,22 @@ def _memory_summary(report: Dict[str, Any]) -> Dict[str, Any]:
         "duplicate_subject_count": report.get("duplicate_subject_count", 0),
         "suspected_pollution_count": report.get("suspected_pollution_count", 0),
         "resume_available": report.get("resume_available", False),
+        "warnings": report.get("warnings") or [],
+    }
+
+
+def _memory_context_summary(report: Dict[str, Any]) -> Dict[str, Any]:
+    compiled = str(report.get("compiled_context") or "")
+    return {
+        "schema": report.get("schema"),
+        "available": bool(compiled),
+        "task_id": report.get("task_id", ""),
+        "skill_scope": report.get("skill_scope", ""),
+        "selected_memory_count": report.get("selected_memory_count", 0),
+        "artifact_ref_count": report.get("artifact_ref_count", 0),
+        "filtered_memory_count": report.get("filtered_memory_count", 0),
+        "context_char_count": report.get("context_char_count", len(compiled)),
+        "read_policy": report.get("read_policy") or {},
         "warnings": report.get("warnings") or [],
     }
 

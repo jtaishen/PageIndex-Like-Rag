@@ -63,6 +63,15 @@ class CliSummariesTest(unittest.TestCase):
                     "ignored_noise_frame_count": 1,
                     "top_frame_noise_reasons": ["front_matter"],
                 },
+                "memory_context": {
+                    "schema": "memory_context.v1",
+                    "available": True,
+                    "selected_memory_count": 2,
+                    "artifact_ref_count": 4,
+                    "filtered_memory_count": 1,
+                    "context_char_count": 780,
+                    "warnings": ["filtered_memory_items"],
+                },
             }
         )
 
@@ -74,6 +83,13 @@ class CliSummariesTest(unittest.TestCase):
         self.assertTrue(result["llm_budget_exhausted"])
         self.assertEqual(result["low_quality_frame_count"], 2)
         self.assertEqual(result["top_frame_noise_reasons"], ["front_matter"])
+        self.assertTrue(result["compiled_context_available"])
+        self.assertEqual(result["compiled_context_schema"], "memory_context.v1")
+        self.assertEqual(result["selected_memory_count"], 2)
+        self.assertEqual(result["artifact_ref_count"], 4)
+        self.assertEqual(result["filtered_memory_count"], 1)
+        self.assertEqual(result["context_char_count"], 780)
+        self.assertEqual(result["memory_context_warnings"], ["filtered_memory_items"])
         self.assertEqual(result["warning_count"], 1)
 
     def test_eval_summary_names_are_public_and_consistent(self) -> None:

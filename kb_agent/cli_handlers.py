@@ -65,7 +65,7 @@ from .ingest import sync_directory
 from .insights import extract_doc_insights
 from .llm import llm_status
 from .knowledge_graph import build_knowledge_graph, export_knowledge_graph, get_graph_neighborhood, get_graph_report
-from .memory import compact_memory, put_memory_gated, remember_task, resume_task, search_memory
+from .memory import compile_memory_context, compact_memory, put_memory_gated, remember_task, resume_task, search_memory
 from .quality_baseline import latest_quality_baseline, run_quality_baseline
 from .query import classify_query
 from .query_log import list_query_logs, query_stats, write_query_log
@@ -407,6 +407,18 @@ def dispatch_command(args: Any, db_path: Path) -> None:
         )
     elif args.command == "memory-search":
         _print_json(search_memory(db_path, args.query, args.scope, args.top_k))
+    elif args.command == "memory-compile":
+        _print_json(
+            compile_memory_context(
+                db_path,
+                args.intent,
+                args.query,
+                task_id=args.task_id,
+                skill_scope=args.skill_scope,
+                max_items=args.max_items,
+                max_chars=args.max_chars,
+            )
+        )
     elif args.command == "remember-task":
         _print_json(remember_task(db_path, args.task_id))
     elif args.command == "resume-task":
