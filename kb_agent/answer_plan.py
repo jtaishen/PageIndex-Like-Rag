@@ -99,6 +99,41 @@ def answer_plan_counts(plan: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def answer_plan_rollup(summaries: Iterable[Optional[Dict[str, Any]]]) -> Dict[str, Any]:
+    items = [summary for summary in summaries if summary]
+    answerability_counts: Dict[str, int] = {}
+    warning_counts: Dict[str, int] = {}
+    result: Dict[str, Any] = {
+        "available": any(bool(item.get("available")) for item in items),
+        "answerability_counts": answerability_counts,
+        "strong_claim_count": 0,
+        "qualified_claim_count": 0,
+        "related_claim_count": 0,
+        "conflicting_claim_count": 0,
+        "insufficient_claim_count": 0,
+        "unchecked_claim_count": 0,
+        "warning_counts": warning_counts,
+    }
+    for item in items:
+        answerability = str(item.get("answerability") or "insufficient_evidence")
+        answerability_counts[answerability] = answerability_counts.get(answerability, 0) + 1
+        for field in (
+            "strong_claim_count",
+            "qualified_claim_count",
+            "related_claim_count",
+            "conflicting_claim_count",
+            "insufficient_claim_count",
+            "unchecked_claim_count",
+        ):
+            result[field] = int(result[field]) + int(item.get(field) or 0)
+        for warning in item.get("warnings") or []:
+            key = str(warning).split(":", 1)[0]
+            if not key:
+                continue
+            warning_counts[key] = warning_counts.get(key, 0) + 1
+    return result
+
+
 def build_answer_plan_from_evidence(query: str, evidence_items: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     claim_items = [
         item

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from . import db
+from .answer_plan import answer_plan_rollup
 from .artifacts import get_doc_card, get_parse_quality, get_parse_report
 from .baseline_renderers import baseline_html, baseline_markdown
 from .baseline_runtime import LLMBaselineRuntime, null_stage
@@ -287,7 +288,7 @@ def latest_quality_baseline(
         compare = ((payload.get("tasks") or {}).get("compare") or {})
         compare_answer_plan = compare.get("answer_plan_summary") or {}
         review_answer_plan = review.get("answer_plan_summary") or {}
-        answerability_counts = _answerability_counts([compare_answer_plan, review_answer_plan])
+        answer_plan = answer_plan_rollup([compare_answer_plan, review_answer_plan])
         review_diagnostics = review.get("llm_diagnostics") or {}
         tree_delta = (payload.get("tree_search") or {}).get("comparison_summary") or {}
         fact_delta = payload.get("fact_audit_delta") or {}
@@ -334,19 +335,13 @@ def latest_quality_baseline(
                 "review_llm_error": (((payload.get("tasks") or {}).get("review") or {}).get("llm_error") or ""),
                 "review_fallback_mode": review_diagnostics.get("mode") or "",
                 "review_partial_reasons": review.get("review_partial_reasons") or [],
-                "answer_plan_available": bool(compare_answer_plan.get("available") or review_answer_plan.get("available")),
-                "answerability_counts": answerability_counts,
-                "strong_claim_count": int(compare_answer_plan.get("strong_claim_count") or 0)
-                + int(review_answer_plan.get("strong_claim_count") or 0),
-                "qualified_claim_count": int(compare_answer_plan.get("qualified_claim_count") or 0)
-                + int(review_answer_plan.get("qualified_claim_count") or 0),
-                "conflicting_claim_count": int(compare_answer_plan.get("conflicting_claim_count") or 0)
-                + int(review_answer_plan.get("conflicting_claim_count") or 0),
-                "insufficient_claim_count": int(compare_answer_plan.get("insufficient_claim_count") or 0)
-                + int(review_answer_plan.get("insufficient_claim_count") or 0),
-                "answer_plan_warning_counts": _warning_counts(
-                    [*(compare_answer_plan.get("warnings") or []), *(review_answer_plan.get("warnings") or [])]
-                ),
+                "answer_plan_available": answer_plan["available"],
+                "answerability_counts": answer_plan["answerability_counts"],
+                "strong_claim_count": answer_plan["strong_claim_count"],
+                "qualified_claim_count": answer_plan["qualified_claim_count"],
+                "conflicting_claim_count": answer_plan["conflicting_claim_count"],
+                "insufficient_claim_count": answer_plan["insufficient_claim_count"],
+                "answer_plan_warning_counts": answer_plan["warning_counts"],
                 "review_draft_status": review_draft.get("status", ""),
                 "review_draft_skip_reason": review_draft.get("review_draft_skip_reason", "") or review_draft.get("reason", ""),
                 "review_draft_quality_level": review_draft.get("draft_quality_level", ""),
@@ -1931,28 +1926,6 @@ def _memory_context_summary(report: Dict[str, Any]) -> Dict[str, Any]:
         "read_policy": report.get("read_policy") or {},
         "warnings": report.get("warnings") or [],
     }
-
-
-def _answerability_counts(summaries: Iterable[Dict[str, Any]]) -> Dict[str, int]:
-    counts: Dict[str, int] = {}
-    for summary in summaries:
-        if not summary:
-            continue
-        value = str(summary.get("answerability") or "insufficient_evidence")
-        counts[value] = counts.get(value, 0) + 1
-    return counts
-
-
-def _warning_counts(warnings: Iterable[Any]) -> Dict[str, int]:
-    counts: Dict[str, int] = {}
-    for warning in warnings:
-        text = str(warning)
-        if not text:
-            continue
-        key = text.split(":", 1)[0]
-        counts[key] = counts.get(key, 0) + 1
-    return counts
-
 
 
 def _avg(values: Iterable[float]) -> float:

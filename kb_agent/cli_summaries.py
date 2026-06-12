@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import List
 
+from .answer_plan import answer_plan_rollup
+
 
 def extract_summary(result: dict) -> dict:
     innovation = result.get("innovation") or {}
@@ -108,26 +110,6 @@ def _task_warnings(result: dict) -> list:
     if result.get("review_outline"):
         return result["review_outline"].get("warnings", [])
     return []
-
-
-def _answerability_counts(summaries: List[dict]) -> dict:
-    counts: dict = {}
-    for summary in summaries:
-        if not summary:
-            continue
-        key = summary.get("answerability") or "insufficient_evidence"
-        counts[key] = counts.get(key, 0) + 1
-    return counts
-
-
-def _warning_counts(warnings: List[object]) -> dict:
-    counts: dict = {}
-    for warning in warnings:
-        key = str(warning).split(":", 1)[0]
-        if not key:
-            continue
-        counts[key] = counts.get(key, 0) + 1
-    return counts
 
 
 def review_summary(result: dict) -> dict:
@@ -285,6 +267,7 @@ def quality_baseline_cli_summary(result: dict) -> dict:
     review_task = ((result.get("tasks") or {}).get("review") or {})
     compare_answer_plan = compare_task.get("answer_plan_summary") or {}
     review_answer_plan = review_task.get("answer_plan_summary") or {}
+    answer_plan = answer_plan_rollup([compare_answer_plan, review_answer_plan])
     review_draft = ((result.get("tasks") or {}).get("review_draft") or {})
     review_diagnostics = review_task.get("llm_diagnostics") or {}
     return {
@@ -335,16 +318,13 @@ def quality_baseline_cli_summary(result: dict) -> dict:
         "review_fallback_mode": review_diagnostics.get("mode", ""),
         "review_retry_count": review_diagnostics.get("retry_count", 0),
         "review_partial_reasons": review_task.get("review_partial_reasons") or [],
-        "answer_plan_available": bool(compare_answer_plan.get("available") or review_answer_plan.get("available")),
-        "answerability_counts": _answerability_counts([compare_answer_plan, review_answer_plan]),
-        "strong_claim_count": int(compare_answer_plan.get("strong_claim_count") or 0) + int(review_answer_plan.get("strong_claim_count") or 0),
-        "qualified_claim_count": int(compare_answer_plan.get("qualified_claim_count") or 0)
-        + int(review_answer_plan.get("qualified_claim_count") or 0),
-        "conflicting_claim_count": int(compare_answer_plan.get("conflicting_claim_count") or 0)
-        + int(review_answer_plan.get("conflicting_claim_count") or 0),
-        "insufficient_claim_count": int(compare_answer_plan.get("insufficient_claim_count") or 0)
-        + int(review_answer_plan.get("insufficient_claim_count") or 0),
-        "answer_plan_warning_counts": _warning_counts([*(compare_answer_plan.get("warnings") or []), *(review_answer_plan.get("warnings") or [])]),
+        "answer_plan_available": answer_plan["available"],
+        "answerability_counts": answer_plan["answerability_counts"],
+        "strong_claim_count": answer_plan["strong_claim_count"],
+        "qualified_claim_count": answer_plan["qualified_claim_count"],
+        "conflicting_claim_count": answer_plan["conflicting_claim_count"],
+        "insufficient_claim_count": answer_plan["insufficient_claim_count"],
+        "answer_plan_warning_counts": answer_plan["warning_counts"],
         "review_draft_status": review_draft.get("status", ""),
         "review_draft_skip_reason": review_draft.get("review_draft_skip_reason", "") or review_draft.get("reason", ""),
         "review_draft_quality_level": review_draft.get("draft_quality_level", ""),
