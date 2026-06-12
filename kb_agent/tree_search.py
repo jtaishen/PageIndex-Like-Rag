@@ -11,10 +11,14 @@ from .llm import LLMError, generate_json_object
 from .models import EvidencePacket, SearchResult
 from .query import classify_query
 from .query_log import insert_query_log
+from .search_core import (
+    resolve_flat_search_mode as _resolve_flat_search_mode,
+    search_documents_ranked,
+    search_nodes_flat,
+)
 from .utils import compact_whitespace, first_words, unique_strings as _unique_strings
 
 
-FLAT_SEARCH_MODES = {"hybrid", "fts"}
 TREE_MEMORY_TYPES = {"preference", "project_rule", "setting", "default"}
 
 
@@ -132,11 +136,9 @@ def tree_search_for_query(
             search_mode=search_mode,
         )
 
-    from .search import search_documents
-
     route_mode = _resolve_flat_search_mode(search_mode)
     doc_limit = max(1, min(4, top_k))
-    docs = search_documents(db_path, query, top_k=doc_limit, search_mode=route_mode)
+    docs = search_documents_ranked(db_path, query, top_k=doc_limit, search_mode=route_mode)
     traces = []
     evidence: List[Dict[str, Any]] = []
     results: List[Dict[str, Any]] = []
@@ -237,10 +239,8 @@ def _flat_candidate_signals(
     budget: int,
     search_mode: str,
 ) -> Dict[str, Dict[str, Any]]:
-    from .search import search_nodes
-
     try:
-        flat = search_nodes(
+        flat = search_nodes_flat(
             db_path,
             query,
             doc_id=doc_id,
@@ -824,16 +824,6 @@ def _log_query(conn: Any, trace: Dict[str, Any], started: float) -> None:
             "fallback_used": bool(trace.get("fallback_reason")),
         },
     )
-
-
-def _resolve_flat_search_mode(search_mode: str) -> str:
-    mode = (search_mode or "hybrid").strip().lower()
-    if mode == "tree":
-        return "hybrid"
-    if mode not in FLAT_SEARCH_MODES:
-        choices = ", ".join(sorted([*FLAT_SEARCH_MODES, "tree"]))
-        raise ValueError(f"Unsupported search_mode '{search_mode}'. Expected one of: {choices}")
-    return mode
 
 
 def _optional_float(value: object) -> Optional[float]:
