@@ -813,7 +813,7 @@ class IngestSearchTest(unittest.TestCase):
                 result = run_quality_baseline(db_path, papers, use_llm=False, top_k=3)
 
             self.assertEqual(result["schema"], "quality_baseline.v1")
-            self.assertEqual(result["code_version"], "v0.57")
+            self.assertEqual(result["code_version"], "v0.58")
             self.assertTrue(result["git_commit"])
             self.assertTrue(result["feature_flags"]["review_draft_baseline"])
             self.assertTrue(result["feature_flags"]["claim_frame_quality_filtering"])
@@ -824,6 +824,7 @@ class IngestSearchTest(unittest.TestCase):
             self.assertTrue(result["feature_flags"]["evidence_grounded_answer_plan"])
             self.assertTrue(result["feature_flags"]["claim_frame_alignment_relations"])
             self.assertTrue(result["feature_flags"]["claim_frame_normalized_alignment"])
+            self.assertTrue(result["feature_flags"]["artifact_first_memory_negative_memory"])
             self.assertTrue(result["is_current_code_baseline"])
             self.assertEqual(result["baseline_stale_reason"], "")
             self.assertEqual(result["doc_count"], 2)
@@ -855,6 +856,8 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(result["memory"]["schema"], "memory_eval.v1")
             self.assertEqual(result["memory_context"]["schema"], "memory_context.v1")
             self.assertGreaterEqual(result["memory_context"]["artifact_ref_count"], 0)
+            self.assertIn("negative_memory_count", result["memory_context"])
+            self.assertIn("memory_plan_available", result["memory_context"])
             self.assertIn("context_char_count", result["memory_context"])
             self.assertIn("claim_graph", result)
             providers = {item["provider"]: item for item in result["parser_comparison"]["providers"]}
@@ -1094,7 +1097,7 @@ class IngestSearchTest(unittest.TestCase):
                     {
                         "schema": "quality_baseline.v1",
                         "baseline_id": "older-commit",
-                        "code_version": "v0.57",
+                        "code_version": "v0.58",
                         "git_commit": "0000000000000000000000000000000000000000",
                         "feature_flags": {"review_draft_baseline": True},
                         "corpus_path": str((Path.cwd() / "articles").resolve()),

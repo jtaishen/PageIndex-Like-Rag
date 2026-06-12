@@ -157,9 +157,11 @@ class CliSummariesTest(unittest.TestCase):
                     "schema": "memory_context.v1",
                     "available": True,
                     "selected_memory_count": 2,
+                    "negative_memory_count": 1,
                     "artifact_ref_count": 4,
                     "filtered_memory_count": 1,
                     "context_char_count": 780,
+                    "memory_plan_available": True,
                     "warnings": ["filtered_memory_items"],
                 },
             }
@@ -203,9 +205,11 @@ class CliSummariesTest(unittest.TestCase):
         self.assertTrue(result["compiled_context_available"])
         self.assertEqual(result["compiled_context_schema"], "memory_context.v1")
         self.assertEqual(result["selected_memory_count"], 2)
+        self.assertEqual(result["negative_memory_count"], 1)
         self.assertEqual(result["artifact_ref_count"], 4)
         self.assertEqual(result["filtered_memory_count"], 1)
         self.assertEqual(result["context_char_count"], 780)
+        self.assertTrue(result["memory_plan_available"])
         self.assertEqual(result["memory_context_warnings"], ["filtered_memory_items"])
         self.assertEqual(result["warning_count"], 1)
 

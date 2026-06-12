@@ -45,7 +45,7 @@ from .utils import compact_whitespace, read_json as _read_json, stable_id, uniqu
 
 
 BASELINE_SCHEMA = "quality_baseline.v1"
-CODE_VERSION = "v0.57"
+CODE_VERSION = "v0.58"
 BASELINE_FEATURE_FLAGS = {
     "review_draft_baseline": True,
     "baseline_staleness": True,
@@ -69,6 +69,7 @@ BASELINE_FEATURE_FLAGS = {
     "evidence_grounded_answer_plan": True,
     "claim_frame_alignment_relations": True,
     "claim_frame_normalized_alignment": True,
+    "artifact_first_memory_negative_memory": True,
 }
 BASELINE_DIR = DATA_DIR / "eval"
 EVAL_SET_DIR = DATA_DIR / "eval_sets"
@@ -409,9 +410,11 @@ def latest_quality_baseline(
                 "compiled_context_available": bool(memory_context.get("available")),
                 "compiled_context_schema": memory_context.get("schema", ""),
                 "selected_memory_count": memory_context.get("selected_memory_count", 0),
+                "negative_memory_count": memory_context.get("negative_memory_count", 0),
                 "artifact_ref_count": memory_context.get("artifact_ref_count", 0),
                 "filtered_memory_count": memory_context.get("filtered_memory_count", 0),
                 "context_char_count": memory_context.get("context_char_count", 0),
+                "memory_plan_available": bool(memory_context.get("memory_plan")),
                 "memory_context_warnings": memory_context.get("warnings") or [],
                 "tree_trace_completeness_before": tree_delta.get("rule_trace_completeness_avg", 0.0),
                 "tree_trace_completeness_after": tree_delta.get("llm_trace_completeness_avg", 0.0),
@@ -1960,9 +1963,11 @@ def _memory_context_summary(report: Dict[str, Any]) -> Dict[str, Any]:
         "task_id": report.get("task_id", ""),
         "skill_scope": report.get("skill_scope", ""),
         "selected_memory_count": report.get("selected_memory_count", 0),
+        "negative_memory_count": report.get("negative_memory_count", 0),
         "artifact_ref_count": report.get("artifact_ref_count", 0),
         "filtered_memory_count": report.get("filtered_memory_count", 0),
         "context_char_count": report.get("context_char_count", len(compiled)),
+        "memory_plan_available": bool(report.get("memory_plan")),
         "read_policy": report.get("read_policy") or {},
         "warnings": report.get("warnings") or [],
     }

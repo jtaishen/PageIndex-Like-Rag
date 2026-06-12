@@ -1112,6 +1112,20 @@ uv run python -m kb_agent.cli compare "任务规划方法比较" --no-llm --top-
 uv run python -m kb_agent.cli task-artifact <task_id> comparison_matrix.json
 ```
 
+## v0.58 Artifact-First Memory 负记忆与恢复计划
+
+v0.58 按技术方案中的 Artifact-First Memory Compiler 收敛长期 memory：`memory-put` 现在支持 `failure` 类型，用于保存短失败经验、触发条件和规避动作。写入门控会继续拒绝论文正文、长 excerpt、完整 evidence、prompt 和模型原文；负记忆只作为任务恢复和避坑提示，不作为论文事实证据。
+
+`memory-compile` 会在兼容 `memory_context.v1` 旧字段的基础上追加 `preferences`、`project_rules`、`task_progress`、`negative_memories` 和 memory plan。`resume-task` 会追加 `resume_plan`，说明当前阶段、阻塞缺口、下一步动作、建议命令和相关负记忆 ID。
+
+轻量验收命令：
+
+```bash
+uv run python -m kb_agent.cli memory-put project failure parser:double_column "双栏扫描 PDF 解析质量低；遇到该类文档先检查 parser_report，再决定是否重跑解析。" --confidence 0.9
+uv run python -m kb_agent.cli memory-compile "继续写综述" --intent review --skill-scope review --max-chars 1200
+uv run python -m kb_agent.cli resume-task
+```
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：

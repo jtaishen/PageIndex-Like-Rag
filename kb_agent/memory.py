@@ -20,6 +20,7 @@ ALLOWED_MEMORY_TYPES = {
     "setting",
     "task_progress",
     "next_action",
+    "failure",
     "default",
 }
 PAPER_ASSET_PATTERNS = (
@@ -27,6 +28,9 @@ PAPER_ASSET_PATTERNS = (
     re.compile(r"\bpage_range\b", re.IGNORECASE),
     re.compile(r"\bevidence(_packet)?\b", re.IGNORECASE),
     re.compile(r"\bexcerpt\b", re.IGNORECASE),
+    re.compile(r"\bprompt\s*[:=]", re.IGNORECASE),
+    re.compile(r"(完整|原始)\s*prompt", re.IGNORECASE),
+    re.compile(r"模型原文"),
     re.compile(r"\braw_text\b", re.IGNORECASE),
     re.compile(r"\bnode_path\b", re.IGNORECASE),
     re.compile(r"\[\s*E\d+\s*\]"),
@@ -41,8 +45,8 @@ PAPER_TEXT_TOKENS = (
 )
 SKILL_MEMORY_TYPES = {
     "paper_qa": {"preference", "project_rule", "setting", "default"},
-    "compare": {"preference", "project_rule", "setting", "task_progress", "next_action", "default"},
-    "review": {"preference", "project_rule", "setting", "task_progress", "next_action", "default"},
+    "compare": {"preference", "project_rule", "setting", "task_progress", "next_action", "failure", "default"},
+    "review": {"preference", "project_rule", "setting", "task_progress", "next_action", "failure", "default"},
     "memory_curator": set(ALLOWED_MEMORY_TYPES),
     "default": set(ALLOWED_MEMORY_TYPES),
 }
@@ -122,7 +126,7 @@ def put_memory_gated(
     refs: str = "",
     force: bool = False,
 ) -> Dict[str, object]:
-    gate = evaluate_memory_write(scope, type_, subject_key, content, confidence=confidence, force=force)
+    gate = evaluate_memory_write(scope, type_, subject_key, content, confidence=confidence, refs=refs, force=force)
     ttl = time.time() + ttl_days * 86400 if ttl_days is not None else None
     existing = _get_memory(db_path, scope, type_, subject_key)
     if not gate["accepted"]:
@@ -131,6 +135,10 @@ def put_memory_gated(
             "action": "rejected",
             "accepted": False,
             "reason": gate["reason"],
+            "gate_decision": "rejected",
+            "gate_reason": gate["reason"],
+            "memory_kind": gate["memory_kind"],
+            "safety_warnings": gate["safety_warnings"],
             "scope": scope,
             "type": type_,
             "subject_key": subject_key,
@@ -163,6 +171,10 @@ def put_memory_gated(
         "action": action,
         "accepted": True,
         "reason": gate["reason"],
+        "gate_decision": action,
+        "gate_reason": gate["reason"],
+        "memory_kind": gate["memory_kind"],
+        "safety_warnings": gate["safety_warnings"],
         "memory_id": saved["memory_id"],
         "scope": scope,
         "type": type_,
@@ -180,20 +192,30 @@ def evaluate_memory_write(
     content: str,
     *,
     confidence: float = 1.0,
+    refs: str = "",
     force: bool = False,
 ) -> Dict[str, object]:
+    memory_kind = _memory_kind(type_)
     if force:
-        return {"accepted": True, "reason": "force"}
+        return {
+            "accepted": True,
+            "reason": "force",
+            "memory_kind": memory_kind,
+            "safety_warnings": ["forced_write_bypasses_gate"],
+        }
     text = compact_whitespace(f"{scope} {type_} {subject_key} {content}")
+    warnings = _memory_safety_warnings(type_, content, refs=refs)
     if confidence < 0.45:
-        return {"accepted": False, "reason": "low_confidence"}
+        return {"accepted": False, "reason": "low_confidence", "memory_kind": memory_kind, "safety_warnings": warnings}
     if type_ not in ALLOWED_MEMORY_TYPES:
-        return {"accepted": False, "reason": "unsupported_memory_type"}
+        return {"accepted": False, "reason": "unsupported_memory_type", "memory_kind": memory_kind, "safety_warnings": warnings}
     if _looks_like_paper_asset(text):
-        return {"accepted": False, "reason": "paper_asset_boundary"}
+        return {"accepted": False, "reason": "paper_asset_boundary", "memory_kind": memory_kind, "safety_warnings": ["paper_asset_boundary"]}
+    if type_ == "failure" and len(content) > 600:
+        return {"accepted": False, "reason": "failure_memory_too_long", "memory_kind": memory_kind, "safety_warnings": warnings}
     if len(content) > 1200 and type_ != "project_rule":
-        return {"accepted": False, "reason": "content_too_long"}
-    return {"accepted": True, "reason": "allowed_memory"}
+        return {"accepted": False, "reason": "content_too_long", "memory_kind": memory_kind, "safety_warnings": warnings}
+    return {"accepted": True, "reason": "allowed_memory", "memory_kind": memory_kind, "safety_warnings": warnings}
 
 
 def search_memory(db_path: Path, query: str, scope: Optional[str] = None, top_k: int = 8) -> List[Dict[str, object]]:
@@ -256,7 +278,6 @@ def resume_task(db_path: Path) -> Dict[str, object]:
     current_task_id = str(current.get("task_id") or "") if current else ""
     current_task = _current_task_status(db_path, current_task_id) if current_task_id else {}
     task_memories = _recent_task_memories(db_path, limit=5)
-    suggested = _suggest_commands(current_task_id, current_task)
     context = compile_memory_context(
         db_path,
         intent=str(current_task.get("task_type") or current.get("task_type") or "resume") if current else "resume",
@@ -266,16 +287,19 @@ def resume_task(db_path: Path) -> Dict[str, object]:
         max_items=5,
         max_chars=MEMORY_CONTEXT_PREVIEW_CHARS,
     )
+    resume_plan = _resume_plan(current_task_id, current_task, context)
     return {
         "schema": "resume_task.v1",
         "current_task": current_task,
         "remembered_tasks": task_memories,
+        "resume_plan": resume_plan,
         "next_actions": current_task.get("next_actions", []),
-        "suggested_commands": suggested,
+        "suggested_commands": resume_plan["suggested_commands"],
         "compiled_context_preview": {
             "schema": context.get("schema"),
             "available": bool(context.get("compiled_context")),
             "selected_memory_count": context.get("selected_memory_count", 0),
+            "negative_memory_count": context.get("negative_memory_count", 0),
             "artifact_ref_count": context.get("artifact_ref_count", 0),
             "context_char_count": context.get("context_char_count", 0),
             "compiled_context": context.get("compiled_context", ""),
@@ -313,6 +337,7 @@ def compile_memory_context(
         skill_scope=skill_scope,
         max_items=max(0, max_items),
     )
+    memory_groups = _memory_groups(selected_memories)
     warnings = list(artifact_warnings)
     if not resolved_task_id:
         warnings.append("no_task_context")
@@ -320,13 +345,16 @@ def compile_memory_context(
         warnings.append("no_selected_memories")
     if filtered_memories:
         warnings.append("filtered_memory_items")
+    if memory_groups["negative_memories"]:
+        warnings.append("negative_memory_available")
+    memory_plan = _memory_plan(artifact_refs, selected_memories, filtered_memories, memory_groups)
     compiled, truncated = _compiled_context_text(
         intent=intent,
         query=query,
         skill_scope=skill_scope,
         task_snapshot=task_snapshot,
         artifact_refs=artifact_refs,
-        selected_memories=selected_memories,
+        memory_groups=memory_groups,
         max_chars=max(0, max_chars),
     )
     if truncated:
@@ -343,8 +371,14 @@ def compile_memory_context(
         "artifact_ref_count": len(artifact_refs),
         "selected_memories": selected_memories,
         "selected_memory_count": len(selected_memories),
+        "preferences": memory_groups["preferences"],
+        "project_rules": memory_groups["project_rules"],
+        "task_progress": memory_groups["task_progress"],
+        "negative_memories": memory_groups["negative_memories"],
+        "negative_memory_count": len(memory_groups["negative_memories"]),
         "filtered_memories": filtered_memories,
         "filtered_memory_count": len(filtered_memories),
+        "memory_plan": memory_plan,
         "compiled_context": compiled,
         "context_char_count": len(compiled),
         "token_or_char_budget": {"max_chars": max_chars, "truncated": truncated},
@@ -513,6 +547,52 @@ def _select_memories(
     return scored[:max_items], filtered[: max(20, max_items * 2)]
 
 
+def _memory_groups(selected: List[Dict[str, object]]) -> Dict[str, List[Dict[str, object]]]:
+    groups = {
+        "preferences": [],
+        "project_rules": [],
+        "task_progress": [],
+        "negative_memories": [],
+    }
+    for item in selected:
+        memory_type = str(item.get("type") or "")
+        if memory_type == "failure":
+            groups["negative_memories"].append(item)
+        elif memory_type == "project_rule":
+            groups["project_rules"].append(item)
+        elif memory_type in {"task_progress", "next_action"}:
+            groups["task_progress"].append(item)
+        elif memory_type in {"preference", "setting", "default"}:
+            groups["preferences"].append(item)
+    return groups
+
+
+def _memory_plan(
+    artifact_refs: List[Dict[str, object]],
+    selected_memories: List[Dict[str, object]],
+    filtered_memories: List[Dict[str, object]],
+    memory_groups: Dict[str, List[Dict[str, object]]],
+) -> Dict[str, object]:
+    return {
+        "schema": "memory_plan.v1",
+        "artifact_first": True,
+        "artifact_sources": [str(item.get("name") or "") for item in artifact_refs if item.get("name")],
+        "selected_memory_ids": [str(item.get("memory_id") or "") for item in selected_memories if item.get("memory_id")],
+        "filtered_memory_ids": [str(item.get("memory_id") or "") for item in filtered_memories if item.get("memory_id")],
+        "negative_memory_ids": [str(item.get("memory_id") or "") for item in memory_groups["negative_memories"] if item.get("memory_id")],
+        "counts": {
+            "artifact_ref_count": len(artifact_refs),
+            "selected_memory_count": len(selected_memories),
+            "filtered_memory_count": len(filtered_memories),
+            "preference_count": len(memory_groups["preferences"]),
+            "project_rule_count": len(memory_groups["project_rules"]),
+            "task_progress_count": len(memory_groups["task_progress"]),
+            "negative_memory_count": len(memory_groups["negative_memories"]),
+        },
+        "warnings": ["negative_memory_available"] if memory_groups["negative_memories"] else [],
+    }
+
+
 def _memory_filter_reason(row: Dict[str, object], allowed_types: set[str]) -> str:
     memory_type = str(row.get("type") or "")
     confidence = _float(row.get("confidence"), 1.0)
@@ -558,6 +638,9 @@ def _memory_context_item(row: Dict[str, object], *, intent: str, query: str, tas
     if row.get("type") == "task_progress":
         score += 0.25
         reasons.append("task_progress")
+    if row.get("type") == "failure":
+        score += 0.2
+        reasons.append("negative_memory")
     return {
         "memory_id": row.get("memory_id"),
         "scope": row.get("scope"),
@@ -580,7 +663,7 @@ def _compiled_context_text(
     skill_scope: str,
     task_snapshot: Dict[str, object],
     artifact_refs: List[Dict[str, object]],
-    selected_memories: List[Dict[str, object]],
+    memory_groups: Dict[str, List[Dict[str, object]]],
     max_chars: int,
 ) -> tuple[str, bool]:
     lines = [
@@ -604,9 +687,19 @@ def _compiled_context_text(
         lines.append("artifact_refs:")
         for item in artifact_refs[:10]:
             lines.append(f"- {item.get('name')}: {item.get('summary')} ({item.get('path')})")
-    if selected_memories:
+    if any(memory_groups.get(key) for key in ("preferences", "project_rules", "task_progress", "negative_memories")):
         lines.append("selected_memories:")
-        for item in selected_memories:
+    for label, title in (
+        ("preferences", "preferences:"),
+        ("project_rules", "project_rules:"),
+        ("task_progress", "task_progress:"),
+        ("negative_memories", "negative_memories:"),
+    ):
+        items = memory_groups.get(label) or []
+        if not items:
+            continue
+        lines.append(title)
+        for item in items:
             refs = item.get("refs") or []
             ref_text = f" refs={','.join(str(ref) for ref in refs[:3])}" if refs else ""
             lines.append(f"- [{item.get('type')}] {item.get('subject_key')}: {item.get('content')}{ref_text}")
@@ -664,6 +757,27 @@ def _float(value: object, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _memory_kind(type_: str) -> str:
+    if type_ == "failure":
+        return "negative_memory"
+    if type_ in {"task_progress", "next_action"}:
+        return "task_state"
+    if type_ in {"preference", "setting", "default"}:
+        return "preference"
+    if type_ == "project_rule":
+        return "project_rule"
+    return "unknown"
+
+
+def _memory_safety_warnings(type_: str, content: str, refs: str) -> List[str]:
+    warnings = []
+    if type_ == "failure" and len(compact_whitespace(content)) > 480:
+        warnings.append("failure_memory_near_length_limit")
+    if refs and _looks_like_paper_asset(refs):
+        warnings.append("refs_may_point_to_paper_asset")
+    return warnings
 
 
 def _get_memory(db_path: Path, scope: str, type_: str, subject_key: str) -> Optional[Dict[str, object]]:
@@ -745,15 +859,20 @@ def _current_task_status(db_path: Path, task_id: str) -> Dict[str, object]:
     next_actions = _read_task_json(task_dir / "next_actions.json", optional=True)
     review_report = _read_task_json(task_dir / "review_report.json", optional=True)
     citation_check = _read_task_json(task_dir / "citation_check.json", optional=True)
+    section_dir = task_dir / "section_evidence"
     return {
         "task_id": task_id,
         "task_type": manifest.get("task_type") or "",
         "query": manifest.get("query") or "",
         "status": review_report.get("status") or manifest.get("status") or "",
         "task_dir": str(task_dir),
+        "has_manifest": (task_dir / "manifest.json").exists(),
+        "has_comparison_matrix": (task_dir / "comparison_matrix.json").exists(),
         "has_review_outline": (task_dir / "review_outline.json").exists(),
         "has_review_draft": (task_dir / "review_draft.md").exists(),
+        "has_review_report": bool(review_report),
         "has_citation_check": bool(citation_check),
+        "has_section_evidence": section_dir.exists() and any(section_dir.glob("*.json")),
         "drafted_section_count": review_report.get("drafted_section_count"),
         "citation_coverage_score": review_report.get("citation_coverage_score", citation_check.get("coverage_score")),
         "next_actions": next_actions.get("items") or review_report.get("next_actions") or [],
@@ -810,6 +929,98 @@ def _suggest_commands(task_id: str, current_task: Dict[str, object]) -> List[str
         commands.append(f"uv run python -m kb_agent.cli assemble-review {task_id}")
     commands.append(f"uv run python -m kb_agent.cli remember-task {task_id}")
     return commands
+
+
+def _resume_plan(task_id: str, current_task: Dict[str, object], context: Dict[str, object]) -> Dict[str, object]:
+    if not task_id:
+        return {
+            "schema": "resume_plan.v1",
+            "status": "blocked",
+            "current_stage": "no_current_task",
+            "blocking_gaps": ["no_current_task"],
+            "next_actions": ["provide_task_id_or_create_task"],
+            "suggested_commands": _suggest_commands("", {}),
+            "relevant_negative_memory_ids": [],
+        }
+    task_type = str(current_task.get("task_type") or "task")
+    if task_type == "review":
+        stage, gaps = _review_resume_stage(current_task)
+    elif task_type == "compare":
+        stage, gaps = _compare_resume_stage(current_task)
+    else:
+        stage, gaps = ("task_ready", [] if current_task.get("has_manifest") else ["missing_manifest"])
+    commands = _resume_commands(task_id, task_type, stage, gaps, current_task)
+    actions = [str(item) for item in current_task.get("next_actions") or [] if str(item)] or _default_resume_actions(task_type, stage, gaps)
+    return {
+        "schema": "resume_plan.v1",
+        "status": "blocked" if gaps else "ready",
+        "current_stage": stage,
+        "blocking_gaps": gaps,
+        "next_actions": actions,
+        "suggested_commands": commands,
+        "relevant_negative_memory_ids": [str(item.get("memory_id") or "") for item in context.get("negative_memories") or [] if item.get("memory_id")],
+    }
+
+
+def _review_resume_stage(current_task: Dict[str, object]) -> tuple[str, List[str]]:
+    gaps: List[str] = []
+    if not current_task.get("has_manifest"):
+        gaps.append("missing_manifest")
+    if not current_task.get("has_review_outline"):
+        gaps.append("missing_review_outline")
+        return "needs_review_outline", gaps
+    if not current_task.get("has_section_evidence"):
+        gaps.append("missing_section_evidence")
+        return "needs_section_evidence", gaps
+    if not current_task.get("has_review_draft"):
+        return "ready_to_draft", gaps
+    if not current_task.get("has_review_report") or not current_task.get("has_citation_check"):
+        gaps.append("missing_citation_check")
+        return "needs_citation_check", gaps
+    coverage = _float(current_task.get("citation_coverage_score"), 1.0)
+    if coverage < 0.6:
+        gaps.append("low_citation_coverage")
+        return "needs_citation_repair", gaps
+    return "ready_to_assemble", gaps
+
+
+def _compare_resume_stage(current_task: Dict[str, object]) -> tuple[str, List[str]]:
+    gaps = []
+    if not current_task.get("has_manifest"):
+        gaps.append("missing_manifest")
+    if not current_task.get("has_comparison_matrix"):
+        gaps.append("missing_comparison_matrix")
+        return "needs_comparison_matrix", gaps
+    return "comparison_ready", gaps
+
+
+def _resume_commands(task_id: str, task_type: str, stage: str, gaps: List[str], current_task: Dict[str, object]) -> List[str]:
+    if "missing_review_outline" in gaps:
+        return [f"uv run python -m kb_agent.cli generate-review \"{current_task.get('query') or '<topic>'}\" --no-llm"]
+    if "missing_comparison_matrix" in gaps:
+        return [f"uv run python -m kb_agent.cli compare \"{current_task.get('query') or '<topic>'}\" --no-llm"]
+    if stage == "ready_to_draft":
+        return [f"uv run python -m kb_agent.cli draft-review {task_id}", f"uv run python -m kb_agent.cli remember-task {task_id}"]
+    if stage in {"needs_citation_check", "needs_citation_repair"}:
+        return [f"uv run python -m kb_agent.cli check-review {task_id}", f"uv run python -m kb_agent.cli remember-task {task_id}"]
+    if stage == "ready_to_assemble":
+        return [f"uv run python -m kb_agent.cli assemble-review {task_id}", f"uv run python -m kb_agent.cli remember-task {task_id}"]
+    if task_type == "compare":
+        return [f"uv run python -m kb_agent.cli task-artifact {task_id} comparison_matrix.json", f"uv run python -m kb_agent.cli remember-task {task_id}"]
+    return _suggest_commands(task_id, current_task)
+
+
+def _default_resume_actions(task_type: str, stage: str, gaps: List[str]) -> List[str]:
+    if gaps:
+        return [f"resolve:{gap}" for gap in gaps]
+    if task_type == "review":
+        return {
+            "ready_to_draft": ["draft_review_sections"],
+            "ready_to_assemble": ["assemble_review"],
+        }.get(stage, ["inspect_review_artifacts"])
+    if task_type == "compare":
+        return ["inspect_comparison_matrix"]
+    return ["inspect_task_artifacts"]
 
 
 def _compact_task_progress(rows: List[Dict[str, object]]) -> Dict[str, object]:

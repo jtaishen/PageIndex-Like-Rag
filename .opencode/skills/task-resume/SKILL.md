@@ -29,7 +29,8 @@ description: 任务恢复 workflow；用于从 .kb_state 和长期 memory 恢复
 
 ## 输出要求
 
-- 输出 task_id、任务类型、当前状态、compiled_context 摘要、缺口、next actions 和建议命令。
+- 优先查看 `resume_plan`，输出 task_id、任务类型、当前阶段、阻塞缺口、next actions 和建议命令。
+- 查看 `compiled_context_preview`、memory plan 和 `negative_memories`；负记忆只作为风险提示，不作为论文事实证据。
 - 只引用任务工件路径和短状态，不粘贴长草稿或 evidence。
 
 ## 禁止事项

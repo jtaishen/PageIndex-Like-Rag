@@ -29,6 +29,7 @@ description: 长期 memory 写入与任务恢复 workflow；用于判断哪些�
 - 稳定、可复用的用户偏好。
 - 项目规则、默认目录、引用格式、关注维度。
 - 跨 session 仍有价值的任务状态和 next actions。
+- 短失败经验、触发条件、影响和规避动作，类型使用 `failure`。
 
 ## 不可写入长期 memory
 
@@ -40,7 +41,8 @@ description: 长期 memory 写入与任务恢复 workflow；用于判断哪些�
 ## 输出要求
 
 - 说明 memory 写入结果：accepted、rejected 或 merged。
-- 恢复任务时返回 task_id、当前状态、compiled_context 摘要、缺口和建议命令。
+- 恢复任务时先看 `resume_plan`，返回 task_id、当前阶段、阻塞缺口和建议命令。
+- 编译上下文时查看 memory plan 和 `negative_memories`；负记忆只能用于避坑，不可替代 evidence。
 
 ## 禁止事项
 

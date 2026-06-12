@@ -44,6 +44,52 @@ class MemoryCompilerTest(unittest.TestCase):
             self.assertIn("下一步完善方法比较", result["compiled_context"])
             self.assertNotIn("node_id: n1", result["compiled_context"])
             self.assertTrue(any(item["reason"] == "paper_asset_boundary" for item in result["filtered_memories"]))
+            self.assertEqual(result["memory_plan"]["schema"], "memory_plan.v1")
+            self.assertTrue(result["memory_plan"]["artifact_first"])
+
+    def test_failure_memory_is_negative_context_and_rejects_paper_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "kb.sqlite"
+            _create_review_task(db_path)
+            written = put_memory_gated(
+                db_path,
+                "project",
+                "failure",
+                "parser:double_column",
+                "双栏扫描 PDF 解析质量低；遇到该类文档先检查 parser_report，再决定是否重跑解析。",
+                confidence=0.9,
+            )
+
+            self.assertTrue(written["accepted"])
+            self.assertEqual(written["memory_kind"], "negative_memory")
+            self.assertEqual(written["gate_decision"], "accepted")
+
+            rejected = put_memory_gated(
+                db_path,
+                "project",
+                "failure",
+                "bad:prompt",
+                "prompt: node_id=n1 evidence excerpt 这段正文不应进入长期记忆。",
+                confidence=0.9,
+            )
+            self.assertFalse(rejected["accepted"])
+            self.assertEqual(rejected["gate_reason"], "paper_asset_boundary")
+
+            result = compile_memory_context(
+                db_path,
+                "review",
+                "继续写综述",
+                task_id=TASK_ID,
+                skill_scope="review",
+                max_items=6,
+                max_chars=2400,
+            )
+
+            self.assertEqual(result["negative_memory_count"], 1)
+            self.assertEqual(result["negative_memories"][0]["subject_key"], "parser:double_column")
+            self.assertIn("negative_memories:", result["compiled_context"])
+            self.assertIn("negative_memory_available", result["warnings"])
+            self.assertEqual(result["memory_plan"]["counts"]["negative_memory_count"], 1)
 
     def test_skill_scope_excludes_task_progress_for_paper_qa(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -63,6 +109,7 @@ class MemoryCompilerTest(unittest.TestCase):
 
             selected_types = {item["type"] for item in result["selected_memories"]}
             self.assertNotIn("task_progress", selected_types)
+            self.assertNotIn("failure", selected_types)
             self.assertIn("preference", selected_types)
             self.assertTrue(
                 any(item["type"] == "task_progress" and item["reason"] == "skill_scope_mismatch" for item in result["filtered_memories"])
@@ -91,6 +138,10 @@ class MemoryCompilerTest(unittest.TestCase):
             self.assertEqual(preview["schema"], "memory_context.v1")
             self.assertTrue(preview["available"])
             self.assertGreater(preview["artifact_ref_count"], 0)
+            self.assertEqual(resumed["resume_plan"]["schema"], "resume_plan.v1")
+            self.assertEqual(resumed["resume_plan"]["status"], "ready")
+            self.assertEqual(resumed["resume_plan"]["current_stage"], "ready_to_draft")
+            self.assertTrue(any("draft-review" in item for item in resumed["resume_plan"]["suggested_commands"]))
 
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
@@ -114,6 +165,32 @@ class MemoryCompilerTest(unittest.TestCase):
             self.assertEqual(payload["schema"], "memory_context.v1")
             self.assertEqual(payload["task_id"], TASK_ID)
             self.assertGreater(payload["artifact_ref_count"], 0)
+
+    def test_resume_plan_blocks_when_review_artifacts_are_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "kb.sqlite"
+            root = _task_state_root(db_path)
+            task_dir = root / TASK_ID
+            _write_json(root / "current_task.json", {"schema": "current_task.v1", "task_id": TASK_ID, "task_type": "review"})
+            _write_json(
+                task_dir / "manifest.json",
+                {
+                    "schema": "task_manifest.v1",
+                    "task_id": TASK_ID,
+                    "task_type": "review",
+                    "query": "任务规划方法研究综述",
+                    "status": "planned",
+                },
+            )
+
+            result = resume_task(db_path)
+            plan = result["resume_plan"]
+
+            self.assertEqual(plan["status"], "blocked")
+            self.assertEqual(plan["current_stage"], "needs_review_outline")
+            self.assertIn("missing_review_outline", plan["blocking_gaps"])
+            self.assertTrue(any("generate-review" in item for item in plan["suggested_commands"]))
+            self.assertFalse(any("draft-review" in item for item in plan["suggested_commands"]))
 
 
 def _create_review_task(db_path: Path) -> tuple[str, Path]:
