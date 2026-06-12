@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from .llm import LLMError, generate_json_object, llm_payload_metadata
-from .tasks import TASK_ID_RE, _task_state_root
+from .task_artifacts import TASK_ID_RE, task_state_root
 from .utils import compact_whitespace, stable_id, unique_strings as _unique_strings, write_json
 
 
@@ -189,7 +189,7 @@ def check_review_citations(db_path: Path, task_id: str) -> Dict[str, Any]:
 def _review_task_dir(db_path: Path, task_id: str) -> Path:
     if not TASK_ID_RE.fullmatch(task_id):
         raise ValueError(f"Unsupported task id: {task_id}")
-    task_dir = _task_state_root(db_path) / task_id
+    task_dir = task_state_root(db_path) / task_id
     if not task_dir.exists():
         raise FileNotFoundError(f"Task directory not found: {task_dir}")
     if not (task_dir / "review_outline.json").exists():

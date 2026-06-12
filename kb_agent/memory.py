@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from . import db
-from .tasks import TASK_ID_RE, _task_state_root
+from .task_artifacts import TASK_ID_RE, task_state_root
 from .utils import compact_whitespace, stable_id, unique_strings as _unique_strings
 
 
@@ -251,7 +251,7 @@ def remember_task(db_path: Path, task_id: str) -> Dict[str, object]:
 
 
 def resume_task(db_path: Path) -> Dict[str, object]:
-    state_root = _task_state_root(db_path)
+    state_root = task_state_root(db_path)
     current = _read_task_json(state_root / "current_task.json", optional=True)
     current_task_id = str(current.get("task_id") or "") if current else ""
     current_task = _current_task_status(db_path, current_task_id) if current_task_id else {}
@@ -388,7 +388,7 @@ def compact_memory(db_path: Path, scope: Optional[str] = None) -> Dict[str, obje
 def _resolve_task_id(db_path: Path, task_id: str) -> str:
     if task_id:
         return task_id
-    current = _read_task_json(_task_state_root(db_path) / "current_task.json", optional=True)
+    current = _read_task_json(task_state_root(db_path) / "current_task.json", optional=True)
     return str(current.get("task_id") or "")
 
 
@@ -699,7 +699,7 @@ def _merge_memory_content(old: str, new: str) -> str:
 def _task_dir(db_path: Path, task_id: str) -> Path:
     if not TASK_ID_RE.fullmatch(task_id):
         raise ValueError(f"Unsupported task id: {task_id}")
-    path = _task_state_root(db_path) / task_id
+    path = task_state_root(db_path) / task_id
     if not path.exists():
         raise FileNotFoundError(f"Task directory not found: {path}")
     return path
@@ -740,7 +740,7 @@ def _task_memory_content(
 
 
 def _current_task_status(db_path: Path, task_id: str) -> Dict[str, object]:
-    task_dir = _task_state_root(db_path) / task_id
+    task_dir = task_state_root(db_path) / task_id
     manifest = _read_task_json(task_dir / "manifest.json", optional=True)
     next_actions = _read_task_json(task_dir / "next_actions.json", optional=True)
     review_report = _read_task_json(task_dir / "review_report.json", optional=True)

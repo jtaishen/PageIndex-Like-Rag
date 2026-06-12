@@ -10,7 +10,7 @@ from .artifacts import get_parse_quality
 from .config import DATA_DIR
 from .memory import evaluate_memory_write, resume_task
 from .search import search_documents, search_nodes
-from .tasks import get_task_artifact
+from .task_artifacts import get_task_artifact
 from .utils import compact_whitespace, unique_strings as _unique_strings, write_json
 
 

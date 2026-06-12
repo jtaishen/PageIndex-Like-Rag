@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -12,18 +11,30 @@ from .answer_plan import (
     answer_plan_warning_tags,
     build_answer_plan_from_evidence,
 )
-from .artifacts import get_citation_map, get_doc_card, get_innovations, get_parse_quality
-from .claim_frames import claim_frame_summary_for_doc, extract_claim_frames, get_claim_frames, get_evidence_units
-from .config import DEFAULT_DB_PATH, PROJECT_ROOT, llm_compare_evidence_per_doc
+from .config import llm_compare_evidence_per_doc
 from .fact_audit import fact_audit_summary
-from .facts import fact_summary_for_doc
-from .insights import extract_doc_insights
 from .knowledge_graph import graph_summary
 from .llm import LLMError, generate_json_object, llm_payload_metadata
 from .query_log import write_query_log
-from .search import search_documents
+from .task_artifacts import (
+    TASK_ARTIFACT_WHITELIST,
+    TASK_ID_RE,
+    get_task_artifact,
+    new_task_id as _new_task_id,
+    next_actions_artifact as _next_actions_artifact,
+    open_questions_artifact as _open_questions_artifact,
+    section_evidence_artifact as _section_evidence_artifact,
+    selected_papers_artifact as _selected_papers_artifact,
+    task_manifest as _manifest,
+    task_state_root as _task_state_root,
+    valid_task_artifact_name as _valid_task_artifact_name,
+    write_task_artifacts as _write_task_artifacts,
+)
+from .task_contexts import (
+    prepare_paper_contexts as _prepare_paper_contexts,
+    select_papers as _select_papers,
+)
 from .task_evidence import (
-    compact_section_evidence as _compact_section_evidence,
     evidence_confidence as _evidence_confidence,
     evidence_duplicate_summary as _evidence_duplicate_summary,
     flatten_dimension_evidence as _flatten_dimension_evidence,
@@ -35,7 +46,7 @@ from .task_evidence_collection import (
     collect_section_evidence as _collect_section_evidence_core,
     search_doc_evidence as _search_doc_evidence_core,
 )
-from .utils import compact_whitespace, stable_id, unique_strings as _unique_strings, write_json
+from .utils import compact_whitespace, unique_strings as _unique_strings
 
 
 COMPARE_DIMENSIONS = [
@@ -103,20 +114,6 @@ REVIEW_SECTIONS = [
         "search_terms": ["局限", "不足", "展望", "未来工作", "限制"],
     },
 ]
-
-TASK_ARTIFACT_WHITELIST = {
-    "manifest.json",
-    "selected_papers.json",
-    "comparison_matrix.json",
-    "review_outline.json",
-    "review_draft.md",
-    "citation_check.json",
-    "review_report.json",
-    "open_questions.json",
-    "next_actions.json",
-}
-TASK_ID_RE = re.compile(r"^task_[0-9a-f]{12}$")
-
 
 def compare_papers(
     db_path: Path,
@@ -353,116 +350,6 @@ def generate_review_plan(
         "artifact_paths": paths,
         "llm_error": llm_error,
     }
-
-
-def get_task_artifact(db_path: Path, task_id: str, name: str) -> Dict[str, Any]:
-    if not _valid_task_artifact_name(name):
-        raise ValueError(f"Unsupported task artifact name: {name}")
-    if task_id != "current" and not TASK_ID_RE.fullmatch(task_id):
-        raise ValueError(f"Unsupported task id: {task_id}")
-    root = _task_state_root(db_path)
-    if task_id == "current":
-        path = root / "current_task.json"
-    else:
-        path = root / task_id / name
-    if not path.exists():
-        raise FileNotFoundError(f"Task artifact not found: {path}")
-    text = path.read_text(encoding="utf-8")
-    content: Any = text
-    if path.suffix == ".json":
-        content = json.loads(text)
-    return {
-        "task_id": task_id,
-        "name": name,
-        "path": str(path),
-        "content": content,
-    }
-
-
-def _select_papers(
-    db_path: Path,
-    query: str,
-    doc_ids: Optional[List[str]],
-    top_k_docs: int,
-    search_mode: str,
-) -> List[Dict[str, Any]]:
-    if doc_ids:
-        return [{"doc_id": doc_id, "score": None, "node_matches": None} for doc_id in _unique_strings(doc_ids)]
-    route_mode = "hybrid" if search_mode == "tree" else search_mode
-    return search_documents(db_path, query, top_k=max(1, top_k_docs), search_mode=route_mode)
-
-
-def _prepare_paper_contexts(db_path: Path, selected: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], List[str]]:
-    contexts = []
-    warnings: List[str] = []
-    for item in selected:
-        doc_id = str(item.get("doc_id") or "")
-        if not doc_id:
-            continue
-        try:
-            card = get_doc_card(db_path, doc_id)
-            quality = get_parse_quality(db_path, doc_id)
-            innovation, insight_warnings = _read_or_extract_insights(db_path, doc_id)
-            citation_map = get_citation_map(db_path, doc_id)
-            facts = fact_summary_for_doc(db_path, doc_id)
-            claim_frames, evidence_units, claim_frame_warnings = _read_or_extract_claim_frame_context(db_path, doc_id)
-        except (FileNotFoundError, KeyError, ValueError) as exc:
-            warnings.append(f"paper_prepare_failed:{doc_id}:{exc}")
-            continue
-        warnings.extend([*insight_warnings, *claim_frame_warnings])
-        contexts.append(
-            {
-                "doc_id": doc_id,
-                "title": card.get("title") or doc_id,
-                "path": card.get("path") or "",
-                "abstract": card.get("abstract") or "",
-                "description": card.get("description") or card.get("summary") or "",
-                "keywords": card.get("keywords") or [],
-                "quality": quality,
-                "innovation": innovation,
-                "citation_map": citation_map,
-                "facts": facts,
-                "claim_frames": claim_frames,
-                "evidence_units": evidence_units,
-                "route_score": item.get("score"),
-                "node_matches": item.get("node_matches"),
-            }
-        )
-    return contexts, _unique_strings(warnings)
-
-
-def _read_or_extract_insights(db_path: Path, doc_id: str) -> tuple[Dict[str, Any], List[str]]:
-    warnings: List[str] = []
-    try:
-        innovation = get_innovations(db_path, doc_id)
-        citation_map = get_citation_map(db_path, doc_id)
-    except (FileNotFoundError, KeyError, ValueError):
-        innovation = {}
-        citation_map = {}
-    if innovation.get("schema") == "innovation.v1" and citation_map.get("schema") == "citation_map.v1":
-        return innovation, warnings
-    result = extract_doc_insights(db_path, doc_id, force=True, use_llm=False)
-    warnings.append(f"insights_rule_refreshed:{doc_id}")
-    return result["innovation"], warnings
-
-
-def _read_or_extract_claim_frame_context(db_path: Path, doc_id: str) -> tuple[Dict[str, Any], Dict[str, Any], List[str]]:
-    warnings: List[str] = []
-    try:
-        frames = get_claim_frames(db_path, doc_id)
-        units = get_evidence_units(db_path, doc_id)
-        summary = claim_frame_summary_for_doc(db_path, doc_id)
-        if frames.get("schema") == "claim_frames.v1" and units.get("schema") == "evidence_units.v1":
-            return {**frames, "summary": summary}, units, warnings
-    except (FileNotFoundError, KeyError, ValueError):
-        pass
-    try:
-        result = extract_claim_frames(db_path, doc_id, force=True, use_llm=False, require_llm=False)
-        warnings.append(f"claim_frames_rule_refreshed:{doc_id}")
-        return result["claim_frames"], get_evidence_units(db_path, doc_id), warnings
-    except Exception as exc:
-        warnings.append(f"claim_frames_unavailable:{doc_id}:{exc}")
-        return {"schema": "claim_frames.v1", "status": "skipped", "frames": [], "summary": {"available": False}}, {"units": []}, warnings
 
 
 def _collect_dimension_evidence(
@@ -1492,188 +1379,6 @@ def _outline_coverage(
     }
 
 
-def _selected_papers_artifact(
-    task_id: str,
-    task_type: str,
-    query: str,
-    contexts: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    papers = []
-    for context in contexts:
-        citation_map = context.get("citation_map") or {}
-        innovation = context.get("innovation") or {}
-        facts = context.get("facts") or {}
-        claim_frame_summary = (context.get("claim_frames") or {}).get("summary") or {}
-        papers.append(
-            {
-                "doc_id": context["doc_id"],
-                "title": context["title"],
-                "path": context["path"],
-                "description": context.get("description") or "",
-                "abstract": context.get("abstract") or "",
-                "keywords": context.get("keywords") or [],
-                "quality_warnings": (context.get("quality") or {}).get("quality_warnings") or [],
-                "innovation_status": innovation.get("status") or "",
-                "innovation_count": len(innovation.get("items") or []),
-                "citation_count": len(citation_map.get("references") or []),
-                "fact_available": bool(facts.get("available")),
-                "claim_count": facts.get("claim_count", 0),
-                "entity_count": facts.get("entity_count", 0),
-                "relation_count": facts.get("relation_count", 0),
-                "table_backed_fact_count": facts.get("table_backed_fact_count", 0),
-                "claim_frame_available": bool(claim_frame_summary.get("available")),
-                "claim_frame_count": claim_frame_summary.get("frame_count", (context.get("claim_frames") or {}).get("count", 0)),
-                "verified_frame_rate": claim_frame_summary.get("verified_frame_rate", 0.0),
-                "unsupported_frame_count": claim_frame_summary.get("unsupported_frame_count", 0),
-                "route_score": context.get("route_score"),
-                "node_matches": context.get("node_matches"),
-            }
-        )
-    return {
-        "schema": "selected_papers.v1",
-        "task_id": task_id,
-        "task_type": task_type,
-        "query": query,
-        "papers": papers,
-        "paper_count": len(papers),
-        "created_at": time.time(),
-    }
-
-
-def _section_evidence_artifact(
-    task_id: str,
-    section_id: str,
-    topic: str,
-    evidence: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    compacted, compaction_report = _compact_section_evidence(evidence)
-    doc_ids = _unique_strings(str(item.get("doc_id") or "") for item in compacted if item.get("doc_id"))
-    return {
-        "schema": "section_evidence.v1",
-        "task_id": task_id,
-        "section_id": section_id,
-        "topic": topic,
-        "evidence": compacted,
-        "evidence_count": len(compacted),
-        "source_doc_count": len(doc_ids),
-        "source_doc_ids": doc_ids,
-        "compaction_report": compaction_report,
-        "created_at": time.time(),
-    }
-
-
-def _open_questions_artifact(
-    task_id: str,
-    questions: Any,
-    coverage: Dict[str, Any],
-    warnings: List[str],
-) -> Dict[str, Any]:
-    items = _string_list(questions)
-    if coverage.get("missing_cells"):
-        items.append("部分比较单元缺少证据，需要补充检索或人工阅读。")
-    if coverage.get("missing_sections"):
-        items.append("部分综述章节缺少证据，需要补充论文或重新解析。")
-    if not items and warnings:
-        items.append("当前任务存在质量告警，需要确认是否影响结论可信度。")
-    return {
-        "schema": "open_questions.v1",
-        "task_id": task_id,
-        "items": _unique_strings(items),
-        "created_at": time.time(),
-    }
-
-
-def _next_actions_artifact(
-    task_id: str,
-    task_type: str,
-    coverage: Dict[str, Any],
-    warnings: List[str],
-) -> Dict[str, Any]:
-    actions = []
-    if warnings:
-        actions.append("查看 warnings，确认是否需要重新同步或重新抽取论文工件。")
-    if coverage.get("missing_cells") or coverage.get("missing_sections"):
-        actions.append("针对缺证据维度补充关键词检索，必要时人工指定 doc_id。")
-    if coverage.get("source_doc_count", 0) < 2 and task_type in {"compare", "review"}:
-        actions.append("补充更多同主题论文后重新运行任务。")
-    if task_type == "review":
-        actions.append("基于 section_evidence 逐节撰写综述正文，并做引用一致性检查。")
-    else:
-        actions.append("基于 comparison_matrix 复核差异点，再决定是否进入综述规划。")
-    return {
-        "schema": "next_actions.v1",
-        "task_id": task_id,
-        "items": _unique_strings(actions),
-        "created_at": time.time(),
-    }
-
-
-def _manifest(task_id: str, task_type: str, query: str, status: str, warnings: List[str]) -> Dict[str, Any]:
-    return {
-        "schema": "task_manifest.v1",
-        "task_id": task_id,
-        "task_type": task_type,
-        "query": query,
-        "status": status,
-        "warnings": _unique_strings(warnings),
-        "created_at": time.time(),
-    }
-
-
-def _write_task_artifacts(
-    db_path: Path,
-    task_id: str,
-    *,
-    manifest: Dict[str, Any],
-    selected_papers: Dict[str, Any],
-    open_questions: Dict[str, Any],
-    next_actions: Dict[str, Any],
-    comparison_matrix: Optional[Dict[str, Any]] = None,
-    review_outline: Optional[Dict[str, Any]] = None,
-    section_evidence: Optional[Dict[str, Dict[str, Any]]] = None,
-) -> Dict[str, str]:
-    root = _task_state_root(db_path)
-    task_dir = root / task_id
-    paths = {
-        "state_root": str(root),
-        "task_dir": str(task_dir),
-    }
-    write_json(task_dir / "manifest.json", manifest)
-    write_json(task_dir / "selected_papers.json", selected_papers)
-    write_json(task_dir / "open_questions.json", open_questions)
-    write_json(task_dir / "next_actions.json", next_actions)
-    paths["manifest"] = str(task_dir / "manifest.json")
-    paths["selected_papers"] = str(task_dir / "selected_papers.json")
-    paths["open_questions"] = str(task_dir / "open_questions.json")
-    paths["next_actions"] = str(task_dir / "next_actions.json")
-    if comparison_matrix is not None:
-        write_json(task_dir / "comparison_matrix.json", comparison_matrix)
-        paths["comparison_matrix"] = str(task_dir / "comparison_matrix.json")
-    if review_outline is not None:
-        write_json(task_dir / "review_outline.json", review_outline)
-        paths["review_outline"] = str(task_dir / "review_outline.json")
-    if section_evidence:
-        section_dir = task_dir / "section_evidence"
-        for section_id, payload in section_evidence.items():
-            path = section_dir / f"{section_id}.json"
-            write_json(path, payload)
-            paths[f"section_evidence/{section_id}.json"] = str(path)
-    write_json(
-        root / "current_task.json",
-        {
-            "schema": "current_task.v1",
-            "task_id": task_id,
-            "task_type": manifest["task_type"],
-            "query": manifest["query"],
-            "status": manifest["status"],
-            "task_dir": str(task_dir),
-            "updated_at": time.time(),
-        },
-    )
-    paths["current_task"] = str(root / "current_task.json")
-    return paths
-
-
 def _log_task_query(
     db_path: Path,
     *,
@@ -1722,31 +1427,6 @@ def _log_task_query(
             "llm_error": bool(llm_error),
         },
     )
-
-
-def _task_state_root(db_path: Path) -> Path:
-    resolved = db_path.expanduser().resolve()
-    if resolved == DEFAULT_DB_PATH.expanduser().resolve():
-        return PROJECT_ROOT / ".kb_state"
-    return resolved.parent / ".kb_state"
-
-
-def _new_task_id(task_type: str, query: str, doc_ids: List[str]) -> str:
-    return stable_id("task", task_type, query, ",".join(doc_ids), time.time(), length=12)
-
-
-def _valid_task_artifact_name(name: str) -> bool:
-    if name == "current_task.json":
-        return True
-    if name in TASK_ARTIFACT_WHITELIST:
-        return True
-    if name.startswith("section_evidence/") and name.endswith(".json"):
-        parts = Path(name).parts
-        return len(parts) == 2 and parts[0] == "section_evidence" and ".." not in parts
-    if name.startswith("section_drafts/") and (name.endswith(".json") or name.endswith(".md")):
-        parts = Path(name).parts
-        return len(parts) == 2 and parts[0] == "section_drafts" and ".." not in parts
-    return False
 
 
 def _review_partial_reasons(outline: Dict[str, Any], contexts: List[Dict[str, Any]], coverage: Dict[str, Any]) -> List[str]:
