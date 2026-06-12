@@ -45,7 +45,7 @@ from .utils import compact_whitespace, read_json as _read_json, stable_id, uniqu
 
 
 BASELINE_SCHEMA = "quality_baseline.v1"
-CODE_VERSION = "v0.56"
+CODE_VERSION = "v0.57"
 BASELINE_FEATURE_FLAGS = {
     "review_draft_baseline": True,
     "baseline_staleness": True,
@@ -68,6 +68,7 @@ BASELINE_FEATURE_FLAGS = {
     "claim_frame_semantic_support": True,
     "evidence_grounded_answer_plan": True,
     "claim_frame_alignment_relations": True,
+    "claim_frame_normalized_alignment": True,
 }
 BASELINE_DIR = DATA_DIR / "eval"
 EVAL_SET_DIR = DATA_DIR / "eval_sets"
@@ -356,6 +357,8 @@ def latest_quality_baseline(
                 "claim_relation_type_counts": alignment["relation_type_counts"],
                 "claim_conflict_classification_counts": alignment["conflict_classification_counts"],
                 "claim_incomparable_pair_count": alignment["incomparable_pair_count"],
+                "claim_avg_align_score": alignment["avg_claim_align_score"],
+                "claim_max_align_score": alignment["max_claim_align_score"],
                 "method_family_group_count": alignment["method_family_group_count"],
                 "conflicting_group_count": alignment["conflicting_group_count"],
                 "research_gap_count": alignment["research_gap_count"],
@@ -1754,6 +1757,8 @@ def _llm_baseline_summary(
             "claim_relation_type_counts": alignment["relation_type_counts"],
             "claim_conflict_classification_counts": alignment["conflict_classification_counts"],
             "claim_incomparable_pair_count": alignment["incomparable_pair_count"],
+            "claim_avg_align_score": alignment["avg_claim_align_score"],
+            "claim_max_align_score": alignment["max_claim_align_score"],
             "method_family_group_count": alignment["method_family_group_count"],
             "conflicting_group_count": alignment["conflicting_group_count"],
             "research_gap_count": alignment["research_gap_count"],

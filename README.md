@@ -1098,6 +1098,20 @@ uv run python -m kb_agent.cli generate-review "任务规划方法研究综述" -
 uv run python -m kb_agent.cli task-artifact <task_id> review_outline.json
 ```
 
+## v0.57 ClaimFrame 字段归一化与 ClaimAlignScore
+
+v0.57 按技术方案中的 ClaimFrame schema 收敛字段：在保留旧字段兼容的同时，为每个 ClaimFrame 派生 `normalized_subject`、`method_family`、`dataset`、`metric`、`claimed_gain`、`condition` 和 `polarity`。这些字段只来自短 claim、已有结构字段和短 evidence 摘要，不保存正文、长 evidence 或 prompt。
+
+跨论文 claim 对齐从简单 terms overlap 升级为 `claim_align_score.v1`，分数由 `type_match_score`、`field_overlap_score`、`subject_similarity_score` 和 `method_family_similarity_score` 组成，对应技术方案中的 `ClaimAlignScore(c1, c2)`。`comparison_matrix.json` / `review_outline.json` 会保留对齐组的平均/最高分，以及 relation 和 comparability check 上的分项分数，便于复盘“为什么这些 claim 被对齐”。
+
+轻量验收命令：
+
+```bash
+uv run python -m kb_agent.cli extract-claim-frames <doc_id> --force --no-llm
+uv run python -m kb_agent.cli compare "任务规划方法比较" --no-llm --top-k-docs 2
+uv run python -m kb_agent.cli task-artifact <task_id> comparison_matrix.json
+```
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：

@@ -35,6 +35,7 @@ description: 跨论文比较 workflow；用于围绕主题筛选论文、生成�
 - 每个关键比较结论绑定 evidence、EvidenceUnit 或 ClaimFrame。
 - 查看 `comparison_matrix.answer_plan_summary`；只有 strong/qualified claim 可以支撑关键比较结论。
 - 查看 `comparison_matrix.claim_alignment_summary`、`method_family_groups`、`conflicting_claim_groups` 和 `research_gap_candidates`；跨论文方法族先按对齐维度解释，结果冲突按 `comparability_checks` 中的 supports/contradicts/incomparable 分类解释，typed relation 只使用技术方案中的轻量关系类型。
+- 复盘 claim 对齐时优先查看 `claim_align_score` 及其分项：type_match、field_overlap、subject_similarity、method_family_similarity。
 - 报告事实审计 warning、冲突数和证据缺口。
 
 ## 禁止事项

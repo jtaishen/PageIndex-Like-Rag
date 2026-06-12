@@ -61,6 +61,8 @@ class ClaimFrameTest(unittest.TestCase):
             self.assertTrue(all(len(frame["short_claim"]) <= 243 for frame in frames["frames"]))
             self.assertIn("quality_summary", frames)
             self.assertTrue(all("quality_score" in frame and "frame_quality" in frame for frame in frames["frames"]))
+            for field in ("normalized_subject", "method_family", "dataset", "metric", "claimed_gain", "condition", "polarity"):
+                self.assertTrue(all(field in frame for frame in frames["frames"]))
 
             verifier = verify_claim_frames(db_path, doc_ids=[doc_id])
             self.assertEqual(verifier["schema"], "claim_frame_verifier_result.v1")

@@ -9,6 +9,7 @@ from .claim_frame_evidence import (
     unit_ids_for_node,
     unit_ids_for_source,
 )
+from .claim_frame_normalization import apply_claim_frame_normalization
 from .claim_frame_quality import (
     LOW_FRAME_QUALITY_SCORE,
     frame_quality,
@@ -282,7 +283,7 @@ def frame_record(
         warnings.append("low_quality_frame")
     trace_status = "partial" if clean_evidence and binding_warnings else ("verified" if clean_evidence else "missing")
     support_status = "structurally_supported" if trace_status == "verified" else ("unchecked" if trace_status == "partial" else "unsupported")
-    return {
+    frame = {
         "frame_id": stable_id("cf", version_id, claim_type_value, short_claim, ",".join(clean_evidence), index, length=14),
         "doc_id": doc_id,
         "version_id": version_id,
@@ -306,6 +307,7 @@ def frame_record(
         "noise_reasons": quality["noise_reasons"],
         "warnings": _unique_strings(warnings),
     }
+    return apply_claim_frame_normalization(frame)
 
 
 def enhance_frames_with_llm(
@@ -375,6 +377,7 @@ def enhance_frames_with_llm(
         frame["frame_quality"] = quality["frame_quality"]
         frame["noise_reasons"] = quality["noise_reasons"]
         frame["warnings"] = _unique_strings([*(frame.get("warnings") or []), *[str(item) for item in raw.get("warnings") or []]])
+        apply_claim_frame_normalization(frame)
     metadata = llm_payload_metadata(payload)
     truncated_frames = len(frames) > LLM_ENHANCE_FRAME_LIMIT
     truncated_units = len(units) > LLM_ENHANCE_UNIT_LIMIT

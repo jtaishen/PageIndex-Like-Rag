@@ -813,7 +813,7 @@ class IngestSearchTest(unittest.TestCase):
                 result = run_quality_baseline(db_path, papers, use_llm=False, top_k=3)
 
             self.assertEqual(result["schema"], "quality_baseline.v1")
-            self.assertEqual(result["code_version"], "v0.56")
+            self.assertEqual(result["code_version"], "v0.57")
             self.assertTrue(result["git_commit"])
             self.assertTrue(result["feature_flags"]["review_draft_baseline"])
             self.assertTrue(result["feature_flags"]["claim_frame_quality_filtering"])
@@ -823,6 +823,7 @@ class IngestSearchTest(unittest.TestCase):
             self.assertTrue(result["feature_flags"]["claim_frame_semantic_support"])
             self.assertTrue(result["feature_flags"]["evidence_grounded_answer_plan"])
             self.assertTrue(result["feature_flags"]["claim_frame_alignment_relations"])
+            self.assertTrue(result["feature_flags"]["claim_frame_normalized_alignment"])
             self.assertTrue(result["is_current_code_baseline"])
             self.assertEqual(result["baseline_stale_reason"], "")
             self.assertEqual(result["doc_count"], 2)
@@ -1093,7 +1094,7 @@ class IngestSearchTest(unittest.TestCase):
                     {
                         "schema": "quality_baseline.v1",
                         "baseline_id": "older-commit",
-                        "code_version": "v0.56",
+                        "code_version": "v0.57",
                         "git_commit": "0000000000000000000000000000000000000000",
                         "feature_flags": {"review_draft_baseline": True},
                         "corpus_path": str((Path.cwd() / "articles").resolve()),
@@ -1588,6 +1589,7 @@ class IngestSearchTest(unittest.TestCase):
             self.assertIn("method_family_groups", matrix)
             self.assertIn("conflicting_claim_groups", matrix)
             self.assertIn("research_gap_candidates", matrix)
+            self.assertIn("avg_claim_align_score", matrix["claim_alignment_summary"])
             dimension_ids = {item["id"] for item in matrix["dimensions"]}
             self.assertIn("problem_setting", dimension_ids)
             self.assertIn("evidence_strength", dimension_ids)

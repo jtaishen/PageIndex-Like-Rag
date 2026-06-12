@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Iterable, List
 
+from .claim_frame_normalization import apply_claim_frame_normalization
 from .utils import compact_whitespace, first_words, stable_id, unique_strings
 
 
@@ -23,6 +24,14 @@ CONTRADICTION_STATUSES = {
     "contradicts",
     "incomparable",
 }
+CLAIM_ALIGN_WEIGHTS = {
+    "type_match": 0.25,
+    "field_overlap": 0.30,
+    "subject_similarity": 0.25,
+    "method_family_similarity": 0.20,
+}
+CLAIM_ALIGN_THRESHOLD = 0.38
+MAX_RELATION_PAIRS_PER_GROUP = 6
 STOP_TERMS = {
     "本文",
     "研究",
@@ -69,13 +78,18 @@ def build_claim_relations(alignment: Dict[str, Any]) -> Dict[str, Any]:
     comparability_checks = []
     for group in alignment.get("groups") or []:
         claims = [item for item in group.get("claims") or [] if isinstance(item, dict)]
+        group_pairs = []
         for index, source in enumerate(claims):
             for target in claims[index + 1 :]:
                 relation, check = _relation_for_pair(source, target, group)
-                if relation:
-                    relations.append(relation)
-                if check:
-                    comparability_checks.append(check)
+                if relation or check:
+                    score = float((relation or check or {}).get("claim_align_score") or 0.0)
+                    group_pairs.append((score, relation, check))
+        for _score, relation, check in sorted(group_pairs, key=lambda item: item[0], reverse=True)[:MAX_RELATION_PAIRS_PER_GROUP]:
+            if relation:
+                relations.append(relation)
+            if check:
+                comparability_checks.append(check)
     type_counts: Dict[str, int] = {}
     for relation in relations:
         relation_type = str(relation.get("relation_type") or "")
@@ -112,6 +126,8 @@ def claim_alignment_summary(alignment: Dict[str, Any], relations: Dict[str, Any]
         "relation_type_counts": relations.get("type_counts") or {},
         "conflict_classification_counts": relations.get("conflict_classification_counts") or {},
         "incomparable_pair_count": int(relations.get("incomparable_pair_count") or 0),
+        "avg_claim_align_score": _avg_float(group.get("avg_claim_align_score") for group in groups),
+        "max_claim_align_score": max([float(group.get("max_claim_align_score") or 0.0) for group in groups] or [0.0]),
         "warnings": unique_strings([*(alignment.get("warnings") or []), *(relations.get("warnings") or [])]),
     }
 
@@ -127,11 +143,14 @@ def claim_alignment_rollup(summaries: Iterable[Dict[str, Any]]) -> Dict[str, Any
         "relation_type_counts": {},
         "conflict_classification_counts": {},
         "incomparable_pair_count": 0,
+        "avg_claim_align_score": 0.0,
+        "max_claim_align_score": 0.0,
         "warnings": [],
     }
     type_counts: Dict[str, int] = {}
     classification_counts: Dict[str, int] = {}
     warnings: List[str] = []
+    avg_scores = []
     for summary in summaries:
         if not isinstance(summary, dict):
             continue
@@ -149,9 +168,13 @@ def claim_alignment_rollup(summaries: Iterable[Dict[str, Any]]) -> Dict[str, Any
             type_counts[str(key)] = type_counts.get(str(key), 0) + int(value or 0)
         for key, value in (summary.get("conflict_classification_counts") or {}).items():
             classification_counts[str(key)] = classification_counts.get(str(key), 0) + int(value or 0)
+        if float(summary.get("avg_claim_align_score") or 0.0) > 0:
+            avg_scores.append(float(summary.get("avg_claim_align_score") or 0.0))
+        rollup["max_claim_align_score"] = max(rollup["max_claim_align_score"], float(summary.get("max_claim_align_score") or 0.0))
         warnings.extend(str(item) for item in summary.get("warnings") or [] if str(item))
     rollup["relation_type_counts"] = type_counts
     rollup["conflict_classification_counts"] = classification_counts
+    rollup["avg_claim_align_score"] = round(sum(avg_scores) / len(avg_scores), 4) if avg_scores else 0.0
     rollup["warnings"] = unique_strings(warnings)
     return rollup
 
@@ -173,31 +196,41 @@ def _normalized_frames(contexts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         for frame in (context.get("claim_frames") or {}).get("frames") or []:
             if not isinstance(frame, dict):
                 continue
+            normalized_frame = apply_claim_frame_normalization(dict(frame))
             frame_id = str(frame.get("frame_id") or "")
             if not frame_id:
                 continue
-            text = _frame_text(frame)
+            text = _frame_text(normalized_frame)
             terms = _terms(text)
             frames.append(
                 {
                     "doc_id": str(context.get("doc_id") or ""),
                     "title": str(context.get("title") or ""),
                     "frame_id": frame_id,
-                    "claim_type": str(frame.get("claim_type") or "claim"),
-                    "short_claim": first_words(compact_whitespace(str(frame.get("short_claim") or "")), 56),
-                    "method": str(frame.get("method") or ""),
-                    "dataset_or_setting": str(frame.get("dataset_or_setting") or ""),
-                    "metric_or_signal": str(frame.get("metric_or_signal") or ""),
-                    "result_or_gain": str(frame.get("result_or_gain") or ""),
-                    "limitation": str(frame.get("limitation") or ""),
-                    "semantic_support_status": str(frame.get("semantic_support_status") or "not_checked"),
-                    "citation_risk": str(frame.get("citation_risk") or "not_checked"),
-                    "evidence_unit_ids": [str(item) for item in frame.get("evidence_unit_ids") or [] if str(item)],
-                    "primary_evidence_unit_ids": [str(item) for item in frame.get("primary_evidence_unit_ids") or [] if str(item)],
+                    "claim_type": str(normalized_frame.get("claim_type") or "claim"),
+                    "short_claim": first_words(compact_whitespace(str(normalized_frame.get("short_claim") or "")), 56),
+                    "problem": str(normalized_frame.get("problem") or ""),
+                    "method": str(normalized_frame.get("method") or ""),
+                    "dataset_or_setting": str(normalized_frame.get("dataset_or_setting") or ""),
+                    "metric_or_signal": str(normalized_frame.get("metric_or_signal") or ""),
+                    "result_or_gain": str(normalized_frame.get("result_or_gain") or ""),
+                    "limitation": str(normalized_frame.get("limitation") or ""),
+                    "normalized_subject": str(normalized_frame.get("normalized_subject") or ""),
+                    "method_family": str(normalized_frame.get("method_family") or ""),
+                    "dataset": str(normalized_frame.get("dataset") or ""),
+                    "metric": str(normalized_frame.get("metric") or ""),
+                    "claimed_gain": str(normalized_frame.get("claimed_gain") or ""),
+                    "condition": str(normalized_frame.get("condition") or ""),
+                    "semantic_support_status": str(normalized_frame.get("semantic_support_status") or "not_checked"),
+                    "citation_risk": str(normalized_frame.get("citation_risk") or "not_checked"),
+                    "evidence_unit_ids": [str(item) for item in normalized_frame.get("evidence_unit_ids") or [] if str(item)],
+                    "primary_evidence_unit_ids": [str(item) for item in normalized_frame.get("primary_evidence_unit_ids") or [] if str(item)],
                     "terms": terms,
-                    "metric_terms": _terms(str(frame.get("metric_or_signal") or "")),
-                    "setting_terms": _terms(str(frame.get("dataset_or_setting") or "")),
-                    "polarity": _polarity(frame),
+                    "subject_terms": _terms(str(normalized_frame.get("normalized_subject") or "")),
+                    "method_family_terms": _terms(str(normalized_frame.get("method_family") or "")),
+                    "metric_terms": _terms(str(normalized_frame.get("metric") or normalized_frame.get("metric_or_signal") or "")),
+                    "setting_terms": _terms(" ".join(str(normalized_frame.get(field) or "") for field in ("dataset", "condition", "dataset_or_setting"))),
+                    "polarity": str(normalized_frame.get("polarity") or _polarity(normalized_frame)),
                 }
             )
     return frames
@@ -218,11 +251,14 @@ def _best_group(groups: List[Dict[str, Any]], frame: Dict[str, Any]) -> Dict[str
     for group in groups:
         if group.get("dominant_claim_type") != frame["claim_type"]:
             continue
-        score = _overlap_score(group.get("terms") or [], frame["terms"])
+        score = max(
+            (_claim_align_scores(candidate, frame)["claim_align_score"] for candidate in group.get("claims") or []),
+            default=0.0,
+        )
         if score > best_score:
             best = group
             best_score = score
-    return best if best_score >= 0.18 else None
+    return best if best_score >= CLAIM_ALIGN_THRESHOLD else None
 
 
 def _finalize_group(query: str, group: Dict[str, Any]) -> Dict[str, Any]:
@@ -236,6 +272,7 @@ def _finalize_group(query: str, group: Dict[str, Any]) -> Dict[str, Any]:
         for claim in claims
         for evidence_id in (claim.get("primary_evidence_unit_ids") or claim.get("evidence_unit_ids") or [])
     )[:10]
+    alignment_pairs = _group_alignment_pairs(claims)
     return {
         "group_id": group_id,
         "topic": " ".join(terms[:6]) or query,
@@ -244,6 +281,10 @@ def _finalize_group(query: str, group: Dict[str, Any]) -> Dict[str, Any]:
         "doc_ids": unique_strings(claim["doc_id"] for claim in claims),
         "support_level": support_level,
         "alignment_reason": _alignment_reason(claim_type),
+        "claim_align_score_schema": "claim_align_score.v1",
+        "avg_claim_align_score": _avg_float(pair.get("claim_align_score") for pair in alignment_pairs),
+        "max_claim_align_score": max([float(pair.get("claim_align_score") or 0.0) for pair in alignment_pairs] or [1.0 if len(claims) == 1 else 0.0]),
+        "alignment_score_pairs": alignment_pairs,
         "primary_evidence_unit_ids": evidence_ids,
         "claims": [_public_claim(claim) for claim in claims],
         "warnings": _group_warnings(claims, support_level),
@@ -254,49 +295,52 @@ def _relation_for_pair(source: Dict[str, Any], target: Dict[str, Any], group: Di
     if source.get("frame_id") == target.get("frame_id") or source.get("doc_id") == target.get("doc_id"):
         return None, None
     claim_type = str(group.get("dominant_claim_type") or "")
+    scores = _claim_align_scores(source, target)
+    if float(scores.get("claim_align_score") or 0.0) < CLAIM_ALIGN_THRESHOLD:
+        return None, None
     comparable = _comparable(source, target, claim_type)
     dimensions = _alignment_dimensions(source, target, claim_type)
-    check_base = _comparability_check(source, target, group, dimensions)
+    check_base = _comparability_check(source, target, group, dimensions, scores)
     if not comparable:
         return None, {**check_base, "comparability_status": "incomparable", "contradiction_status": "incomparable", "reason": "metric_or_setting_mismatch"}
     if _conflict_risk(source) or _conflict_risk(target) or _opposite_polarity(source, target):
         return (
-            _relation(source, target, "contradicts", "comparable_conflict_signal", 0.76, dimensions),
+            _relation(source, target, "contradicts", "comparable_conflict_signal", 0.76, dimensions, scores),
             {**check_base, "comparability_status": "comparable", "contradiction_status": "contradicts", "reason": "comparable_conflict_signal"},
         )
     if claim_type == "method":
         return (
-            _relation(source, target, "supports", "method_family_overlap", 0.72, dimensions),
+            _relation(source, target, "supports", "method_family_overlap", 0.72, dimensions, scores),
             {**check_base, "comparability_status": "comparable", "contradiction_status": "supports", "reason": "method_family_overlap"},
         )
     if claim_type == "result":
         if source.get("metric_terms") and target.get("metric_terms"):
             if _has_improvement_signal(source) or _has_improvement_signal(target):
                 return (
-                    _relation(source, target, "improves_over", "same_metric_improvement_signal", 0.68, dimensions),
+                    _relation(source, target, "improves_over", "same_metric_improvement_signal", 0.68, dimensions, scores),
                     {**check_base, "comparability_status": "comparable", "contradiction_status": "supports", "reason": "same_metric_improvement_signal"},
                 )
             if _overlap_score(source.get("metric_terms") or [], target.get("metric_terms") or []) > 0:
                 return (
-                    _relation(source, target, "same_metric", "metric_terms_overlap", 0.66, dimensions),
+                    _relation(source, target, "same_metric", "metric_terms_overlap", 0.66, dimensions, scores),
                     {**check_base, "comparability_status": "comparable", "contradiction_status": "supports", "reason": "metric_terms_overlap"},
                 )
         if _overlap_score(source.get("setting_terms") or [], target.get("setting_terms") or []) > 0:
             return (
-                _relation(source, target, "same_dataset", "dataset_or_setting_overlap", 0.64, dimensions),
+                _relation(source, target, "same_dataset", "dataset_or_setting_overlap", 0.64, dimensions, scores),
                 {**check_base, "comparability_status": "comparable", "contradiction_status": "supports", "reason": "dataset_or_setting_overlap"},
             )
         return (
-            _relation(source, target, "supports", "result_terms_overlap", 0.62, dimensions),
+            _relation(source, target, "supports", "result_terms_overlap", 0.62, dimensions, scores),
             {**check_base, "comparability_status": "comparable", "contradiction_status": "supports", "reason": "result_terms_overlap"},
         )
     if claim_type == "limitation":
         return (
-            _relation(source, target, "limitation_of", "limitation_terms_overlap", 0.62, dimensions),
+            _relation(source, target, "limitation_of", "limitation_terms_overlap", 0.62, dimensions, scores),
             {**check_base, "comparability_status": "comparable", "contradiction_status": "supports", "reason": "limitation_terms_overlap"},
         )
     return (
-        _relation(source, target, "supports", "claim_terms_overlap", 0.6, dimensions),
+        _relation(source, target, "supports", "claim_terms_overlap", 0.6, dimensions, scores),
         {**check_base, "comparability_status": "comparable", "contradiction_status": "supports", "reason": "claim_terms_overlap"},
     )
 
@@ -308,6 +352,7 @@ def _relation(
     reason: str,
     confidence: float,
     dimensions: List[str],
+    scores: Dict[str, float],
 ) -> Dict[str, Any]:
     safe_type = relation_type if relation_type in RELATION_TYPES else "supports"
     return {
@@ -319,6 +364,8 @@ def _relation(
         "reason": reason,
         "confidence": confidence,
         "alignment_dimensions": dimensions,
+        "claim_align_score_schema": "claim_align_score.v1",
+        **scores,
         "evidence_unit_ids": unique_strings([*(source.get("evidence_unit_ids") or []), *(target.get("evidence_unit_ids") or [])])[:10],
         "warnings": [] if safe_type == relation_type else ["relation_type_normalized_to_supports"],
     }
@@ -329,6 +376,7 @@ def _comparability_check(
     target: Dict[str, Any],
     group: Dict[str, Any],
     dimensions: List[str],
+    scores: Dict[str, float],
 ) -> Dict[str, Any]:
     return {
         "group_id": group.get("group_id"),
@@ -338,6 +386,8 @@ def _comparability_check(
         "source_doc_id": source["doc_id"],
         "target_doc_id": target["doc_id"],
         "alignment_dimensions": dimensions,
+        "claim_align_score_schema": "claim_align_score.v1",
+        **scores,
         "evidence_unit_ids": unique_strings([*(source.get("evidence_unit_ids") or []), *(target.get("evidence_unit_ids") or [])])[:10],
     }
 
@@ -354,6 +404,12 @@ def _public_claim(claim: Dict[str, Any]) -> Dict[str, Any]:
         "metric_or_signal": claim["metric_or_signal"],
         "result_or_gain": claim["result_or_gain"],
         "limitation": claim["limitation"],
+        "normalized_subject": claim["normalized_subject"],
+        "method_family": claim["method_family"],
+        "dataset": claim["dataset"],
+        "metric": claim["metric"],
+        "claimed_gain": claim["claimed_gain"],
+        "condition": claim["condition"],
         "terms": claim["terms"],
         "metric_terms": claim["metric_terms"],
         "setting_terms": claim["setting_terms"],
@@ -473,6 +529,58 @@ def _method_lineage(alignment: Dict[str, Any], relations: Dict[str, Any]) -> Dic
     }
 
 
+def _group_alignment_pairs(claims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    pairs = []
+    for index, source in enumerate(claims):
+        for target in claims[index + 1 :]:
+            pairs.append(
+                {
+                    "source_frame_id": source.get("frame_id"),
+                    "target_frame_id": target.get("frame_id"),
+                    **_claim_align_scores(source, target),
+                }
+            )
+    return pairs
+
+
+def _claim_align_scores(left: Dict[str, Any], right: Dict[str, Any]) -> Dict[str, float]:
+    type_match_score = 1.0 if left.get("claim_type") == right.get("claim_type") else 0.0
+    left_dataset_terms = _terms(str(left.get("dataset") or left.get("condition") or ""))
+    right_dataset_terms = _terms(str(right.get("dataset") or right.get("condition") or ""))
+    field_scores = []
+    if left_dataset_terms and right_dataset_terms:
+        field_scores.append(_overlap_score(left_dataset_terms, right_dataset_terms))
+    if left.get("metric_terms") and right.get("metric_terms"):
+        field_scores.append(_overlap_score(left.get("metric_terms") or [], right.get("metric_terms") or []))
+    field_overlap_score = sum(field_scores) / len(field_scores) if field_scores else 0.0
+    subject_similarity_score = _overlap_score(
+        left.get("subject_terms") or _terms(str(left.get("normalized_subject") or left.get("short_claim") or "")),
+        right.get("subject_terms") or _terms(str(right.get("normalized_subject") or right.get("short_claim") or "")),
+    )
+    method_family_similarity_score = _method_family_similarity(left, right)
+    claim_align_score = (
+        CLAIM_ALIGN_WEIGHTS["type_match"] * type_match_score
+        + CLAIM_ALIGN_WEIGHTS["field_overlap"] * field_overlap_score
+        + CLAIM_ALIGN_WEIGHTS["subject_similarity"] * subject_similarity_score
+        + CLAIM_ALIGN_WEIGHTS["method_family_similarity"] * method_family_similarity_score
+    )
+    return {
+        "type_match_score": round(type_match_score, 4),
+        "field_overlap_score": round(field_overlap_score, 4),
+        "subject_similarity_score": round(subject_similarity_score, 4),
+        "method_family_similarity_score": round(method_family_similarity_score, 4),
+        "claim_align_score": round(claim_align_score, 4),
+    }
+
+
+def _method_family_similarity(left: Dict[str, Any], right: Dict[str, Any]) -> float:
+    left_family = str(left.get("method_family") or "")
+    right_family = str(right.get("method_family") or "")
+    if left_family and right_family and left_family == right_family:
+        return 1.0
+    return _overlap_score(left.get("method_family_terms") or [], right.get("method_family_terms") or [])
+
+
 def _comparable(source: Dict[str, Any], target: Dict[str, Any], claim_type: str) -> bool:
     if claim_type in {"method", "limitation", "problem", "claim"}:
         return True
@@ -525,3 +633,8 @@ def _conflict_risk(frame: Dict[str, Any]) -> bool:
 def _has_improvement_signal(frame: Dict[str, Any]) -> bool:
     text = " ".join(str(frame.get(field) or "") for field in ("short_claim", "result_or_gain"))
     return any(term in text for term in ("优于", "improve", "outperform", "提升", "提高", "改进"))
+
+
+def _avg_float(values: Iterable[Any]) -> float:
+    numbers = [float(value or 0.0) for value in values if value is not None and float(value or 0.0) > 0]
+    return round(sum(numbers) / len(numbers), 4) if numbers else 0.0

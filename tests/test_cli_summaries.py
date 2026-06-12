@@ -56,6 +56,8 @@ class CliSummariesTest(unittest.TestCase):
                         "relation_type_counts": {"supports": 1, "contradicts": 1},
                         "conflict_classification_counts": {"supports": 1, "contradicts": 1, "incomparable": 1},
                         "incomparable_pair_count": 1,
+                        "avg_claim_align_score": 0.42,
+                        "max_claim_align_score": 0.68,
                     },
                     "warnings": [],
                 },
@@ -65,6 +67,8 @@ class CliSummariesTest(unittest.TestCase):
         self.assertEqual(result["claim_relation_type_counts"], {"supports": 1, "contradicts": 1})
         self.assertEqual(result["claim_conflict_classification_counts"], {"supports": 1, "contradicts": 1, "incomparable": 1})
         self.assertEqual(result["claim_incomparable_pair_count"], 1)
+        self.assertEqual(result["claim_avg_align_score"], 0.42)
+        self.assertEqual(result["claim_max_align_score"], 0.68)
 
     def test_quality_baseline_summary_exposes_runtime_limits(self) -> None:
         result = quality_baseline_cli_summary(
@@ -100,6 +104,8 @@ class CliSummariesTest(unittest.TestCase):
                             "relation_type_counts": {"supports": 1, "same_metric": 1},
                             "conflict_classification_counts": {"supports": 2, "incomparable": 1},
                             "incomparable_pair_count": 1,
+                            "avg_claim_align_score": 0.5,
+                            "max_claim_align_score": 0.8,
                             "warnings": ["claim_alignment_insufficient_evidence"],
                         },
                     },
@@ -123,6 +129,8 @@ class CliSummariesTest(unittest.TestCase):
                             "relation_type_counts": {"contradicts": 1},
                             "conflict_classification_counts": {"contradicts": 1},
                             "incomparable_pair_count": 0,
+                            "avg_claim_align_score": 0.3,
+                            "max_claim_align_score": 0.6,
                             "warnings": ["claim_alignment_conflicts"],
                         },
                     },
@@ -186,6 +194,8 @@ class CliSummariesTest(unittest.TestCase):
         self.assertEqual(result["claim_relation_type_counts"], {"supports": 1, "same_metric": 1, "contradicts": 1})
         self.assertEqual(result["claim_conflict_classification_counts"], {"supports": 2, "incomparable": 1, "contradicts": 1})
         self.assertEqual(result["claim_incomparable_pair_count"], 1)
+        self.assertEqual(result["claim_avg_align_score"], 0.4)
+        self.assertEqual(result["claim_max_align_score"], 0.8)
         self.assertEqual(result["method_family_group_count"], 1)
         self.assertEqual(result["conflicting_group_count"], 1)
         self.assertEqual(result["research_gap_count"], 1)
