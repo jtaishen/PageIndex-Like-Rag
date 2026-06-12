@@ -3,7 +3,7 @@
 这是一个基于 OpenCode 的 PageIndex-like 论文知识库智能体 MVP。当前目标是跑通论文入库、结构化工件、章节树检索和 EvidenceUnit / ClaimFrame 的核心闭环：
 
 ```text
-parse -> normalize -> tree -> artifacts -> indexes -> EvidenceUnit -> ClaimFrame -> Verifier -> Memory Context -> CLI / MCP 工具
+parse -> normalize -> tree -> artifacts -> indexes -> EvidenceUnit -> ClaimFrame -> Semantic Verifier -> Memory Context -> CLI / MCP 工具
 ```
 
 ## 当前能力
@@ -1045,6 +1045,23 @@ v0.42 将 OpenCode 侧的 MCP 使用方式从单一超长工具清单，整理�
 uv run python -m unittest discover -s tests -p 'test_opencode_workflows.py' -v
 uv run python -m unittest discover -s tests
 git diff --check
+```
+
+## v0.43 ClaimFrame 语义支持验证与 Citation Risk
+
+v0.43 将 ClaimFrame verifier 从结构可追踪推进到规则版语义支持判断。`structurally_supported` 仍只表示 EvidenceUnit、node 和 source 链路完整，不表示语义上已经支撑 claim；正式结论应优先查看 `semantic_support_status` 和 `citation_risk`。
+
+每个 verifier item 会追加 `semantic_support_status`、`semantic_support_score`、`semantic_support_reason`、`primary_evidence_unit_ids`、`weak_evidence_unit_ids`、`contradictory_evidence_unit_ids` 和 `citation_risk`。状态包括 `semantically_supported`、`partially_supported`、`related_only`、`contradicted`、`insufficient_evidence`、`not_checked`；citation risk 包括 `safe`、`needs_qualification`、`needs_more_evidence`、`conflicting_evidence`、`not_checked`。
+
+`search-report` 的 `claim_frame_matches` 会展示语义支持和 citation risk，并降低 `related_only`、`insufficient_evidence`、`contradicted` 在普通方法/结果查询中的排序。`quality-baseline` / `latest-quality-baseline` 会展示语义支持率、冲突 frame 数、证据不足 frame 数和 citation risk 分布。
+
+轻量验收命令：
+
+```bash
+uv run python -m kb_agent.cli extract-facts <doc_id> --force --no-llm
+uv run python -m kb_agent.cli verify-claim-frames --doc-id <doc_id>
+uv run python -m kb_agent.cli claim-frames <doc_id>
+uv run python -m kb_agent.cli search-report "任务规划方法" --search-mode hybrid --top-k 3
 ```
 
 ## PDF 和 MCP 可选依赖

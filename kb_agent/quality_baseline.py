@@ -43,7 +43,7 @@ from .utils import compact_whitespace, read_json as _read_json, stable_id, uniqu
 
 
 BASELINE_SCHEMA = "quality_baseline.v1"
-CODE_VERSION = "v0.41"
+CODE_VERSION = "v0.43"
 BASELINE_FEATURE_FLAGS = {
     "review_draft_baseline": True,
     "baseline_staleness": True,
@@ -63,6 +63,7 @@ BASELINE_FEATURE_FLAGS = {
     "evidence_unit_artifact_coverage": True,
     "claim_frame_structural_status": True,
     "artifact_first_memory_compiler": True,
+    "claim_frame_semantic_support": True,
 }
 BASELINE_DIR = DATA_DIR / "eval"
 EVAL_SET_DIR = DATA_DIR / "eval_sets"
@@ -127,6 +128,14 @@ def run_quality_baseline(
         "unsupported_frame_count": 0,
         "trace_status_counts": {},
         "support_status_counts": {},
+        "semantic_support_status_counts": {},
+        "semantic_verified_frame_count": 0,
+        "semantic_supported_frame_rate": 0.0,
+        "partial_supported_frame_count": 0,
+        "related_only_frame_count": 0,
+        "contradicted_frame_count": 0,
+        "insufficient_evidence_frame_count": 0,
+        "citation_risk_counts": {},
         "low_confidence_frame_count": 0,
         "low_quality_frame_count": 0,
         "noisy_frame_count": 0,
@@ -348,6 +357,14 @@ def latest_quality_baseline(
                 "unsupported_frame_count": claim_frame_verification.get("unsupported_frame_count", 0),
                 "trace_status_counts": claim_frame_verification.get("trace_status_counts", {}),
                 "support_status_counts": claim_frame_verification.get("support_status_counts", {}),
+                "semantic_support_status_counts": claim_frame_verification.get("semantic_support_status_counts", {}),
+                "semantic_verified_frame_count": claim_frame_verification.get("semantic_verified_frame_count", 0),
+                "semantic_supported_frame_rate": claim_frame_verification.get("semantic_supported_frame_rate", 0.0),
+                "partial_supported_frame_count": claim_frame_verification.get("partial_supported_frame_count", 0),
+                "related_only_frame_count": claim_frame_verification.get("related_only_frame_count", 0),
+                "contradicted_frame_count": claim_frame_verification.get("contradicted_frame_count", 0),
+                "insufficient_evidence_frame_count": claim_frame_verification.get("insufficient_evidence_frame_count", 0),
+                "citation_risk_counts": claim_frame_verification.get("citation_risk_counts", {}),
                 "missing_evidence_unit_count": claim_frame_verification.get("missing_evidence_unit_count", 0),
                 "missing_node_count": claim_frame_verification.get("missing_node_count", 0),
                 "missing_source_count": claim_frame_verification.get("missing_source_count", 0),

@@ -45,6 +45,14 @@ def baseline_markdown(report: Dict[str, Any]) -> str:
         f"- unsupported_frame_count: `{(report.get('claim_frame_verification') or {}).get('unsupported_frame_count', 0)}`",
         f"- trace_status_counts: `{(report.get('claim_frame_verification') or {}).get('trace_status_counts', {})}`",
         f"- support_status_counts: `{(report.get('claim_frame_verification') or {}).get('support_status_counts', {})}`",
+        f"- semantic_support_status_counts: `{(report.get('claim_frame_verification') or {}).get('semantic_support_status_counts', {})}`",
+        f"- semantic_supported_frame_rate: `{(report.get('claim_frame_verification') or {}).get('semantic_supported_frame_rate', 0.0)}`",
+        f"- semantic_verified_frame_count: `{(report.get('claim_frame_verification') or {}).get('semantic_verified_frame_count', 0)}`",
+        f"- partial_supported_frame_count: `{(report.get('claim_frame_verification') or {}).get('partial_supported_frame_count', 0)}`",
+        f"- related_only_frame_count: `{(report.get('claim_frame_verification') or {}).get('related_only_frame_count', 0)}`",
+        f"- contradicted_frame_count: `{(report.get('claim_frame_verification') or {}).get('contradicted_frame_count', 0)}`",
+        f"- insufficient_evidence_frame_count: `{(report.get('claim_frame_verification') or {}).get('insufficient_evidence_frame_count', 0)}`",
+        f"- citation_risk_counts: `{(report.get('claim_frame_verification') or {}).get('citation_risk_counts', {})}`",
         f"- missing_evidence_unit_count: `{(report.get('claim_frame_verification') or {}).get('missing_evidence_unit_count', 0)}`",
         f"- missing_node_count: `{(report.get('claim_frame_verification') or {}).get('missing_node_count', 0)}`",
         f"- missing_source_count: `{(report.get('claim_frame_verification') or {}).get('missing_source_count', 0)}`",
@@ -114,6 +122,7 @@ def baseline_html(report: Dict[str, Any]) -> str:
     llm_tasks = llm_baseline.get("tasks") or {}
     embedding = report.get("embedding") or {}
     memory_context = report.get("memory_context") or {}
+    claim_frame_verification = report.get("claim_frame_verification") or {}
     cards = [
         ("Docs", report.get("doc_count", 0)),
         ("PDFs", report.get("pdf_count", 0)),
@@ -148,6 +157,10 @@ def baseline_html(report: Dict[str, Any]) -> str:
         ("Limitations", ", ".join(report.get("baseline_limitations") or [])),
         ("Citation Gaps", f"{fact_delta.get('citation_gap_count_before', 0)}->{fact_delta.get('citation_gap_count_after', 0)}"),
         ("Memory", (report.get("memory") or {}).get("status", "")),
+        ("Semantic Support", claim_frame_verification.get("semantic_supported_frame_rate", 0.0)),
+        ("Semantic Frames", claim_frame_verification.get("semantic_verified_frame_count", 0)),
+        ("Contradicted", claim_frame_verification.get("contradicted_frame_count", 0)),
+        ("Citation Risk", ", ".join(f"{key}:{value}" for key, value in (claim_frame_verification.get("citation_risk_counts") or {}).items())),
         ("Context Available", memory_context.get("available", False)),
         ("Selected Memory", memory_context.get("selected_memory_count", 0)),
         ("Artifact Refs", memory_context.get("artifact_ref_count", 0)),

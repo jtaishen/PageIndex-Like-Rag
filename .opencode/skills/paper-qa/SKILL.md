@@ -20,7 +20,7 @@ description: 证据优先论文问答 workflow；用于回答单篇或多篇论�
 ## 可选工具
 
 - `kb_get_parse_quality` / `kb_get_parse_report`：当证据质量可疑、PDF 弱解析或用户问高风险结论时调用。
-- `kb_get_claim_frames` / `kb_verify_claim_frames`：当问题需要主张级证据链、方法贡献或实验结论时调用。
+- `kb_get_claim_frames` / `kb_verify_claim_frames`：当问题需要主张级证据链、方法贡献或实验结论时调用，并优先检查 `semantic_support_status` 和 `citation_risk`。
 - `kb_get_table_content` / `kb_get_table_summaries`：当问题涉及指标、实验表格或性能对比时调用。
 
 ## 停止条件
@@ -33,7 +33,7 @@ description: 证据优先论文问答 workflow；用于回答单篇或多篇论�
 - 简要回答用户问题。
 - 列出关键证据来源：文档标题、章节路径、节点 ID、页码范围。
 - 对创新点、实验结果、局限性等高风险结论标注不确定性。
-- 若使用 ClaimFrame，说明 `support_status`、`trace_status` 和相关 `evidence_unit_ids`。
+- 若使用 ClaimFrame，说明 `support_status`、`trace_status`、`semantic_support_status`、`citation_risk` 和相关 `evidence_unit_ids`。
 
 ## 禁止事项
 

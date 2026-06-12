@@ -17,7 +17,7 @@ description: 单篇论文理解 workflow；用于抽取 doc card、创新点、�
 4. `kb_extract_facts`：生成 claims、entities、relations。
 5. `kb_extract_evidence_units`：从节点、图表、表格、引用工件派生 EvidenceUnit。
 6. `kb_extract_claim_frames`：把 facts 和 insight 组织成 ClaimFrame。
-7. `kb_verify_claim_frames`：检查 ClaimFrame 到 EvidenceUnit、node、source 的结构链路。
+7. `kb_verify_claim_frames`：检查 ClaimFrame 到 EvidenceUnit、node、source 的结构链路与语义支持状态。
 
 ## 可选工具
 
@@ -28,12 +28,12 @@ description: 单篇论文理解 workflow；用于抽取 doc card、创新点、�
 ## 停止条件
 
 - 如果 doc card 或 parse quality 显示弱解析，先报告解析风险，再给出有限结论。
-- 如果 ClaimFrame `support_status` 为 unsupported，不把它当作正式论文结论。
+- 如果 ClaimFrame `support_status` 为 unsupported，或 `semantic_support_status` 为 `related_only` / `insufficient_evidence` / `contradicted`，不把它当作正式论文结论。
 
 ## 输出要求
 
 - 输出论文名片、创新点、方法贡献、局限、引用关系和事实层状态。
-- 标明 `innovation.status`、fact status、ClaimFrame `support_status`、`trace_status`。
+- 标明 `innovation.status`、fact status、ClaimFrame `support_status`、`trace_status`、`semantic_support_status` 和 `citation_risk`。
 - 对每条关键结论给出 evidence id、node id 或 EvidenceUnit id。
 
 ## 禁止事项

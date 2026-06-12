@@ -47,6 +47,8 @@ class ClaimFrameTest(unittest.TestCase):
             self.assertGreaterEqual(report["verified_frame_rate"], 0.0)
             self.assertIn("trace_status_counts", report)
             self.assertIn("support_status_counts", report)
+            self.assertIn("semantic_support_status_counts", report)
+            self.assertIn("citation_risk_counts", report)
 
             units = get_evidence_units(db_path, doc_id)
             self.assertEqual(units["schema"], "evidence_units.v1")
@@ -68,6 +70,7 @@ class ClaimFrameTest(unittest.TestCase):
             self.assertIn("top_frame_noise_reasons", verifier)
             self.assertEqual(frames["trace_status_counts"], verifier["documents"][0]["trace_status_counts"])
             self.assertEqual(frames["support_status_counts"], verifier["documents"][0]["support_status_counts"])
+            self.assertEqual(frames["semantic_support_status_counts"], verifier["documents"][0]["semantic_support_status_counts"])
 
     def test_evidence_units_include_secondary_artifacts_without_hard_dependency(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -163,7 +166,7 @@ class ClaimFrameTest(unittest.TestCase):
             "schema": "claim_frames.v1",
             "version_id": "v1",
             "frames": [
-                {"frame_id": "verified", "claim_type": "method", "short_claim": "提出任务规划方法。", "evidence_unit_ids": ["eu-node"], "confidence": 0.8},
+                {"frame_id": "verified", "claim_type": "method", "short_claim": "提出动态任务规划算法。", "evidence_unit_ids": ["eu-node"], "confidence": 0.8},
                 {"frame_id": "missing-node", "claim_type": "method", "short_claim": "方法依赖额外节点。", "evidence_unit_ids": ["eu-missing-node"], "confidence": 0.8},
                 {"frame_id": "missing-unit", "claim_type": "result", "short_claim": "结果有引用但 unit 缺失。", "evidence_unit_ids": ["eu-absent"], "confidence": 0.8},
                 {"frame_id": "unsupported", "claim_type": "result", "short_claim": "完全没有证据。", "evidence_unit_ids": [], "confidence": 0.8},
@@ -173,7 +176,7 @@ class ClaimFrameTest(unittest.TestCase):
             "schema": "evidence_units.v1",
             "version_id": "v1",
             "units": [
-                {"unit_id": "eu-node", "node_id": "node-1", "source_kind": "node", "source_id": "node-1", "text_excerpt": "任务规划方法。"},
+                {"unit_id": "eu-node", "node_id": "node-1", "source_kind": "node", "source_id": "node-1", "text_excerpt": "动态任务规划算法。"},
                 {
                     "unit_id": "eu-missing-node",
                     "node_id": "node-missing",
@@ -203,12 +206,139 @@ class ClaimFrameTest(unittest.TestCase):
         self.assertEqual(by_id["missing-unit"]["support_status"], "unchecked")
         self.assertEqual(by_id["unsupported"]["trace_status"], "missing")
         self.assertEqual(by_id["unsupported"]["support_status"], "unsupported")
+        self.assertEqual(by_id["verified"]["semantic_support_status"], "semantically_supported")
+        self.assertEqual(by_id["verified"]["citation_risk"], "safe")
+        self.assertEqual(by_id["missing-unit"]["semantic_support_status"], "insufficient_evidence")
+        self.assertEqual(by_id["unsupported"]["citation_risk"], "needs_more_evidence")
         self.assertEqual(verifier["verified_frame_count"], 1)
         self.assertEqual(verifier["unsupported_frame_count"], 1)
         self.assertEqual(verifier["trace_status_counts"], {"verified": 1, "partial": 2, "missing": 1})
         self.assertEqual(verifier["support_status_counts"], {"structurally_supported": 1, "unchecked": 2, "unsupported": 1})
+        self.assertIn("semantic_support_status_counts", verifier)
+        self.assertGreaterEqual(verifier["insufficient_evidence_frame_count"], 1)
         self.assertEqual(verifier["missing_evidence_unit_count"], 1)
         self.assertEqual(verifier["missing_node_count"], 1)
+
+    def test_claim_frame_semantic_support_statuses_and_citation_risk(self) -> None:
+        claim_frames = {
+            "schema": "claim_frames.v1",
+            "version_id": "v1",
+            "frames": [
+                {
+                    "frame_id": "supported",
+                    "claim_type": "method",
+                    "short_claim": "本文提出动态任务规划算法提升任务分配效率。",
+                    "method": "动态任务规划算法",
+                    "evidence_unit_ids": ["eu-supported"],
+                    "confidence": 0.9,
+                },
+                {
+                    "frame_id": "partial",
+                    "claim_type": "result",
+                    "short_claim": "该方法提升任务成功率并降低通信开销。",
+                    "result_or_gain": "提升任务成功率并降低通信开销",
+                    "metric_or_signal": "任务成功率、通信开销",
+                    "evidence_unit_ids": ["eu-partial"],
+                    "confidence": 0.8,
+                },
+                {
+                    "frame_id": "related",
+                    "claim_type": "method",
+                    "short_claim": "本文提出动态角色任务规划算法。",
+                    "method": "动态角色任务规划算法",
+                    "evidence_unit_ids": ["eu-related"],
+                    "confidence": 0.8,
+                },
+                {
+                    "frame_id": "contradicted",
+                    "claim_type": "result",
+                    "short_claim": "实验验证该方法提升任务成功率。",
+                    "result_or_gain": "提升任务成功率",
+                    "evidence_unit_ids": ["eu-contradicted"],
+                    "confidence": 0.8,
+                },
+                {
+                    "frame_id": "insufficient",
+                    "claim_type": "result",
+                    "short_claim": "该方法显著降低响应时间。",
+                    "evidence_unit_ids": [],
+                    "confidence": 0.8,
+                },
+            ],
+        }
+        evidence_units = {
+            "schema": "evidence_units.v1",
+            "version_id": "v1",
+            "units": [
+                {
+                    "unit_id": "eu-supported",
+                    "node_id": "node-1",
+                    "source_kind": "node",
+                    "source_id": "node-1",
+                    "summary": "动态任务规划算法用于任务分配效率提升。",
+                    "text_excerpt": "本文提出动态任务规划算法，并用于提升任务分配效率。",
+                    "keywords": ["动态任务规划", "任务分配效率"],
+                    "confidence": 0.9,
+                },
+                {
+                    "unit_id": "eu-partial",
+                    "node_id": "node-2",
+                    "source_kind": "node",
+                    "source_id": "node-2",
+                    "summary": "实验结果显示任务成功率提升。",
+                    "text_excerpt": "实验结果显示任务成功率提升，其他指标未展开。",
+                    "keywords": ["任务成功率"],
+                    "confidence": 0.8,
+                },
+                {
+                    "unit_id": "eu-related",
+                    "node_id": "node-3",
+                    "source_kind": "node",
+                    "source_id": "node-3",
+                    "summary": "任务规划是服务机器人研究中的重要问题。",
+                    "text_excerpt": "该段介绍服务机器人任务规划背景。",
+                    "keywords": ["任务规划", "服务机器人"],
+                    "confidence": 0.8,
+                },
+                {
+                    "unit_id": "eu-contradicted",
+                    "node_id": "node-4",
+                    "source_kind": "node",
+                    "source_id": "node-4",
+                    "summary": "实验未验证任务成功率提升。",
+                    "text_excerpt": "结果显示该方法未验证任务成功率提升，证据不足。",
+                    "keywords": ["任务成功率", "未验证"],
+                    "confidence": 0.8,
+                },
+            ],
+        }
+
+        def fake_artifact(_db_path: Path, _doc_id: str, name: str, default: object) -> object:
+            if name == "node_index.jsonl":
+                return [{"node_id": f"node-{index}"} for index in range(1, 5)]
+            if name == "citation_map.json":
+                return {"references": [], "relations": []}
+            return default
+
+        with mock.patch("kb_agent.claim_frames._artifact_content", side_effect=fake_artifact):
+            verifier = _verify_claim_frames_payload(Path("unused.sqlite"), "doc-1", claim_frames, evidence_units)
+
+        by_id = {item["frame_id"]: item for item in verifier["items"]}
+        self.assertEqual(by_id["supported"]["semantic_support_status"], "semantically_supported")
+        self.assertEqual(by_id["supported"]["citation_risk"], "safe")
+        self.assertEqual(by_id["partial"]["semantic_support_status"], "partially_supported")
+        self.assertEqual(by_id["partial"]["citation_risk"], "needs_qualification")
+        self.assertEqual(by_id["related"]["semantic_support_status"], "related_only")
+        self.assertEqual(by_id["related"]["citation_risk"], "needs_more_evidence")
+        self.assertEqual(by_id["contradicted"]["semantic_support_status"], "contradicted")
+        self.assertEqual(by_id["contradicted"]["citation_risk"], "conflicting_evidence")
+        self.assertEqual(by_id["insufficient"]["semantic_support_status"], "insufficient_evidence")
+        self.assertEqual(verifier["semantic_verified_frame_count"], 1)
+        self.assertEqual(verifier["partial_supported_frame_count"], 1)
+        self.assertEqual(verifier["related_only_frame_count"], 1)
+        self.assertEqual(verifier["contradicted_frame_count"], 1)
+        self.assertEqual(verifier["insufficient_evidence_frame_count"], 1)
+        self.assertEqual(verifier["citation_risk_counts"]["conflicting_evidence"], 1)
 
     def test_llm_enhancement_records_truncation_metadata(self) -> None:
         frames = [
@@ -354,6 +484,9 @@ class ClaimFrameTest(unittest.TestCase):
             self.assertIn("evidence_unit_ids", frame_matches["items"][0])
             self.assertIn("quality_score", frame_matches["items"][0])
             self.assertIn("selection_reasons", frame_matches["items"][0])
+            self.assertIn("semantic_support_status", frame_matches["items"][0])
+            self.assertIn("citation_risk", frame_matches["items"][0])
+            self.assertIn("primary_evidence_unit_ids", frame_matches["items"][0])
 
             compare = compare_papers(db_path, "任务规划方法比较", top_k_docs=2, use_llm=False)
             evidence = [

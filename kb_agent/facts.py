@@ -149,6 +149,14 @@ def extract_facts(
         artifacts["fact_report"]["unsupported_frame_count"] = verifier.get("unsupported_frame_count", 0)
         artifacts["fact_report"]["trace_status_counts"] = verifier.get("trace_status_counts") or {}
         artifacts["fact_report"]["support_status_counts"] = verifier.get("support_status_counts") or {}
+        artifacts["fact_report"]["semantic_support_status_counts"] = verifier.get("semantic_support_status_counts") or {}
+        artifacts["fact_report"]["semantic_verified_frame_count"] = verifier.get("semantic_verified_frame_count", 0)
+        artifacts["fact_report"]["semantic_supported_frame_rate"] = verifier.get("semantic_supported_frame_rate", 0.0)
+        artifacts["fact_report"]["partial_supported_frame_count"] = verifier.get("partial_supported_frame_count", 0)
+        artifacts["fact_report"]["related_only_frame_count"] = verifier.get("related_only_frame_count", 0)
+        artifacts["fact_report"]["contradicted_frame_count"] = verifier.get("contradicted_frame_count", 0)
+        artifacts["fact_report"]["insufficient_evidence_frame_count"] = verifier.get("insufficient_evidence_frame_count", 0)
+        artifacts["fact_report"]["citation_risk_counts"] = verifier.get("citation_risk_counts") or {}
         artifacts["fact_report"]["missing_evidence_unit_count"] = verifier.get("missing_evidence_unit_count", 0)
         artifacts["fact_report"]["missing_node_count"] = verifier.get("missing_node_count", 0)
         artifacts["fact_report"]["missing_source_count"] = verifier.get("missing_source_count", 0)

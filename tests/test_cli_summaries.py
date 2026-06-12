@@ -62,6 +62,14 @@ class CliSummariesTest(unittest.TestCase):
                     "noisy_frame_count": 1,
                     "ignored_noise_frame_count": 1,
                     "top_frame_noise_reasons": ["front_matter"],
+                    "semantic_support_status_counts": {"semantically_supported": 2, "related_only": 1},
+                    "semantic_verified_frame_count": 2,
+                    "semantic_supported_frame_rate": 0.5,
+                    "partial_supported_frame_count": 1,
+                    "related_only_frame_count": 1,
+                    "contradicted_frame_count": 0,
+                    "insufficient_evidence_frame_count": 1,
+                    "citation_risk_counts": {"safe": 2, "needs_more_evidence": 2},
                 },
                 "memory_context": {
                     "schema": "memory_context.v1",
@@ -83,6 +91,14 @@ class CliSummariesTest(unittest.TestCase):
         self.assertTrue(result["llm_budget_exhausted"])
         self.assertEqual(result["low_quality_frame_count"], 2)
         self.assertEqual(result["top_frame_noise_reasons"], ["front_matter"])
+        self.assertEqual(result["semantic_support_status_counts"], {"semantically_supported": 2, "related_only": 1})
+        self.assertEqual(result["semantic_verified_frame_count"], 2)
+        self.assertEqual(result["semantic_supported_frame_rate"], 0.5)
+        self.assertEqual(result["partial_supported_frame_count"], 1)
+        self.assertEqual(result["related_only_frame_count"], 1)
+        self.assertEqual(result["contradicted_frame_count"], 0)
+        self.assertEqual(result["insufficient_evidence_frame_count"], 1)
+        self.assertEqual(result["citation_risk_counts"], {"safe": 2, "needs_more_evidence": 2})
         self.assertTrue(result["compiled_context_available"])
         self.assertEqual(result["compiled_context_schema"], "memory_context.v1")
         self.assertEqual(result["selected_memory_count"], 2)
