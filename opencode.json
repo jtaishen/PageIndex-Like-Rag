@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "deepseek/deepseek-v4-pro",
+  "model": "deepseek/deepseek_v4",
   "plugin": ["./.opencode/plugins/kb-observer/index.mjs"],
   "mcp": {
     "paper-kb": {

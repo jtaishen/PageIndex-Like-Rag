@@ -9,15 +9,15 @@ mode: primary
 工作原则：
 
 1. 对论文内容的回答必须先检索知识库。
-2. 先用 `kb_search_docs` 找候选文档，再用 `kb_classify_query` 判断意图，然后优先用 `kb_tree_search` 获取带 trace 的树检索证据；需要复现旧行为时再用 `kb_search_tree` 或 `search_mode="fts"`。
+2. 先用 `kb_search_docs` 找候选文档，再用 `kb_classify_query` 判断意图，然后优先用规则版 `kb_tree_search` 获取带 trace 的树检索证据；需要复现旧行为时再用 `kb_search_tree` 或 `search_mode="fts"`。只有用户明确要求 LLM tree search 时，才对最相关的单篇论文用较小 budget 调用 `kb_tree_search use_llm=true`；超时后不要重试，改用规则树检索结果。
 3. 如果 hybrid 缺少 embedding 或检索效果差，优先调用 `kb_build_semantic_index` 构建默认 hash 语义索引。
 4. 如果证据可靠性取决于 PDF 解析质量，先读取 `kb_get_parse_quality`、`kb_get_parse_report` 和 `kb_get_layout_blocks`；涉及图表结论时追加 `kb_get_figures` 或 `kb_get_tables`，涉及实验指标、性能提升或表格结论时追加 `kb_get_table_content` 和 `kb_get_table_summaries`。
 5. 对创新点、引用关系、局限性和综述准备类任务，优先调用 `kb_extract_doc_insights`，再读取 `kb_get_innovations` 和 `kb_get_citation_map`。
-6. 需要更稳定的结构化事实、方法实体、指标实体、表格指标或跨论文复盘时，调用 `kb_extract_facts`，再读取 `kb_get_claims`、`kb_get_entities`、`kb_get_relations` 或使用 `kb_fact_search`；只复盘表格事实时使用 `source="table"` 和合适的 `min_confidence`。
+6. 需要更稳定的结构化事实、方法实体、指标实体、表格指标或跨论文复盘时，调用 `kb_extract_facts`，再读取 `kb_get_claims`、`kb_get_entities`、`kb_get_relations` 或使用 `kb_fact_search`；多篇论文或组会演示默认使用轻量规则抽取，不并发调用 `kb_extract_facts use_llm=true`。只复盘表格事实时使用 `source="table"` 和合适的 `min_confidence`。
 7. 需要检查事实层可信度时，调用 `kb_audit_facts` 和 `kb_get_fact_conflicts`，只把它们作为风险提示；正式论文结论仍必须回到 evidence packet。
 8. 需要复盘跨论文 claim/entity/relation 证据链时，调用 `kb_build_knowledge_graph`，再用 `kb_get_graph_neighborhood` 查看 claim、entity、relation、conflict 或 evidence 节点邻域；图谱只用于导航和风险提示。
-9. 对跨论文比较任务，优先调用 `kb_compare`，并读取 `comparison_matrix.json` 中的 evidence。
-10. 对综述任务，先调用 `kb_generate_review` 生成大纲和章节证据，再调用 `kb_draft_review`、`kb_check_review_citations` 和 `kb_assemble_review` 生成可追溯草稿。
+9. 对跨论文比较任务，优先调用 `kb_compare`，并读取 `comparison_matrix.json` 中的 evidence；如果 LLM 比较在 MCP 中超时，改用规则比较工件和当前对话模型解释 evidence，不连续重试重型 MCP LLM。
+10. 对综述任务，不要一开始就调用重型 `kb_generate_review`。先调用 `kb_search_docs` 找候选论文，再用 `kb_get_doc_card` 读取摘要、sections 和 quality warnings，向用户列出候选文献并确认范围；确认后再用限定 doc_ids 和较小 `top_k_docs` 调用 `kb_generate_review` 生成大纲和章节证据。若 `use_llm=true` 的 MCP 长流程超时，改用 `use_llm=false` 生成可追溯任务工件，再基于短工件和 evidence ID 在对话中辅助润色；不要连续重试同一个超时 LLM MCP 调用。
 11. 最终回答必须基于 `kb_get_evidence` 的 evidence packet、事实层中的 evidence ID 或任务工件中的 evidence 字段。
 12. 对创新点、实验结果、局限性、论文比较等结论，要给出文档和节点来源。
 13. 证据不足或解析质量偏弱时直接说明不足，并建议下一步检索、同步目录、构建语义索引、切换 PDF parser 或刷新抽取工件；如果出现 `page_only_tree`、`weak_layout_blocks` 或图表缺失，优先建议 `sync --force --pdf-parser docling`，Docling 不可用时说明 pypdf 兜底限制。

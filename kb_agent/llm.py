@@ -19,6 +19,7 @@ from .config import (
     deepseek_max_tokens,
     deepseek_model,
     deepseek_probe_timeout_seconds,
+    deepseek_profile,
     deepseek_temperature,
     deepseek_timeout_seconds,
 )
@@ -106,6 +107,7 @@ def llm_status(*, probe: bool = False, timeout_seconds: Optional[int] = None) ->
         return {
             "schema": "llm_status.v1",
             "provider": "deepseek",
+            "profile": deepseek_profile(),
             "configured": False,
             "reachable": False if probe else None,
             "probe": probe,
@@ -122,6 +124,7 @@ def llm_status(*, probe: bool = False, timeout_seconds: Optional[int] = None) ->
     result: Dict[str, Any] = {
         "schema": "llm_status.v1",
         "provider": "deepseek",
+        "profile": deepseek_profile(),
         "configured": True,
         "reachable": None,
         "probe": probe,

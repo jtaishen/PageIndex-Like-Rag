@@ -1187,6 +1187,20 @@ KB_LLM_FACT_MAX_NODES=18
 KB_LLM_COMPARE_EVIDENCE_PER_DOC=3
 ```
 
+如果需要保留默认 v4，同时准备一个 pro 备用通道，可以在同一个 `.env` 中追加 profile 配置：
+
+```text
+DEEPSEEK_PRO_BASE_URL=https://api.deepseek.com
+DEEPSEEK_PRO_MODEL=deepseek-v4-pro
+DEEPSEEK_PRO_API_KEY=sk-your-pro-key-here
+```
+
+默认仍使用 `DEEPSEEK_*`；需要临时切换 paper-kb 内部 LLM 到 pro 时，在启动或命令前加：
+
+```bash
+DEEPSEEK_PROFILE=pro uv run python -m kb_agent.cli llm-status --probe
+```
+
 如果 `DEEPSEEK_BASE_URL` 使用 `http://`，密钥会以明文经过该网络链路；只建议在可信内网或临时科研验证环境中使用。
 
 配置后运行：
@@ -1229,14 +1243,18 @@ uv run --extra mcp python -m kb_agent.mcp_server
 | 任务类型 | 触发意图示例 | Skill | 主要 MCP 工具链 | 输出结果 |
 | --- | --- | --- | --- | --- |
 | 入库与质量检查 | “同步这些论文”“检查 PDF 解析质量” | `ingest-papers` | `kb_sync -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_get_layout_blocks` | 同步结果、解析质量、重解析建议 |
-| 证据优先问答 | “这篇论文的方法是什么”“有没有实验指标” | `paper-qa` | `kb_search_docs -> kb_classify_query -> kb_tree_search -> kb_get_evidence -> kb_answer` | 带文档、章节、节点和页码的回答 |
-| 单篇论文理解 | “提炼这篇论文创新点”“抽取主张证据链” | `paper-insight` | `kb_get_doc_card -> kb_extract_doc_insights -> kb_extract_facts -> kb_extract_evidence_units -> kb_extract_claim_frames -> kb_verify_claim_frames` | doc card、innovation、citation、facts、EvidenceUnit、ClaimFrame、Verifier |
-| 跨论文比较 | “比较这些论文的方法差异” | `compare-papers` | `kb_search_docs -> kb_extract_facts -> kb_extract_claim_frames -> kb_verify_claim_frames -> kb_compare -> kb_audit_facts` | 比较矩阵、证据覆盖、事实风险和 open questions |
-| 综述写作 | “生成综述提纲和草稿” | `review-writing` | `kb_generate_review -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review -> kb_get_task_artifact` | review task、章节草稿、引用检查、总稿路径、修订动作 |
+| 证据优先问答 | “这篇论文的方法是什么”“有没有实验指标” | `paper-qa` | `kb_search_docs -> kb_classify_query -> 规则 kb_tree_search -> kb_get_evidence -> kb_answer` | 带文档、章节、节点和页码的回答 |
+| 单篇论文理解 | “提炼这篇论文创新点”“抽取主张证据链” | `paper-insight` | `kb_get_doc_card -> kb_extract_doc_insights -> 轻量 kb_extract_facts -> kb_extract_evidence_units -> kb_extract_claim_frames -> kb_verify_claim_frames` | doc card、innovation、citation、facts、EvidenceUnit、ClaimFrame、Verifier |
+| 跨论文比较 | “比较这些论文的方法差异” | `compare-papers` | `kb_search_docs -> 轻量 kb_extract_facts -> kb_extract_claim_frames -> kb_verify_claim_frames -> kb_compare -> kb_audit_facts` | 比较矩阵、证据覆盖、事实风险和 open questions |
+| 综述写作 | “生成综述提纲和草稿” | `review-writing` | `kb_search_docs -> kb_get_doc_card -> 用户确认候选文献 -> kb_generate_review -> kb_get_task_artifact -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review` | 候选文献、review task、章节证据、章节草稿、引用检查、总稿路径、修订动作 |
 | 质量复盘 | “评估检索质量”“跑真实 baseline” | `quality-review` | `kb_create_eval_suite -> kb_run_benchmark -> kb_run_quality_baseline -> kb_eval_dashboard -> kb_get_latest_quality_baseline` | benchmark、baseline、dashboard、warning 和 next actions |
 | 任务恢复与记忆 | “继续上次综述任务”“保存当前进度” | `task-resume` / `memory-hygiene` | `memory_resume_task -> memory_compile_context -> kb_get_task_artifact -> memory_remember_task -> memory_compact` | task_id、短上下文包、任务状态、缺口、建议命令和压缩任务记忆 |
 
 所有 workflow 都遵守 evidence-first：正式结论必须回到 evidence packet、EvidenceUnit、ClaimFrame 或任务工件中的 evidence 字段。论文正文、长 excerpt、完整 evidence、完整 prompt、API key 和综述正文不能写入长期 memory、query log、feedback 或普通报告摘要。
+
+综述 workflow 默认先检索候选论文并读取 doc card，用户确认范围后再生成 review task。若 `kb_generate_review` 的 LLM 长流程在 MCP 中超时，优先用确认后的 doc_ids、较小 `top_k_docs` 和 `use_llm=false` 生成可追溯任务工件，再让当前对话模型基于短 outline、section evidence 和 evidence ID 辅助润色；不要反复重试同一个重型 LLM MCP 调用。
+
+论文理解、问答和比较 workflow 也遵守同一原则：MCP 工具优先产出可追溯的短结构化工件和 evidence ID；`kb_extract_facts use_llm=true`、`kb_tree_search use_llm=true`、`kb_compare use_llm=true` 只适合用户明确要求时对少量关键论文单次增强，不适合多篇并发调用。遇到 MCP timeout 时，应回到规则工件和当前对话模型解释证据，而不是继续重试重型 MCP 内部 LLM。
 
 当用户明确指出某次结果好坏时，可追加：
 

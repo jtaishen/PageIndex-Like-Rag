@@ -10,6 +10,7 @@ DATA_DIR = PROJECT_ROOT / "data"
 DEFAULT_DB_PATH = DATA_DIR / "kb.sqlite"
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
+DEFAULT_DEEPSEEK_PROFILE = "default"
 SUPPORTED_EXTENSIONS = {
     ".md",
     ".markdown",
@@ -52,22 +53,27 @@ def resolve_db_path(value: Optional[str] = None) -> Path:
 
 def deepseek_api_key() -> Optional[str]:
     load_env_file()
-    return os.environ.get("DEEPSEEK_API_KEY")
+    return _deepseek_env("API_KEY")
 
 
 def deepseek_base_url() -> str:
     load_env_file()
-    return os.environ.get("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL).rstrip("/")
+    return _deepseek_env("BASE_URL", DEFAULT_DEEPSEEK_BASE_URL).rstrip("/")
 
 
 def deepseek_model() -> str:
     load_env_file()
-    return os.environ.get("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL)
+    return _deepseek_env("MODEL", DEFAULT_DEEPSEEK_MODEL)
+
+
+def deepseek_profile() -> str:
+    load_env_file()
+    return (os.environ.get("DEEPSEEK_PROFILE") or DEFAULT_DEEPSEEK_PROFILE).strip().lower() or DEFAULT_DEEPSEEK_PROFILE
 
 
 def deepseek_temperature() -> float:
     load_env_file()
-    raw = os.environ.get("DEEPSEEK_TEMPERATURE", "0.2")
+    raw = _deepseek_env("TEMPERATURE", "0.2")
     try:
         return float(raw)
     except ValueError:
@@ -76,7 +82,7 @@ def deepseek_temperature() -> float:
 
 def deepseek_max_tokens() -> int:
     load_env_file()
-    raw = os.environ.get("DEEPSEEK_MAX_TOKENS", "1200")
+    raw = _deepseek_env("MAX_TOKENS", "1200")
     try:
         return int(raw)
     except ValueError:
@@ -91,6 +97,16 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
     return value if value > 0 else default
+
+
+def _deepseek_env(suffix: str, default: Optional[str] = None) -> Optional[str]:
+    profile = deepseek_profile()
+    if profile not in {"", DEFAULT_DEEPSEEK_PROFILE, "default", "v4", "deepseek"}:
+        profiled_name = f"DEEPSEEK_{profile.upper()}_{suffix}"
+        value = os.environ.get(profiled_name)
+        if value is not None and value.strip():
+            return value
+    return os.environ.get(f"DEEPSEEK_{suffix}", default)
 
 
 def deepseek_timeout_seconds() -> int:
