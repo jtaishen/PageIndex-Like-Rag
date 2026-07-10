@@ -214,6 +214,7 @@ def generate_json_object(
     timeout_seconds: Optional[int] = None,
     retry_count: Optional[int] = None,
     max_tokens: Optional[int] = None,
+    thinking: Optional[bool] = None,
     operation: str = "",
     stage: str = "",
 ) -> Dict[str, object]:
@@ -238,7 +239,7 @@ def generate_json_object(
         else resolved.max_tokens
     )
     started = time.time()
-    body = _chat_body(resolved, messages, max_tokens=max_tokens)
+    body = _chat_body(resolved, messages, max_tokens=max_tokens, thinking=thinking)
     try:
         content = _chat_completion_content(body, resolved, timeout=timeout, operation=options.operation, stage=options.stage)
     except LLMError as exc:
@@ -262,6 +263,7 @@ def generate_json_object(
             "operation": options.operation,
             "stage": options.stage,
             "max_tokens": request_max_tokens,
+            "thinking_mode": _thinking_mode(thinking),
             "duration_ms": round((time.time() - started) * 1000, 3),
         }
         return payload
@@ -290,7 +292,7 @@ def generate_json_object(
         ]
         retry_error: Optional[LLMError] = None
         for retry_index in range(1, retries + 1):
-            retry_body = _chat_body(resolved, retry_messages, max_tokens=max_tokens)
+            retry_body = _chat_body(resolved, retry_messages, max_tokens=max_tokens, thinking=thinking)
             try:
                 retry_content = _chat_completion_content(
                     retry_body,
@@ -325,6 +327,7 @@ def generate_json_object(
             "operation": options.operation,
             "stage": options.stage,
             "max_tokens": request_max_tokens,
+            "thinking_mode": _thinking_mode(thinking),
             "duration_ms": round((time.time() - started) * 1000, 3),
         }
         return payload
@@ -335,6 +338,7 @@ def _chat_body(
     messages: List[Dict[str, str]],
     *,
     max_tokens: Optional[int] = None,
+    thinking: Optional[bool] = None,
 ) -> Dict[str, object]:
     output_tokens = resolved.max_tokens
     if max_tokens is not None and max_tokens > 0:
@@ -346,10 +350,12 @@ def _chat_body(
         "max_tokens": output_tokens,
         "stream": False,
     }
-    thinking = os.environ.get("DEEPSEEK_THINKING", "").strip().lower()
-    if thinking in {"enabled", "true", "1", "yes"}:
+    env_thinking = os.environ.get("DEEPSEEK_THINKING", "").strip().lower()
+    if thinking is True or (thinking is None and env_thinking in {"enabled", "true", "1", "yes"}):
         body["thinking"] = {"type": "enabled"}
         body["reasoning_effort"] = os.environ.get("DEEPSEEK_REASONING_EFFORT", "medium")
+    elif thinking is False:
+        body["thinking"] = {"type": "disabled"}
     return body
 
 
@@ -431,7 +437,8 @@ def _chat_completion_content(
         ) from exc
 
     try:
-        content = payload["choices"][0]["message"]["content"]
+        choice = payload["choices"][0]
+        message = choice["message"]
     except (KeyError, IndexError, TypeError) as exc:
         _record_llm_event(
             operation=operation,
@@ -446,19 +453,38 @@ def _chat_completion_content(
             error_type="unexpected_response",
             metadata={"operation": operation, "stage": stage},
         ) from exc
+    if not isinstance(message, dict):
+        raise LLMError(
+            "Unexpected DeepSeek API response.",
+            error_type="unexpected_response",
+            metadata={"operation": operation, "stage": stage},
+        )
+    content = message.get("content")
     if not content:
+        finish_reason = str(choice.get("finish_reason") or "") if isinstance(choice, dict) else ""
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+        output_limit_reached = finish_reason == "length"
+        error_type = "output_token_limit" if output_limit_reached else "empty_response"
         _record_llm_event(
             operation=operation,
             stage=stage,
             status="failed",
-            error_type="empty_response",
+            error_type=error_type,
             started=started,
             timeout=timeout,
         )
         raise LLMError(
-            "DeepSeek API returned an empty answer.",
-            error_type="empty_response",
-            metadata={"operation": operation, "stage": stage},
+            "DeepSeek output token budget was exhausted before content was produced."
+            if output_limit_reached
+            else "DeepSeek API returned an empty answer.",
+            error_type=error_type,
+            metadata={
+                "operation": operation,
+                "stage": stage,
+                "finish_reason": finish_reason,
+                "completion_tokens": int(usage.get("completion_tokens") or 0),
+                "reasoning_content_present": bool(message.get("reasoning_content")),
+            },
         )
     _record_llm_event(
         operation=operation,
@@ -501,7 +527,7 @@ def _llm_error_metadata(
     started: float,
     first_error_type: str = "",
 ) -> Dict[str, Any]:
-    return {
+    metadata = {
         "retry_count": retry_count,
         "repair_used": False,
         "first_error_type": first_error_type,
@@ -510,6 +536,18 @@ def _llm_error_metadata(
         "stage": stage,
         "duration_ms": round((time.time() - started) * 1000, 3),
     }
+    for key in ("finish_reason", "completion_tokens", "reasoning_content_present"):
+        if key in error.metadata:
+            metadata[key] = error.metadata[key]
+    return metadata
+
+
+def _thinking_mode(thinking: Optional[bool]) -> str:
+    if thinking is True:
+        return "enabled"
+    if thinking is False:
+        return "disabled"
+    return "configured_default"
 
 
 def _record_llm_event(

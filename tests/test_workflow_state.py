@@ -68,10 +68,12 @@ class WorkflowStateTest(unittest.TestCase):
                 "review_draft",
                 "method_paradigms",
                 max_tokens=900,
+                thinking=False,
             )("system", "user")
 
         self.assertEqual(result, {"ok": True})
         self.assertEqual(generate.call_args.kwargs["max_tokens"], 900)
+        self.assertFalse(generate.call_args.kwargs["thinking"])
         self.assertEqual(generate.call_args.kwargs["retry_count"], 0)
 
 

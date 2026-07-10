@@ -1126,9 +1126,13 @@ uv run python -m kb_agent.cli memory-compile "继续写综述" --intent review -
 uv run python -m kb_agent.cli resume-task
 ```
 
+## v0.61 DeepSeek Pro 综述推理额度修复
+
+v0.61 修复 `deepseek-v4-pro` 在 staged 综述草稿中先耗尽 reasoning token、最终返回空正文的问题。草稿步骤现在显式关闭 reasoning，使独立的 900-token 额度用于生成实际 JSON 和正文；大纲、事实和比较步骤仍保持原有推理设置。LLM 响应诊断也会根据 `finish_reason` 区分 `output_token_limit` 与普通 `empty_response`，避免把输出额度耗尽误判为 evidence 过多或网络超时。
+
 ## v0.60 Staged 综述草稿超时修复
 
-v0.60 根据真实综述任务中的章节超时结果，将 staged MCP 单步默认超时调整为 45 秒，并为综述草稿设置独立的 900-token 输出上限。草稿提示词要求 2 至 3 个短段落，避免单节继承全局长输出配置；超时结果会明确提示只重试失败章节，已完成章节保持不变，存在 failed/pending step 时不能宣称任务完成。
+v0.60 根据真实综述任务中的章节超时结果，将 staged MCP 单步默认超时调整为 45 秒，并为综述草稿设置独立的 900-token 输出上限。草稿提示词要求 2 至 3 个短段落；失败结果会明确提示只重试失败章节。已完成章节保持不变，存在 failed/pending step 时不能宣称任务完成。
 
 ## v0.59 OpenCode 长流程 Staged MCP
 

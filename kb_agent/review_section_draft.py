@@ -141,6 +141,7 @@ def section_draft_llm_diagnostics(
         "retry_count": int(metadata.get("retry_count") or 0),
         "repair_used": bool(metadata.get("repair_used")),
         "max_tokens": int(metadata.get("max_tokens") or 0),
+        "thinking_mode": str(metadata.get("thinking_mode") or ""),
         "error_type": (getattr(error, "error_type", "") if error else str(metadata.get("error_type") or "")),
         "fallback_reason": fallback_reason,
         "evidence_count": evidence_count,

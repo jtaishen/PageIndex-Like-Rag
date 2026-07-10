@@ -116,6 +116,7 @@ def single_request_json_generator(
     stage: str,
     *,
     max_tokens: Optional[int] = None,
+    thinking: Optional[bool] = None,
 ) -> JsonGenerator:
     """Create a JSON generator that can issue only one bounded LLM request."""
 
@@ -128,6 +129,8 @@ def single_request_json_generator(
         }
         if max_tokens is not None:
             options["max_tokens"] = max_tokens
+        if thinking is not None:
+            options["thinking"] = thinking
         return generate_json_object(
             system_prompt,
             user_prompt,

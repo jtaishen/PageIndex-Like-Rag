@@ -233,6 +233,7 @@ def draft_review_section(
         "review_draft",
         section_id,
         max_tokens=mcp_review_draft_max_tokens(),
+        thinking=False,
     )
     try:
         result = draft_review(
@@ -287,7 +288,13 @@ def _failed_step_result(
     error_type: str,
     workflow: Dict[str, Any],
 ) -> Dict[str, Any]:
-    retryable = error_type in {"request_timeout", "request_failed", "invalid_json", "truncated_json"}
+    retryable = error_type in {
+        "request_timeout",
+        "request_failed",
+        "invalid_json",
+        "truncated_json",
+        "output_token_limit",
+    }
     return {
         "schema": schema,
         "task_id": task_id,
