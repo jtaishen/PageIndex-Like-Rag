@@ -12,11 +12,13 @@ description: 跨论文比较 workflow；用于围绕主题筛选论文、生成�
 ## 必调工具顺序
 
 1. `kb_search_docs`：围绕比较主题筛选候选论文。
-2. `kb_extract_facts`：确保候选论文有 claims、entities、relations；多篇候选论文默认使用轻量规则路径，避免在 MCP 内部并发 LLM 抽取。
+2. `kb_prepare_fact_extraction -> kb_extract_fact_batch -> kb_finalize_fact_extraction`：候选论文缺少 facts 时逐篇、逐批完成抽取，不并发调用 LLM。
 3. `kb_extract_claim_frames`：生成主张级证据链。
 4. `kb_verify_claim_frames`：检查 ClaimFrame 支撑状态。
-5. `kb_compare`：生成固定维度比较矩阵和任务工件；MCP 内部 LLM 超时风险高时先用规则路径生成矩阵，再由当前对话模型基于短工件解释。
-6. `kb_audit_facts`：检查重复、低置信、冲突和 citation gaps。
+5. `kb_prepare_compare`：生成固定六维的比较任务和 evidence，不调用 LLM。
+6. `kb_get_workflow_status` / `kb_generate_compare_dimension`：按 pending steps 一次生成一个比较维度。
+7. `kb_finalize_compare`：所有维度完成后合并 comparison matrix。
+8. `kb_audit_facts`：检查重复、低置信、冲突和 citation gaps。
 
 ## 可选工具
 
@@ -27,8 +29,8 @@ description: 跨论文比较 workflow；用于围绕主题筛选论文、生成�
 ## 停止条件
 
 - 如果候选论文少于 2 篇，停止比较并说明需要更多论文。
-- 如果 `kb_extract_facts use_llm=true` 或 `kb_compare use_llm=true` 超时，停止继续重试重型 LLM MCP；改用规则 facts / compare 工件，并把 LLM 超时作为限制说明。
-- 不对多篇论文并发运行 LLM facts 抽取；确实需要 LLM 增强时先只处理用户确认的关键论文。
+- 单个 fact batch 或 comparison dimension 超时时，只重试失败 step，不重跑已完成部分。
+- 不对多篇论文并发运行 LLM facts 抽取；按论文依次完成 workflow。
 - 如果某比较维度缺 evidence，保留 warning，不补写确定结论。
 
 ## 输出要求
@@ -43,7 +45,7 @@ description: 跨论文比较 workflow；用于围绕主题筛选论文、生成�
 
 ## 禁止事项
 
-- 不并发执行多篇 `kb_extract_facts use_llm=true`。
-- 不反复重试超时的 `kb_compare use_llm=true`；先保留 evidence-first 的规则比较结果。
+- 交互式 OpenCode workflow 不直接调用旧的 `kb_extract_facts use_llm=true` 或 `kb_compare use_llm=true` 长流程。
+- 不跳过失败维度后把比较矩阵标记为完整。
 - 不把 fact audit 或 claim graph 当成最终论文证据；正式结论仍需回到 evidence。
 - 不把比较矩阵中的短摘要写入长期 memory。

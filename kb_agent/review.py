@@ -25,6 +25,7 @@ def draft_review(
     should_continue: Optional[Callable[[], bool]] = None,
     skip_reason: str = "review_draft_budget_exhausted",
     budget_fallback_to_rule: bool = False,
+    json_generator: Optional[Callable[[str, str], Dict[str, object]]] = None,
 ) -> Dict[str, Any]:
     task_dir = _review_task_dir(db_path, task_id)
     outline = _read_json(task_dir / "review_outline.json")
@@ -36,6 +37,7 @@ def draft_review(
     warnings: List[str] = []
     llm_error = ""
     paths: Dict[str, str] = {}
+    generator = json_generator or generate_json_object
     for section in sections:
         evidence_artifact = _read_section_evidence(task_dir, str(section["section_id"]))
         numbered_evidence, compaction = prepare_numbered_draft_evidence(
@@ -55,7 +57,7 @@ def draft_review(
                     use_llm=False,
                     rule_warnings=[skip_reason, "llm_budget_exhausted"],
                     fallback_reason=skip_reason,
-                    json_generator=generate_json_object,
+                    json_generator=generator,
                 )
                 draft = draft_result.draft
             else:
@@ -79,7 +81,7 @@ def draft_review(
             compaction,
             use_llm=use_llm,
             require_llm=require_llm,
-            json_generator=generate_json_object,
+            json_generator=generator,
         )
         draft = draft_result.draft
         if draft_result.llm_error:

@@ -331,7 +331,7 @@ uv run python -m kb_agent.cli query-log --limit 10
 uv run python -m kb_agent.cli query-stats --since-days 7
 ```
 
-OpenCode 已配置 `.opencode/plugins/kb-observer/index.mjs`。它会在 `kb_tree_search`、`kb_compare`、`kb_generate_review`、`kb_check_review_citations` 和评测工具运行后，把任务状态和质量告警摘要写入 `.kb_state/opencode_observer/`，并在会话压缩时注入短上下文；不会写入论文正文或 evidence。
+OpenCode 已配置 `.opencode/plugins/kb-observer/index.mjs`。它会在树检索、staged facts/compare/review、引用检查和评测工具运行后，把任务状态和质量告警摘要写入 `.kb_state/opencode_observer/`，并在会话压缩时注入短上下文；不会写入论文正文或 evidence。
 
 ## v0.12 人工反馈闭环与评测集管理
 
@@ -1126,6 +1126,22 @@ uv run python -m kb_agent.cli memory-compile "继续写综述" --intent review -
 uv run python -m kb_agent.cli resume-task
 ```
 
+## v0.59 OpenCode 长流程 Staged MCP
+
+v0.59 将交互式 `facts / compare / review` 从单次长 MCP 请求改为可恢复的 staged workflow。准备步骤只生成 evidence-first 任务工件；每个 fact batch、比较维度、综述大纲章节和综述草稿章节最多发出一次 DeepSeek 请求，完成状态写入 `workflow_state.json`。单步失败后可从对应 pending step 恢复，不会重复已完成的模型调用，也不会用规则结果伪装成 LLM 成功。
+
+OpenCode 默认调用顺序：
+
+```text
+facts:   kb_prepare_fact_extraction -> kb_extract_fact_batch -> kb_finalize_fact_extraction
+compare: kb_prepare_compare -> kb_generate_compare_dimension -> kb_finalize_compare
+review:  kb_prepare_review -> kb_generate_review_outline_section -> kb_finalize_review_outline
+         -> kb_draft_review_section -> kb_check_review_citations -> kb_assemble_review
+status:  kb_get_workflow_status
+```
+
+旧的同步 CLI 和 MCP 工具继续保留兼容。staged 单步默认使用 `KB_MCP_LLM_STEP_TIMEOUT_SECONDS=35`，并关闭单步内 JSON 重试，从调用结构上避开 MCP 默认约 60 秒请求上限。
+
 ## PDF 和 MCP 可选依赖
 
 如果要解析 PDF：
@@ -1180,6 +1196,7 @@ DEEPSEEK_MAX_TOKENS=3000
 DEEPSEEK_TIMEOUT_SECONDS=45
 DEEPSEEK_PROBE_TIMEOUT_SECONDS=15
 DEEPSEEK_JSON_RETRY_COUNT=1
+KB_MCP_LLM_STEP_TIMEOUT_SECONDS=35
 KB_BASELINE_LLM_TIMEOUT_SECONDS=420
 KB_BASELINE_LLM_STAGE_TIMEOUT_SECONDS=120
 KB_LLM_FACT_BATCH_SIZE=6
@@ -1244,17 +1261,17 @@ uv run --extra mcp python -m kb_agent.mcp_server
 | --- | --- | --- | --- | --- |
 | 入库与质量检查 | “同步这些论文”“检查 PDF 解析质量” | `ingest-papers` | `kb_sync -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_get_layout_blocks` | 同步结果、解析质量、重解析建议 |
 | 证据优先问答 | “这篇论文的方法是什么”“有没有实验指标” | `paper-qa` | `kb_search_docs -> kb_classify_query -> 规则 kb_tree_search -> kb_get_evidence -> kb_answer` | 带文档、章节、节点和页码的回答 |
-| 单篇论文理解 | “提炼这篇论文创新点”“抽取主张证据链” | `paper-insight` | `kb_get_doc_card -> kb_extract_doc_insights -> 轻量 kb_extract_facts -> kb_extract_evidence_units -> kb_extract_claim_frames -> kb_verify_claim_frames` | doc card、innovation、citation、facts、EvidenceUnit、ClaimFrame、Verifier |
-| 跨论文比较 | “比较这些论文的方法差异” | `compare-papers` | `kb_search_docs -> 轻量 kb_extract_facts -> kb_extract_claim_frames -> kb_verify_claim_frames -> kb_compare -> kb_audit_facts` | 比较矩阵、证据覆盖、事实风险和 open questions |
-| 综述写作 | “生成综述提纲和草稿” | `review-writing` | `kb_search_docs -> kb_get_doc_card -> 用户确认候选文献 -> kb_generate_review -> kb_get_task_artifact -> kb_draft_review -> kb_check_review_citations -> kb_assemble_review` | 候选文献、review task、章节证据、章节草稿、引用检查、总稿路径、修订动作 |
+| 单篇论文理解 | “提炼这篇论文创新点”“抽取主张证据链” | `paper-insight` | `kb_get_doc_card -> kb_extract_doc_insights -> kb_prepare_fact_extraction -> 逐批 kb_extract_fact_batch -> kb_finalize_fact_extraction -> kb_extract_evidence_units -> kb_extract_claim_frames -> kb_verify_claim_frames` | doc card、innovation、citation、facts、EvidenceUnit、ClaimFrame、Verifier |
+| 跨论文比较 | “比较这些论文的方法差异” | `compare-papers` | `kb_search_docs -> staged facts -> kb_extract_claim_frames -> kb_verify_claim_frames -> kb_prepare_compare -> 逐维度 kb_generate_compare_dimension -> kb_finalize_compare -> kb_audit_facts` | 可恢复比较任务、比较矩阵、证据覆盖、事实风险和 open questions |
+| 综述写作 | “生成综述提纲和草稿” | `review-writing` | `kb_search_docs -> kb_get_doc_card -> 用户确认候选文献 -> kb_prepare_review -> 逐节 kb_generate_review_outline_section -> kb_finalize_review_outline -> 逐节 kb_draft_review_section -> kb_check_review_citations -> kb_assemble_review` | 候选文献、可恢复 workflow、章节证据、章节草稿、引用检查、总稿路径、修订动作 |
 | 质量复盘 | “评估检索质量”“跑真实 baseline” | `quality-review` | `kb_create_eval_suite -> kb_run_benchmark -> kb_run_quality_baseline -> kb_eval_dashboard -> kb_get_latest_quality_baseline` | benchmark、baseline、dashboard、warning 和 next actions |
 | 任务恢复与记忆 | “继续上次综述任务”“保存当前进度” | `task-resume` / `memory-hygiene` | `memory_resume_task -> memory_compile_context -> kb_get_task_artifact -> memory_remember_task -> memory_compact` | task_id、短上下文包、任务状态、缺口、建议命令和压缩任务记忆 |
 
 所有 workflow 都遵守 evidence-first：正式结论必须回到 evidence packet、EvidenceUnit、ClaimFrame 或任务工件中的 evidence 字段。论文正文、长 excerpt、完整 evidence、完整 prompt、API key 和综述正文不能写入长期 memory、query log、feedback 或普通报告摘要。
 
-综述 workflow 默认先检索候选论文并读取 doc card，用户确认范围后再生成 review task。若 `kb_generate_review` 的 LLM 长流程在 MCP 中超时，优先用确认后的 doc_ids、较小 `top_k_docs` 和 `use_llm=false` 生成可追溯任务工件，再让当前对话模型基于短 outline、section evidence 和 evidence ID 辅助润色；不要反复重试同一个重型 LLM MCP 调用。
+综述、compare 和 facts 的交互式 LLM 流程采用 staged MCP：准备步骤不调用模型，每个章节、比较维度或 fact batch 最多发出一次 DeepSeek 请求，随后将完成状态写入 `workflow_state.json`。`kb_get_workflow_status` 返回当前 phase、completed steps、pending steps 和失败类型；连接恢复后只重试失败 step，不重复已经完成的模型调用。
 
-论文理解、问答和比较 workflow 也遵守同一原则：MCP 工具优先产出可追溯的短结构化工件和 evidence ID；`kb_extract_facts use_llm=true`、`kb_tree_search use_llm=true`、`kb_compare use_llm=true` 只适合用户明确要求时对少量关键论文单次增强，不适合多篇并发调用。遇到 MCP timeout 时，应回到规则工件和当前对话模型解释证据，而不是继续重试重型 MCP 内部 LLM。
+旧的 `kb_generate_review`、`kb_draft_review` 和 `kb_extract_facts` 继续保留，供 CLI、自动化脚本和兼容调用使用；OpenCode agent 默认使用 staged 工具，避免把多次模型请求塞进单个 60 秒左右的 MCP 调用。每个 staged LLM step 默认使用 `KB_MCP_LLM_STEP_TIMEOUT_SECONDS=35`，并关闭该 step 内的 JSON 重试；结构化失败会明确记录，不会用规则结果伪装为 LLM 成功。
 
 当用户明确指出某次结果好坏时，可追加：
 

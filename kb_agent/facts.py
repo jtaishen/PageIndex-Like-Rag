@@ -64,15 +64,15 @@ def extract_facts(
             **existing,
         }
 
-    card = get_doc_card(db_path, doc_id)
-    quality = get_parse_quality(db_path, doc_id)
-    nodes = _artifact_content(db_path, doc_id, "node_index.jsonl", [])
-    table_content = _artifact_content(db_path, doc_id, "table_content.json", {})
-    table_summaries = _artifact_content(db_path, doc_id, "table_summaries.json", {})
-    innovation, citation_map, insight_warnings = _read_or_extract_insight_artifacts(db_path, doc_id)
-    node_by_id = node_map(nodes)
-    selected_nodes = select_fact_nodes(nodes, innovation, citation_map)
-    warnings = [*insight_warnings]
+    inputs = load_fact_extraction_inputs(db_path, doc_id, listing=listing)
+    card = inputs["card"]
+    quality = inputs["quality"]
+    table_summaries = inputs["table_summaries"]
+    innovation = inputs["innovation"]
+    citation_map = inputs["citation_map"]
+    node_by_id = inputs["node_by_id"]
+    selected_nodes = inputs["selected_nodes"]
+    warnings = [*inputs["warnings"]]
     llm_error = ""
 
     if use_llm:
@@ -110,8 +110,58 @@ def extract_facts(
         warnings.append("llm_disabled")
         facts = rule_based_facts(doc_id, version_id, card, quality, innovation, citation_map, selected_nodes, node_by_id, warnings)
 
+    return persist_fact_result(db_path, inputs, facts, llm_error=llm_error)
+
+
+def load_fact_extraction_inputs(
+    db_path: Path,
+    doc_id: str,
+    *,
+    listing: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    resolved_listing = listing or list_artifacts(db_path, doc_id)
+    nodes = _artifact_content(db_path, doc_id, "node_index.jsonl", [])
+    innovation, citation_map, insight_warnings = _read_or_extract_insight_artifacts(db_path, doc_id)
+    return {
+        "doc_id": doc_id,
+        "version_id": str(resolved_listing["version_id"]),
+        "artifact_dir": Path(str(resolved_listing["artifact_dir"])),
+        "card": get_doc_card(db_path, doc_id),
+        "quality": get_parse_quality(db_path, doc_id),
+        "nodes": nodes,
+        "table_content": _artifact_content(db_path, doc_id, "table_content.json", {}),
+        "table_summaries": _artifact_content(db_path, doc_id, "table_summaries.json", {}),
+        "innovation": innovation,
+        "citation_map": citation_map,
+        "node_by_id": node_map(nodes),
+        "selected_nodes": select_fact_nodes(nodes, innovation, citation_map),
+        "warnings": [*insight_warnings],
+    }
+
+
+def persist_fact_result(
+    db_path: Path,
+    inputs: Dict[str, Any],
+    facts: Dict[str, Any],
+    *,
+    llm_error: str = "",
+) -> Dict[str, Any]:
+    doc_id = str(inputs["doc_id"])
+    version_id = str(inputs["version_id"])
+    artifact_dir = Path(inputs["artifact_dir"])
+    card = inputs["card"]
+    quality = inputs["quality"]
+    citation_map = inputs["citation_map"]
+    node_by_id = inputs["node_by_id"]
     facts = merge_citation_relations(doc_id, version_id, card, facts, citation_map, node_by_id)
-    facts = merge_table_facts(doc_id, version_id, facts, table_content, table_summaries, node_by_id)
+    facts = merge_table_facts(
+        doc_id,
+        version_id,
+        facts,
+        inputs["table_content"],
+        inputs["table_summaries"],
+        node_by_id,
+    )
     facts = dedupe_facts(facts)
     artifacts = build_fact_artifacts(doc_id, version_id, card, quality, facts, llm_error)
     write_fact_artifacts(artifact_dir, artifacts)

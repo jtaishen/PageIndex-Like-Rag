@@ -4,7 +4,18 @@ import path from "node:path";
 const OBSERVED_TOOLS = new Set([
   "kb_tree_search",
   "kb_compare",
+  "kb_prepare_compare",
+  "kb_generate_compare_dimension",
+  "kb_finalize_compare",
   "kb_generate_review",
+  "kb_prepare_review",
+  "kb_generate_review_outline_section",
+  "kb_finalize_review_outline",
+  "kb_draft_review_section",
+  "kb_prepare_fact_extraction",
+  "kb_extract_fact_batch",
+  "kb_finalize_fact_extraction",
+  "kb_get_workflow_status",
   "kb_check_review_citations",
   "kb_eval_search",
   "kb_eval_review",
@@ -164,6 +175,29 @@ function summarizeToolEvent(tool, input, payload) {
 }
 
 function summarizeMetrics(tool, safe, coverage) {
+  if (
+    tool === "kb_prepare_review" ||
+    tool === "kb_prepare_compare" ||
+    tool === "kb_generate_compare_dimension" ||
+    tool === "kb_finalize_compare" ||
+    tool === "kb_generate_review_outline_section" ||
+    tool === "kb_finalize_review_outline" ||
+    tool === "kb_draft_review_section" ||
+    tool === "kb_prepare_fact_extraction" ||
+    tool === "kb_extract_fact_batch" ||
+    tool === "kb_finalize_fact_extraction" ||
+    tool === "kb_get_workflow_status"
+  ) {
+    const workflow = safe.workflow || safe;
+    const summary = workflow.summary || {};
+    return {
+      phase: stringValue(workflow.phase),
+      step_count: numberValue(summary.step_count),
+      completed_step_count: numberValue(summary.completed_step_count),
+      remaining_step_count: numberValue(summary.remaining_step_count),
+      failed_step_count: numberValue(summary.failed_steps?.length),
+    };
+  }
   if (tool === "kb_tree_search") {
     return {
       result_count: numberValue(safe.results?.length),

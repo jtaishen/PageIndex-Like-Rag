@@ -813,7 +813,7 @@ class IngestSearchTest(unittest.TestCase):
                 result = run_quality_baseline(db_path, papers, use_llm=False, top_k=3)
 
             self.assertEqual(result["schema"], "quality_baseline.v1")
-            self.assertEqual(result["code_version"], "v0.58")
+            self.assertEqual(result["code_version"], "v0.59")
             self.assertTrue(result["git_commit"])
             self.assertTrue(result["feature_flags"]["review_draft_baseline"])
             self.assertTrue(result["feature_flags"]["claim_frame_quality_filtering"])
@@ -825,6 +825,7 @@ class IngestSearchTest(unittest.TestCase):
             self.assertTrue(result["feature_flags"]["claim_frame_alignment_relations"])
             self.assertTrue(result["feature_flags"]["claim_frame_normalized_alignment"])
             self.assertTrue(result["feature_flags"]["artifact_first_memory_negative_memory"])
+            self.assertTrue(result["feature_flags"]["staged_mcp_workflows"])
             self.assertTrue(result["is_current_code_baseline"])
             self.assertEqual(result["baseline_stale_reason"], "")
             self.assertEqual(result["doc_count"], 2)
@@ -1097,7 +1098,7 @@ class IngestSearchTest(unittest.TestCase):
                     {
                         "schema": "quality_baseline.v1",
                         "baseline_id": "older-commit",
-                        "code_version": "v0.58",
+                        "code_version": "v0.59",
                         "git_commit": "0000000000000000000000000000000000000000",
                         "feature_flags": {"review_draft_baseline": True},
                         "corpus_path": str((Path.cwd() / "articles").resolve()),

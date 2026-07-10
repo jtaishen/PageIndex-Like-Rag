@@ -32,9 +32,15 @@ class TaskArtifactsTest(unittest.TestCase):
         self.assertTrue(valid_task_artifact_name("current_task.json"))
         self.assertTrue(valid_task_artifact_name("section_evidence/background_problem.json"))
         self.assertTrue(valid_task_artifact_name("section_drafts/background_problem.md"))
+        self.assertTrue(valid_task_artifact_name("workflow_state.json"))
+        self.assertTrue(valid_task_artifact_name("fact_extraction_plan.json"))
+        self.assertTrue(valid_task_artifact_name("fact_batches/batch_001.json"))
+        self.assertTrue(valid_task_artifact_name("review_sections/background_problem.json"))
+        self.assertTrue(valid_task_artifact_name("comparison_dimensions/method_paradigm.json"))
         self.assertFalse(valid_task_artifact_name("../manifest.json"))
         self.assertFalse(valid_task_artifact_name("section_evidence/../bad.json"))
         self.assertFalse(valid_task_artifact_name("section_evidence/nested/bad.json"))
+        self.assertFalse(valid_task_artifact_name("fact_batches/../bad.json"))
         self.assertFalse(valid_task_artifact_name("unknown.json"))
 
     def test_write_and_read_task_artifacts_preserves_existing_schema_and_paths(self) -> None:

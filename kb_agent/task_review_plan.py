@@ -21,6 +21,12 @@ class ReviewPlanBuildResult:
     llm_diagnostics: Dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ReviewSectionBuildResult:
+    section: Dict[str, Any]
+    llm_diagnostics: Dict[str, Any]
+
+
 def build_review_outline(
     topic: str,
     contexts: List[Dict[str, Any]],
@@ -88,6 +94,24 @@ def build_review_outline(
         outline = _rule_based_review_plan(topic, contexts, section_evidence, sections, warnings)
     outline["llm_diagnostics"] = diagnostics
     return ReviewPlanBuildResult(outline=outline, llm_error=llm_error, llm_diagnostics=diagnostics)
+
+
+def build_review_section(
+    topic: str,
+    spec: Dict[str, Any],
+    contexts: List[Dict[str, Any]],
+    evidence: List[Dict[str, Any]],
+    *,
+    json_generator: JsonGenerator | None = None,
+) -> ReviewSectionBuildResult:
+    """Generate and normalize exactly one review-outline section."""
+    generator = json_generator or generate_json_object
+    payload = _review_section_with_llm(topic, spec, contexts, evidence, generator)
+    metadata = llm_payload_metadata(payload)
+    return ReviewSectionBuildResult(
+        section=_normalize_review_section_payload(payload, spec, evidence),
+        llm_diagnostics=llm_diagnostics("staged_section_json", metadata=metadata),
+    )
 
 
 def _review_plan_with_llm(

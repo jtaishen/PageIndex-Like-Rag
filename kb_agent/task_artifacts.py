@@ -8,11 +8,13 @@ from typing import Any, Dict, List, Optional
 
 from .config import DEFAULT_DB_PATH, PROJECT_ROOT
 from .task_evidence import compact_section_evidence
-from .utils import compact_whitespace, stable_id, unique_strings, write_json
+from .utils import compact_whitespace, read_json, stable_id, unique_strings, write_json
 
 
 TASK_ARTIFACT_WHITELIST = {
     "manifest.json",
+    "workflow_state.json",
+    "fact_extraction_plan.json",
     "selected_papers.json",
     "comparison_matrix.json",
     "review_outline.json",
@@ -47,6 +49,15 @@ def valid_task_artifact_name(name: str) -> bool:
     if name.startswith("section_drafts/") and (name.endswith(".json") or name.endswith(".md")):
         parts = Path(name).parts
         return len(parts) == 2 and parts[0] == "section_drafts" and ".." not in parts
+    if name.startswith("review_sections/") and name.endswith(".json"):
+        parts = Path(name).parts
+        return len(parts) == 2 and parts[0] == "review_sections" and ".." not in parts
+    if name.startswith("comparison_dimensions/") and name.endswith(".json"):
+        parts = Path(name).parts
+        return len(parts) == 2 and parts[0] == "comparison_dimensions" and ".." not in parts
+    if name.startswith("fact_batches/") and name.endswith(".json"):
+        parts = Path(name).parts
+        return len(parts) == 2 and parts[0] == "fact_batches" and ".." not in parts
     return False
 
 
@@ -202,6 +213,30 @@ def task_manifest(task_id: str, task_type: str, query: str, status: str, warning
     }
 
 
+def update_task_status(
+    db_path: Path,
+    task_id: str,
+    status: str,
+    *,
+    warnings: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    if not TASK_ID_RE.fullmatch(task_id):
+        raise ValueError(f"Unsupported task id: {task_id}")
+    root = task_state_root(db_path)
+    task_dir = root / task_id
+    manifest_path = task_dir / "manifest.json"
+    manifest = read_json(manifest_path, None)
+    if not isinstance(manifest, dict):
+        raise FileNotFoundError(f"Task manifest not found: {manifest_path}")
+    manifest["status"] = status
+    if warnings is not None:
+        manifest["warnings"] = unique_strings(warnings)
+    manifest["updated_at"] = time.time()
+    write_json(manifest_path, manifest)
+    _write_current_task(root, task_dir, manifest, status)
+    return manifest
+
+
 def write_task_artifacts(
     db_path: Path,
     task_id: str,
@@ -240,20 +275,24 @@ def write_task_artifacts(
             path = section_dir / f"{section_id}.json"
             write_json(path, payload)
             paths[f"section_evidence/{section_id}.json"] = str(path)
+    _write_current_task(root, task_dir, manifest, str(manifest["status"]))
+    paths["current_task"] = str(root / "current_task.json")
+    return paths
+
+
+def _write_current_task(root: Path, task_dir: Path, manifest: Dict[str, Any], status: str) -> None:
     write_json(
         root / "current_task.json",
         {
             "schema": "current_task.v1",
-            "task_id": task_id,
-            "task_type": manifest["task_type"],
-            "query": manifest["query"],
-            "status": manifest["status"],
+            "task_id": manifest.get("task_id") or task_dir.name,
+            "task_type": manifest.get("task_type") or "",
+            "query": manifest.get("query") or "",
+            "status": status,
             "task_dir": str(task_dir),
             "updated_at": time.time(),
         },
     )
-    paths["current_task"] = str(root / "current_task.json")
-    return paths
 
 
 def _string_list(value: object) -> List[str]:

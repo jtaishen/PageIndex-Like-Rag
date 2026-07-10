@@ -21,6 +21,12 @@ class ComparisonBuildResult:
     llm_diagnostics: Dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ComparisonDimensionBuildResult:
+    dimension: Dict[str, Any]
+    llm_diagnostics: Dict[str, Any]
+
+
 def build_comparison_matrix(
     query: str,
     contexts: List[Dict[str, Any]],
@@ -57,6 +63,26 @@ def build_comparison_matrix(
         matrix = _rule_based_comparison(query, contexts, evidence_by_dimension, dimensions, warnings)
     matrix["llm_diagnostics"] = diagnostics
     return ComparisonBuildResult(matrix=matrix, llm_error=llm_error, llm_diagnostics=diagnostics)
+
+
+def build_comparison_dimension(
+    query: str,
+    dimension: Dict[str, Any],
+    contexts: List[Dict[str, Any]],
+    evidence_by_doc: Dict[str, List[Dict[str, Any]]],
+    *,
+    json_generator: JsonGenerator | None = None,
+) -> ComparisonDimensionBuildResult:
+    """Generate and normalize exactly one comparison dimension."""
+    generator = json_generator or generate_json_object
+    dimension_id = str(dimension["id"])
+    evidence_by_dimension = {dimension_id: evidence_by_doc}
+    payload = _compare_dimension_with_llm(query, dimension, contexts, evidence_by_dimension, generator)
+    metadata = llm_payload_metadata(payload)
+    return ComparisonDimensionBuildResult(
+        dimension=_normalize_comparison_dimension_payload(payload, dimension, contexts, evidence_by_dimension),
+        llm_diagnostics=llm_diagnostics("staged_dimension_json", metadata=metadata),
+    )
 
 
 def _compare_with_dimension_llm(

@@ -45,7 +45,7 @@ from .utils import compact_whitespace, read_json as _read_json, stable_id, uniqu
 
 
 BASELINE_SCHEMA = "quality_baseline.v1"
-CODE_VERSION = "v0.58"
+CODE_VERSION = "v0.59"
 BASELINE_FEATURE_FLAGS = {
     "review_draft_baseline": True,
     "baseline_staleness": True,
@@ -70,6 +70,7 @@ BASELINE_FEATURE_FLAGS = {
     "claim_frame_alignment_relations": True,
     "claim_frame_normalized_alignment": True,
     "artifact_first_memory_negative_memory": True,
+    "staged_mcp_workflows": True,
 }
 BASELINE_DIR = DATA_DIR / "eval"
 EVAL_SET_DIR = DATA_DIR / "eval_sets"

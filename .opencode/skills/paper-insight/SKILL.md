@@ -14,10 +14,12 @@ description: 单篇论文理解 workflow；用于抽取 doc card、创新点、�
 1. `kb_get_doc_card`：读取标题、摘要、description、sections 和 quality warnings。
 2. `kb_extract_doc_insights`：生成或刷新 innovation 与 citation 工件。
 3. `kb_get_innovations` / `kb_get_citation_map`：读取创新点和引用关系状态。
-4. `kb_extract_facts`：生成 claims、entities、relations；多篇论文、组会演示或批处理时默认用轻量规则路径，不在 MCP 内部并发跑 LLM。
-5. `kb_extract_evidence_units`：从节点、图表、表格、引用工件派生 EvidenceUnit。
-6. `kb_extract_claim_frames`：把 facts 和 insight 组织成 ClaimFrame。
-7. `kb_verify_claim_frames`：检查 ClaimFrame 到 EvidenceUnit、node、source 的结构链路与语义支持状态。
+4. `kb_prepare_fact_extraction`：准备单篇论文的 fact batches，不调用 LLM；已有 facts 且不要求刷新时直接复用。
+5. `kb_get_workflow_status` / `kb_extract_fact_batch`：按 pending batch 一次执行一个 DeepSeek 请求，完成后刷新状态，不并发处理多个 batch 或多篇论文。
+6. `kb_finalize_fact_extraction`：所有 batch 完成后统一合并、去重并写入正式 facts 工件和数据库。
+7. `kb_extract_evidence_units`：从节点、图表、表格、引用工件派生 EvidenceUnit。
+8. `kb_extract_claim_frames`：把 facts 和 insight 组织成 ClaimFrame。
+9. `kb_verify_claim_frames`：检查 ClaimFrame 到 EvidenceUnit、node、source 的结构链路与语义支持状态。
 
 ## 可选工具
 
@@ -28,8 +30,8 @@ description: 单篇论文理解 workflow；用于抽取 doc card、创新点、�
 ## 停止条件
 
 - 如果 doc card 或 parse quality 显示弱解析，先报告解析风险，再给出有限结论。
-- 如果 `kb_extract_facts` 或 `kb_extract_doc_insights` 的 LLM 路径超时，停止继续批量 LLM 抽取；改用规则工件和短 evidence ID 让当前对话模型辅助分析。
-- 对多篇论文不要并发调用 `kb_extract_facts use_llm=true`；确实需要 LLM 抽取时一次只处理一篇，并在超时后回退轻量路径。
+- 如果单个 fact batch 超时，读取 workflow status，并只重试失败 batch；不能跳过失败 batch 后把结果标记为完整。
+- 对多篇论文必须逐篇完成 staged fact workflow，不并发运行 LLM batch。
 - 如果 ClaimFrame `support_status` 为 unsupported，或 `semantic_support_status` 为 `related_only` / `insufficient_evidence` / `contradicted`，不把它当作正式论文结论。
 
 ## 输出要求
@@ -41,7 +43,7 @@ description: 单篇论文理解 workflow；用于抽取 doc card、创新点、�
 
 ## 禁止事项
 
-- 不对多篇论文并发执行 `kb_extract_facts use_llm=true` 或其他 MCP 内部长 LLM 调用。
-- 不因 LLM 抽取超时而连续重试同一篇论文；超时后先保留规则事实和 evidence 链路。
+- 交互式 OpenCode workflow 不直接调用旧的 `kb_extract_facts use_llm=true` 长流程。
+- 不因单个 batch 失败而重跑已完成 batch；从 workflow pending steps 恢复。
 - 不输出无证据支撑的创新点或实验结论。
 - 不保存论文正文、长 excerpt、完整 evidence packet 或模型原文。

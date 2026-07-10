@@ -33,9 +33,15 @@ from .claim_frames import (
     verify_claim_frames,
 )
 from .config import resolve_db_path
+from .compare_workflow import finalize_compare_workflow, generate_compare_dimension, prepare_compare_workflow
 from .embeddings import build_semantic_index, semantic_index_status
 from .eval import eval_facts, eval_memory, eval_review, eval_search
 from .fact_audit import audit_facts, get_fact_conflicts
+from .fact_workflow import (
+    extract_fact_batch_workflow,
+    finalize_fact_extraction_workflow,
+    prepare_fact_extraction_workflow,
+)
 from .facts import extract_facts, fact_search, get_claims, get_entities, get_fact_graph, get_relations
 from .feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from .ingest import sync_directory
@@ -53,10 +59,17 @@ from .quality_baseline import latest_quality_baseline, run_quality_baseline
 from .query import classify_query
 from .query_log import list_query_logs, query_stats
 from .review import assemble_review, check_review_citations, draft_review
+from .review_workflow import (
+    draft_review_section,
+    finalize_review_outline,
+    generate_review_outline_section,
+    prepare_review_workflow,
+)
 from .search import get_evidence, search_nodes
 from .search_profile import apply_search_profile, get_search_profile, list_search_profiles, tune_search
 from .tasks import compare_papers, generate_review_plan, get_task_artifact
 from .tree_search import tree_search
+from .workflow_state import get_workflow_state
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -649,6 +662,29 @@ if FastMCP is not None:
         )
 
     @mcp.tool()
+    def kb_prepare_fact_extraction(
+        doc_id: str,
+        force: bool = False,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Prepare resumable fact-extraction batches without calling the LLM."""
+        return prepare_fact_extraction_workflow(resolve_db_path(db_path), doc_id, force=force)
+
+    @mcp.tool()
+    def kb_extract_fact_batch(
+        task_id: str,
+        batch_id: str,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Extract one fact batch with exactly one bounded DeepSeek request."""
+        return extract_fact_batch_workflow(resolve_db_path(db_path), task_id, batch_id)
+
+    @mcp.tool()
+    def kb_finalize_fact_extraction(task_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Merge completed fact batches and write the canonical fact artifacts and DB rows."""
+        return finalize_fact_extraction_workflow(resolve_db_path(db_path), task_id)
+
+    @mcp.tool()
     def kb_get_claims(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
         """Return the extracted claims artifact for one document."""
         return get_claims(resolve_db_path(db_path), doc_id)
@@ -711,6 +747,37 @@ if FastMCP is not None:
         )
 
     @mcp.tool()
+    def kb_prepare_compare(
+        query: str,
+        doc_ids: Optional[List[str]] = None,
+        top_k_docs: int = 5,
+        search_mode: str = "hybrid",
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Prepare a resumable comparison task and dimension evidence without calling the LLM."""
+        return prepare_compare_workflow(
+            resolve_db_path(db_path),
+            query,
+            doc_ids=doc_ids,
+            top_k_docs=top_k_docs,
+            search_mode=search_mode,
+        )
+
+    @mcp.tool()
+    def kb_generate_compare_dimension(
+        task_id: str,
+        dimension_id: str,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Generate one comparison dimension with exactly one bounded DeepSeek request."""
+        return generate_compare_dimension(resolve_db_path(db_path), task_id, dimension_id)
+
+    @mcp.tool()
+    def kb_finalize_compare(task_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Merge completed comparison dimensions without calling the LLM."""
+        return finalize_compare_workflow(resolve_db_path(db_path), task_id)
+
+    @mcp.tool()
     def kb_generate_review(
         topic: str,
         doc_ids: Optional[List[str]] = None,
@@ -730,6 +797,37 @@ if FastMCP is not None:
             require_llm=require_llm,
             search_mode=search_mode,
         )
+
+    @mcp.tool()
+    def kb_prepare_review(
+        topic: str,
+        doc_ids: Optional[List[str]] = None,
+        top_k_docs: int = 5,
+        search_mode: str = "hybrid",
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Prepare a resumable review task and section evidence without calling the LLM."""
+        return prepare_review_workflow(
+            resolve_db_path(db_path),
+            topic,
+            doc_ids=doc_ids,
+            top_k_docs=top_k_docs,
+            search_mode=search_mode,
+        )
+
+    @mcp.tool()
+    def kb_generate_review_outline_section(
+        task_id: str,
+        section_id: str,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Generate one review-outline section with exactly one bounded DeepSeek request."""
+        return generate_review_outline_section(resolve_db_path(db_path), task_id, section_id)
+
+    @mcp.tool()
+    def kb_finalize_review_outline(task_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Merge completed review-outline sections without calling the LLM."""
+        return finalize_review_outline(resolve_db_path(db_path), task_id)
 
     @mcp.tool()
     def kb_get_task_artifact(
@@ -756,6 +854,26 @@ if FastMCP is not None:
             use_llm=use_llm,
             require_llm=require_llm,
         )
+
+    @mcp.tool()
+    def kb_draft_review_section(
+        task_id: str,
+        section_id: str,
+        require_llm: bool = True,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Draft one review section with one bounded DeepSeek request and persist progress."""
+        return draft_review_section(
+            resolve_db_path(db_path),
+            task_id,
+            section_id,
+            require_llm=require_llm,
+        )
+
+    @mcp.tool()
+    def kb_get_workflow_status(task_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return resumable staged-workflow progress without reading long artifact content."""
+        return get_workflow_state(resolve_db_path(db_path), task_id)
 
     @mcp.tool()
     def kb_assemble_review(task_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:

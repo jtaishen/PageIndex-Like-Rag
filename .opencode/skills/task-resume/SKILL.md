@@ -18,6 +18,7 @@ description: 任务恢复 workflow；用于从 .kb_state 和长期 memory 恢复
 
 ## 可选工具
 
+- `kb_get_workflow_status`：current task 使用 staged workflow 时，读取 phase、completed steps、pending steps 和失败类型，并从失败或待处理 step 继续。
 - `memory_get`：读取与当前任务相关的少量项目偏好。
 - `memory_compact`：重复任务记忆过多时调用。
 - `kb_eval_review`：恢复综述任务后需要检查引用覆盖时调用。

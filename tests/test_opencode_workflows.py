@@ -79,6 +79,33 @@ class OpenCodeWorkflowTest(unittest.TestCase):
         ]:
             self.assertIn(phrase, text)
 
+    def test_llm_heavy_workflows_use_resumable_staged_tools(self) -> None:
+        expected_by_skill = {
+            "paper-insight": {
+                "kb_prepare_fact_extraction",
+                "kb_extract_fact_batch",
+                "kb_finalize_fact_extraction",
+                "kb_get_workflow_status",
+            },
+            "compare-papers": {
+                "kb_prepare_compare",
+                "kb_generate_compare_dimension",
+                "kb_finalize_compare",
+                "kb_get_workflow_status",
+            },
+            "review-writing": {
+                "kb_prepare_review",
+                "kb_generate_review_outline_section",
+                "kb_finalize_review_outline",
+                "kb_draft_review_section",
+                "kb_get_workflow_status",
+            },
+        }
+        for skill_name, expected in expected_by_skill.items():
+            text = (SKILLS_DIR / skill_name / "SKILL.md").read_text(encoding="utf-8")
+            referenced = set(re.findall(r"`((?:kb|memory)_[a-zA-Z0-9_]+)`", text))
+            self.assertTrue(expected.issubset(referenced), f"{skill_name} is missing staged tools")
+
 
 if __name__ == "__main__":
     unittest.main()
