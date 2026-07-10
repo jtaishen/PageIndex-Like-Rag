@@ -69,6 +69,18 @@ def llm_diagnostics(
         "fallback_dimensions": fallback_dimensions or [],
         "error_type": error_type,
     }
+    for key in (
+        "duration_ms",
+        "finish_reason",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "reasoning_content_present",
+        "max_tokens",
+        "thinking_mode",
+    ):
+        if key in meta:
+            result[key] = meta[key]
     if extra:
         result.update(extra)
     first_type = str(meta.get("first_error_type") or "")

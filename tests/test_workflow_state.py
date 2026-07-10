@@ -42,6 +42,32 @@ class WorkflowStateTest(unittest.TestCase):
             self.assertEqual(persisted["steps"][0]["attempt_count"], 1)
             self.assertEqual(persisted["steps"][0]["error_type"], "request_timeout")
 
+    def test_running_and_completed_steps_cannot_be_started_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "kb.sqlite"
+            task_id = "task_abcdef123456"
+            create_workflow_state(
+                db_path,
+                task_id,
+                "review",
+                [{"step_id": "outline:background", "phase": "outline"}],
+                phase="outline",
+            )
+            start_workflow_step(db_path, task_id, "outline:background")
+            with self.assertRaisesRegex(ValueError, "already running"):
+                start_workflow_step(db_path, task_id, "outline:background")
+            finish_workflow_step(
+                db_path,
+                task_id,
+                "outline:background",
+                status="completed",
+                diagnostics={"duration_ms": 120, "prompt": "must not persist"},
+            )
+            with self.assertRaisesRegex(ValueError, "already completed"):
+                start_workflow_step(db_path, task_id, "outline:background")
+            persisted = get_workflow_state(db_path, task_id)
+            self.assertEqual(persisted["steps"][0]["diagnostics"], {"duration_ms": 120})
+
     def test_single_request_generator_disables_json_retry(self) -> None:
         with mock.patch.dict(os.environ, {"KB_MCP_LLM_STEP_TIMEOUT_SECONDS": "31"}, clear=False), mock.patch(
             "kb_agent.workflow_state.generate_json_object",

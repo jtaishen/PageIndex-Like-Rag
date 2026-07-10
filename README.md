@@ -1126,6 +1126,23 @@ uv run python -m kb_agent.cli memory-compile "继续写综述" --intent review -
 uv run python -m kb_agent.cli resume-task
 ```
 
+## v0.62 DeepSeek 结构化主链路稳定化
+
+v0.62 将 DeepSeek 从“长请求失败后再降级”调整为受限、可恢复的主成功路径。文档卡片、查询分类、Tree Search、论文洞察、Facts、ClaimFrame、Compare、Review Outline 和 Review Draft 统一使用按操作定义的 timeout、max tokens 与 JSON 重试策略；结构化任务显式关闭隐藏 reasoning，把输出额度用于实际 JSON。每个步骤会记录耗时、token、finish reason、是否出现 reasoning、重试次数等安全诊断，不保存 prompt、模型原文或密钥。
+
+论文洞察现在也采用 staged workflow：
+
+```text
+insights: kb_prepare_doc_insights -> kb_extract_insight_batch -> kb_finalize_doc_insights
+facts:    kb_prepare_fact_extraction -> kb_extract_fact_batch -> kb_finalize_fact_extraction
+compare:  kb_prepare_compare -> kb_generate_compare_dimension -> kb_finalize_compare
+review:   kb_prepare_review -> kb_generate_review_outline_section -> kb_finalize_review_outline
+          -> kb_draft_review_section -> kb_check_review_citations -> kb_assemble_review
+status:   kb_get_workflow_status
+```
+
+旧的一次性 insights/facts/compare/review MCP 工具继续保留兼容，但 `use_llm` 默认关闭；OpenCode workflow 使用上面的 staged LLM 工具。单个步骤超时只重试该步骤，已完成步骤禁止重复执行。Tree Search 保留 LLM 节点选择，但查询意图先用规则解析，因此每篇论文只需要一个结构化 LLM 决策。同步入库也把文档卡片 LLM 摘要移到数据库写事务之前，并按文件提交，避免慢模型调用长期占用 SQLite 写锁。
+
 ## v0.61 DeepSeek Pro 综述推理额度修复
 
 v0.61 修复 `deepseek-v4-pro` 在 staged 综述草稿中先耗尽 reasoning token、最终返回空正文的问题。草稿步骤现在显式关闭 reasoning，使独立的 900-token 额度用于生成实际 JSON 和正文；大纲、事实和比较步骤仍保持原有推理设置。LLM 响应诊断也会根据 `finish_reason` 区分 `output_token_limit` 与普通 `empty_response`，避免把输出额度耗尽误判为 evidence 过多或网络超时。
@@ -1136,7 +1153,7 @@ v0.60 根据真实综述任务中的章节超时结果，将 staged MCP 单步�
 
 ## v0.59 OpenCode 长流程 Staged MCP
 
-v0.59 将交互式 `facts / compare / review` 从单次长 MCP 请求改为可恢复的 staged workflow。准备步骤只生成 evidence-first 任务工件；每个 fact batch、比较维度、综述大纲章节和综述草稿章节最多发出一次 DeepSeek 请求，完成状态写入 `workflow_state.json`。单步失败后可从对应 pending step 恢复，不会重复已完成的模型调用，也不会用规则结果伪装成 LLM 成功。
+v0.59 将交互式 `facts / compare / review` 从单次长 MCP 请求改为可恢复的 staged workflow。准备步骤只生成 evidence-first 任务工件；每个 fact batch、比较维度、综述大纲章节和综述草稿章节都是一个独立的有界 LLM 步骤，完成状态写入 `workflow_state.json`。单步失败后可从对应 pending step 恢复，不会重复已完成的模型调用，也不会用规则结果伪装成 LLM 成功。
 
 OpenCode 默认调用顺序：
 
@@ -1148,7 +1165,7 @@ review:  kb_prepare_review -> kb_generate_review_outline_section -> kb_finalize_
 status:  kb_get_workflow_status
 ```
 
-旧的同步 CLI 和 MCP 工具继续保留兼容。staged 单步默认使用 `KB_MCP_LLM_STEP_TIMEOUT_SECONDS=45`，并关闭单步内 JSON 重试，从调用结构上避开 MCP 默认约 60 秒请求上限。综述草稿单步另外使用 `KB_MCP_REVIEW_DRAFT_MAX_TOKENS=900` 限制输出规模；请求超时后只需重试失败章节，已经完成的章节会保留，所有章节完成前 workflow 不会进入 completed。
+旧的同步 CLI 和 MCP 工具继续保留兼容。v0.62 起 staged 结构化步骤使用不超过 25 秒的操作级 timeout，并显式关闭 reasoning；网络超时不会自动重复，只有非法或截断 JSON 最多修复重试一次。综述草稿单步另外使用 `KB_MCP_REVIEW_DRAFT_MAX_TOKENS=900` 限制输出规模；请求失败后只需重试失败章节，已经完成的章节会保留，所有章节完成前 workflow 不会进入 completed。
 
 ## PDF 和 MCP 可选依赖
 
@@ -1242,11 +1259,13 @@ python3 -m kb_agent.cli ask "memory write gate 是什么？" --no-llm
 ```
 
 OpenCode 配置见 [opencode.json](/Users/jtai/Desktop/PageIndex-Like-Rag/opencode.json)。
-项目默认模型已设置为：
+当前 [opencode.json](/Users/jtai/Desktop/PageIndex-Like-Rag/opencode.json) 中的 OpenCode 对话模型是：
 
 ```text
-deepseek/deepseek-v4-pro
+deepseek/deepseek_v4
 ```
+
+这只控制 OpenCode 主对话模型。`paper-kb` MCP 内部调用哪个 DeepSeek 由本地 `.env` 的 `DEEPSEEK_PROFILE`、`DEEPSEEK_MODEL` 或 `DEEPSEEK_PRO_MODEL` 决定，两套配置相互独立。
 
 DeepSeek 官方 OpenCode 接入方式：
 
@@ -1269,8 +1288,8 @@ uv run --extra mcp python -m kb_agent.mcp_server
 | 任务类型 | 触发意图示例 | Skill | 主要 MCP 工具链 | 输出结果 |
 | --- | --- | --- | --- | --- |
 | 入库与质量检查 | “同步这些论文”“检查 PDF 解析质量” | `ingest-papers` | `kb_sync -> kb_get_doc_card -> kb_get_parse_quality -> kb_get_parse_report -> kb_get_layout_blocks` | 同步结果、解析质量、重解析建议 |
-| 证据优先问答 | “这篇论文的方法是什么”“有没有实验指标” | `paper-qa` | `kb_search_docs -> kb_classify_query -> 规则 kb_tree_search -> kb_get_evidence -> kb_answer` | 带文档、章节、节点和页码的回答 |
-| 单篇论文理解 | “提炼这篇论文创新点”“抽取主张证据链” | `paper-insight` | `kb_get_doc_card -> kb_extract_doc_insights -> kb_prepare_fact_extraction -> 逐批 kb_extract_fact_batch -> kb_finalize_fact_extraction -> kb_extract_evidence_units -> kb_extract_claim_frames -> kb_verify_claim_frames` | doc card、innovation、citation、facts、EvidenceUnit、ClaimFrame、Verifier |
+| 证据优先问答 | “这篇论文的方法是什么”“有没有实验指标” | `paper-qa` | `kb_search_docs -> 规则 kb_classify_query -> 单篇 LLM kb_tree_search -> kb_get_evidence -> kb_answer` | 带文档、章节、节点和页码的回答 |
+| 单篇论文理解 | “提炼这篇论文创新点”“抽取主张证据链” | `paper-insight` | `kb_get_doc_card -> staged insights -> staged facts -> kb_extract_evidence_units -> kb_extract_claim_frames use_llm=true -> kb_verify_claim_frames` | doc card、innovation、citation、facts、EvidenceUnit、ClaimFrame、Verifier |
 | 跨论文比较 | “比较这些论文的方法差异” | `compare-papers` | `kb_search_docs -> staged facts -> kb_extract_claim_frames -> kb_verify_claim_frames -> kb_prepare_compare -> 逐维度 kb_generate_compare_dimension -> kb_finalize_compare -> kb_audit_facts` | 可恢复比较任务、比较矩阵、证据覆盖、事实风险和 open questions |
 | 综述写作 | “生成综述提纲和草稿” | `review-writing` | `kb_search_docs -> kb_get_doc_card -> 用户确认候选文献 -> kb_prepare_review -> 逐节 kb_generate_review_outline_section -> kb_finalize_review_outline -> 逐节 kb_draft_review_section -> kb_check_review_citations -> kb_assemble_review` | 候选文献、可恢复 workflow、章节证据、章节草稿、引用检查、总稿路径、修订动作 |
 | 质量复盘 | “评估检索质量”“跑真实 baseline” | `quality-review` | `kb_create_eval_suite -> kb_run_benchmark -> kb_run_quality_baseline -> kb_eval_dashboard -> kb_get_latest_quality_baseline` | benchmark、baseline、dashboard、warning 和 next actions |
@@ -1278,9 +1297,9 @@ uv run --extra mcp python -m kb_agent.mcp_server
 
 所有 workflow 都遵守 evidence-first：正式结论必须回到 evidence packet、EvidenceUnit、ClaimFrame 或任务工件中的 evidence 字段。论文正文、长 excerpt、完整 evidence、完整 prompt、API key 和综述正文不能写入长期 memory、query log、feedback 或普通报告摘要。
 
-综述、compare 和 facts 的交互式 LLM 流程采用 staged MCP：准备步骤不调用模型，每个章节、比较维度或 fact batch 最多发出一次 DeepSeek 请求，随后将完成状态写入 `workflow_state.json`。`kb_get_workflow_status` 返回当前 phase、completed steps、pending steps 和失败类型；连接恢复后只重试失败 step，不重复已经完成的模型调用。
+insights、facts、compare 和 review 的交互式 LLM 流程采用 staged MCP：准备步骤不调用模型，每个批次、章节或比较维度是一个独立有界步骤，随后将完成状态与安全运行诊断写入 `workflow_state.json`。`kb_get_workflow_status` 返回当前 phase、completed steps、pending steps 和失败类型；连接恢复后只重试失败 step，不重复已经完成的模型调用。
 
-旧的 `kb_generate_review`、`kb_draft_review` 和 `kb_extract_facts` 继续保留，供 CLI、自动化脚本和兼容调用使用；OpenCode agent 默认使用 staged 工具，避免把多次模型请求塞进单个 60 秒左右的 MCP 调用。每个 staged LLM step 默认使用 `KB_MCP_LLM_STEP_TIMEOUT_SECONDS=45`，并关闭该 step 内的 JSON 重试；综述草稿再通过 `KB_MCP_REVIEW_DRAFT_MAX_TOKENS=900` 控制单节输出规模。结构化失败会明确记录，不会用规则结果伪装为 LLM 成功。
+旧的 `kb_extract_doc_insights`、`kb_generate_review`、`kb_draft_review`、`kb_extract_facts` 和 `kb_compare` 继续保留，供 CLI、自动化脚本和兼容调用使用；这些 MCP 入口的 `use_llm` 默认关闭。OpenCode agent 默认使用 staged 工具，避免把多次模型请求塞进单个 MCP 调用。结构化步骤显式关闭 reasoning，按操作限制在 15 至 25 秒及 500 至 1600 tokens；非法 JSON 最多重试一次。结构化失败会明确记录，不会用规则结果伪装为 LLM 成功。
 
 当用户明确指出某次结果好坏时，可追加：
 

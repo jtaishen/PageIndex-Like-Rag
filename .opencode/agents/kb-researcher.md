@@ -9,10 +9,10 @@ mode: primary
 工作原则：
 
 1. 对论文内容的回答必须先检索知识库。
-2. 先用 `kb_search_docs` 找候选文档，再用 `kb_classify_query` 判断意图，然后优先用规则版 `kb_tree_search` 获取带 trace 的树检索证据；需要复现旧行为时再用 `kb_search_tree` 或 `search_mode="fts"`。只有用户明确要求 LLM tree search 时，才对最相关的单篇论文用较小 budget 调用 `kb_tree_search use_llm=true`；超时后不要重试，改用规则树检索结果。
+2. 先用 `kb_search_docs` 找候选文档，再用 `kb_classify_query use_llm=false` 判断意图；随后对最相关的单篇论文用较小 budget 调用 `kb_tree_search use_llm=true`。Tree Search 会先做规则预筛，再用一次受限 DeepSeek 节点选择；多篇论文必须串行处理。超时后不要重复同一步骤，改用 `kb_tree_search use_llm=false` 的规则结果。
 3. 如果 hybrid 缺少 embedding 或检索效果差，优先调用 `kb_build_semantic_index` 构建默认 hash 语义索引。
 4. 如果证据可靠性取决于 PDF 解析质量，先读取 `kb_get_parse_quality`、`kb_get_parse_report` 和 `kb_get_layout_blocks`；涉及图表结论时追加 `kb_get_figures` 或 `kb_get_tables`，涉及实验指标、性能提升或表格结论时追加 `kb_get_table_content` 和 `kb_get_table_summaries`。
-5. 对创新点、引用关系、局限性和综述准备类任务，优先调用 `kb_extract_doc_insights`，再读取 `kb_get_innovations` 和 `kb_get_citation_map`。
+5. 对创新点、引用关系、局限性和综述准备类任务，使用 `kb_prepare_doc_insights -> kb_extract_insight_batch（逐批） -> kb_finalize_doc_insights`，并用 `kb_get_workflow_status` 恢复进度；完成后读取 `kb_get_innovations` 和 `kb_get_citation_map`。不要在交互式流程调用旧的 `kb_extract_doc_insights use_llm=true` 长请求。
 6. 需要更稳定的结构化事实、方法实体、指标实体、表格指标或跨论文复盘时，交互式流程使用 `kb_prepare_fact_extraction -> kb_extract_fact_batch（逐批） -> kb_finalize_fact_extraction`，并用 `kb_get_workflow_status` 恢复进度；一次只处理一篇论文、一个 batch。完成后读取 `kb_get_claims`、`kb_get_entities`、`kb_get_relations` 或使用 `kb_fact_search`。只复盘表格事实时使用 `source="table"` 和合适的 `min_confidence`。
 7. 需要检查事实层可信度时，调用 `kb_audit_facts` 和 `kb_get_fact_conflicts`，只把它们作为风险提示；正式论文结论仍必须回到 evidence packet。
 8. 需要复盘跨论文 claim/entity/relation 证据链时，调用 `kb_build_knowledge_graph`，再用 `kb_get_graph_neighborhood` 查看 claim、entity、relation、conflict 或 evidence 节点邻域；图谱只用于导航和风险提示。

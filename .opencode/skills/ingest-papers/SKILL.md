@@ -21,7 +21,7 @@ description: 论文目录入库与解析质量检查 workflow；用于同步本�
 
 - `kb_get_figures` / `kb_get_tables` / `kb_get_table_content` / `kb_get_table_summaries`：涉及图表、实验指标或表格证据时调用。
 - `kb_build_semantic_index`：用户明确要使用真实或 hash embedding 检索时调用。
-- `kb_extract_doc_insights` / staged facts / `kb_extract_evidence_units` / `kb_extract_claim_frames`：用户要后续做单篇理解、比较或综述时调用；staged facts 使用 `kb_prepare_fact_extraction -> kb_extract_fact_batch -> kb_finalize_fact_extraction`。
+- staged insights / staged facts / `kb_extract_evidence_units` / `kb_extract_claim_frames`：用户要后续做单篇理解、比较或综述时调用；insights 使用 `kb_prepare_doc_insights -> kb_extract_insight_batch -> kb_finalize_doc_insights`，facts 使用 `kb_prepare_fact_extraction -> kb_extract_fact_batch -> kb_finalize_fact_extraction`。
 
 ## 停止条件
 

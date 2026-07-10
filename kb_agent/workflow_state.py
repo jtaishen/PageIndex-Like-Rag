@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from .config import mcp_llm_step_timeout_seconds
 from .llm import generate_json_object, llm_status
+from .llm_policies import structured_json_generator
 from .task_artifacts import TASK_ID_RE, task_state_root
 from .utils import read_json, unique_strings, write_json
 
@@ -59,12 +60,17 @@ def save_workflow_state(db_path: Path, state: Dict[str, Any]) -> Dict[str, Any]:
 def start_workflow_step(db_path: Path, task_id: str, step_id: str) -> Dict[str, Any]:
     state = get_workflow_state(db_path, task_id)
     step = _find_step(state, step_id)
+    if step.get("status") == "completed":
+        raise ValueError(f"Workflow step is already completed: {step_id}")
+    if step.get("status") == "running" and not _running_step_is_stale(step):
+        raise ValueError(f"Workflow step is already running: {step_id}")
     llm_identity = _llm_identity()
     step["status"] = "running"
     step["attempt_count"] = int(step.get("attempt_count") or 0) + 1
     step["error_type"] = ""
     step["started_at"] = time.time()
     step["finished_at"] = None
+    step["diagnostics"] = {}
     step["llm"] = llm_identity
     state["llm"] = llm_identity
     state["status"] = "in_progress"
@@ -78,6 +84,7 @@ def finish_workflow_step(
     *,
     status: str,
     error_type: str = "",
+    diagnostics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if status not in {"completed", "failed", "skipped"}:
         raise ValueError(f"Unsupported workflow step status: {status}")
@@ -85,6 +92,7 @@ def finish_workflow_step(
     step = _find_step(state, step_id)
     step["status"] = status
     step["error_type"] = error_type
+    step["diagnostics"] = _safe_diagnostics(diagnostics)
     step["finished_at"] = time.time()
     summary = _summary(state)
     state["status"] = (
@@ -140,6 +148,11 @@ def single_request_json_generator(
     return generate
 
 
+def staged_json_generator(operation: str, stage: str) -> JsonGenerator:
+    """Create the bounded structured generator used by interactive staged workflows."""
+    return structured_json_generator(operation, stage)
+
+
 def _workflow_path(db_path: Path, task_id: str) -> Path:
     if not TASK_ID_RE.fullmatch(task_id):
         raise ValueError(f"Unsupported task id: {task_id}")
@@ -159,6 +172,7 @@ def _normalize_step(step: Dict[str, Any]) -> Dict[str, Any]:
         "error_type": str(step.get("error_type") or ""),
         "started_at": step.get("started_at"),
         "finished_at": step.get("finished_at"),
+        "diagnostics": _safe_diagnostics(step.get("diagnostics")),
         "metadata": step.get("metadata") if isinstance(step.get("metadata"), dict) else {},
     }
 
@@ -201,3 +215,32 @@ def _llm_identity() -> Dict[str, Any]:
         "insecure_http": bool(status.get("insecure_http")),
         "step_timeout_seconds": mcp_llm_step_timeout_seconds(),
     }
+
+
+def _running_step_is_stale(step: Dict[str, Any]) -> bool:
+    started_at = step.get("started_at")
+    if not isinstance(started_at, (int, float)):
+        return True
+    return time.time() - float(started_at) > max(90, mcp_llm_step_timeout_seconds() * 2)
+
+
+def _safe_diagnostics(value: object) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    allowed = {
+        "duration_ms",
+        "retry_count",
+        "repair_used",
+        "first_error_type",
+        "finish_reason",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "reasoning_content_present",
+        "max_tokens",
+        "thinking_mode",
+        "operation",
+        "stage",
+        "error_type",
+    }
+    return {key: value[key] for key in allowed if key in value}

@@ -240,9 +240,19 @@ def generate_json_object(
     )
     started = time.time()
     body = _chat_body(resolved, messages, max_tokens=max_tokens, thinking=thinking)
+    response_metadata: Dict[str, Any] = {}
     try:
-        content = _chat_completion_content(body, resolved, timeout=timeout, operation=options.operation, stage=options.stage)
+        content = _chat_completion_content(
+            body,
+            resolved,
+            timeout=timeout,
+            operation=options.operation,
+            stage=options.stage,
+            response_metadata=response_metadata,
+        )
     except LLMError as exc:
+        exc.metadata.setdefault("max_tokens", request_max_tokens)
+        exc.metadata.setdefault("thinking_mode", _thinking_mode(thinking))
         raise LLMError(
             str(exc),
             error_type=exc.error_type,
@@ -258,6 +268,7 @@ def generate_json_object(
         payload, metadata = _parse_json_object(content)
         payload[LLM_METADATA_KEY] = {
             **metadata,
+            **response_metadata,
             "retry_count": 0,
             "error_type": "",
             "operation": options.operation,
@@ -268,6 +279,9 @@ def generate_json_object(
         }
         return payload
     except LLMError as first_error:
+        first_error.metadata.update(response_metadata)
+        first_error.metadata.setdefault("max_tokens", request_max_tokens)
+        first_error.metadata.setdefault("thinking_mode", _thinking_mode(thinking))
         if retries <= 0:
             raise LLMError(
                 f"DeepSeek JSON parse failed: {first_error.error_type}",
@@ -293,6 +307,7 @@ def generate_json_object(
         retry_error: Optional[LLMError] = None
         for retry_index in range(1, retries + 1):
             retry_body = _chat_body(resolved, retry_messages, max_tokens=max_tokens, thinking=thinking)
+            retry_response_metadata: Dict[str, Any] = {}
             try:
                 retry_content = _chat_completion_content(
                     retry_body,
@@ -300,10 +315,15 @@ def generate_json_object(
                     timeout=timeout,
                     operation=options.operation,
                     stage=options.stage,
+                    response_metadata=retry_response_metadata,
                 )
                 payload, metadata = _parse_json_object(retry_content)
+                metadata.update(retry_response_metadata)
                 break
             except LLMError as exc:
+                exc.metadata.update(retry_response_metadata)
+                exc.metadata.setdefault("max_tokens", request_max_tokens)
+                exc.metadata.setdefault("thinking_mode", _thinking_mode(thinking))
                 retry_error = exc
         else:
             error = retry_error or first_error
@@ -366,6 +386,7 @@ def _chat_completion_content(
     timeout: int,
     operation: str = "",
     stage: str = "",
+    response_metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
     started = time.time()
     request = urllib.request.Request(
@@ -459,10 +480,20 @@ def _chat_completion_content(
             error_type="unexpected_response",
             metadata={"operation": operation, "stage": stage},
         )
+    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+    finish_reason = str(choice.get("finish_reason") or "") if isinstance(choice, dict) else ""
+    if response_metadata is not None:
+        response_metadata.update(
+            {
+                "finish_reason": finish_reason,
+                "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+                "completion_tokens": int(usage.get("completion_tokens") or 0),
+                "total_tokens": int(usage.get("total_tokens") or 0),
+                "reasoning_content_present": bool(message.get("reasoning_content")),
+            }
+        )
     content = message.get("content")
     if not content:
-        finish_reason = str(choice.get("finish_reason") or "") if isinstance(choice, dict) else ""
-        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
         output_limit_reached = finish_reason == "length"
         error_type = "output_token_limit" if output_limit_reached else "empty_response"
         _record_llm_event(
@@ -510,9 +541,19 @@ def _resolve_runtime_options(
     stage: str = "",
 ) -> LLMRuntimeOptions:
     current = _RUNTIME_OPTIONS.get()
+    resolved_timeout = timeout_seconds
+    if current.timeout_seconds is not None:
+        resolved_timeout = (
+            min(timeout_seconds, current.timeout_seconds)
+            if timeout_seconds is not None
+            else current.timeout_seconds
+        )
+    resolved_retries = retry_count
+    if current.retry_count is not None:
+        resolved_retries = min(retry_count, current.retry_count) if retry_count is not None else current.retry_count
     return LLMRuntimeOptions(
-        timeout_seconds=timeout_seconds if timeout_seconds is not None else current.timeout_seconds,
-        retry_count=retry_count if retry_count is not None else current.retry_count,
+        timeout_seconds=resolved_timeout,
+        retry_count=resolved_retries,
         operation=operation or current.operation,
         stage=stage or current.stage,
     )
@@ -536,7 +577,15 @@ def _llm_error_metadata(
         "stage": stage,
         "duration_ms": round((time.time() - started) * 1000, 3),
     }
-    for key in ("finish_reason", "completion_tokens", "reasoning_content_present"):
+    for key in (
+        "finish_reason",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "reasoning_content_present",
+        "max_tokens",
+        "thinking_mode",
+    ):
         if key in error.metadata:
             metadata[key] = error.metadata[key]
     return metadata

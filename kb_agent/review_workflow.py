@@ -4,7 +4,6 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from .config import mcp_review_draft_max_tokens
 from .llm import LLMError
 from .review import draft_review
 from .task_artifacts import get_task_artifact, task_state_root, update_task_status
@@ -16,7 +15,7 @@ from .workflow_state import (
     finish_workflow_step,
     get_workflow_state,
     set_workflow_phase,
-    single_request_json_generator,
+    staged_json_generator,
     start_workflow_step,
     workflow_step,
     workflow_steps_for_phase,
@@ -117,7 +116,7 @@ def generate_review_outline_section(
         evidence_artifact = _task_json(db_path, task_id, f"section_evidence/{section_id}.json")
         spec = _find_section(outline, section_id)
         evidence = evidence_artifact.get("evidence") or []
-        generator = json_generator or single_request_json_generator("review_outline", section_id)
+        generator = json_generator or staged_json_generator("review_outline", section_id)
         built = build_review_section(
             str(outline.get("topic") or ""),
             spec,
@@ -143,7 +142,13 @@ def generate_review_outline_section(
         outline["source"] = "llm_staged_partial"
         outline["status"] = "partial"
         write_json(task_dir / "review_outline.json", outline)
-        workflow = finish_workflow_step(db_path, task_id, step_id, status="completed")
+        workflow = finish_workflow_step(
+            db_path,
+            task_id,
+            step_id,
+            status="completed",
+            diagnostics=built.llm_diagnostics,
+        )
         return {
             "schema": "staged_review_section_result.v1",
             "task_id": task_id,
@@ -155,7 +160,14 @@ def generate_review_outline_section(
             "artifact_path": str(task_dir / "review_sections" / f"{section_id}.json"),
         }
     except LLMError as exc:
-        workflow = finish_workflow_step(db_path, task_id, step_id, status="failed", error_type=exc.error_type)
+        workflow = finish_workflow_step(
+            db_path,
+            task_id,
+            step_id,
+            status="failed",
+            error_type=exc.error_type,
+            diagnostics=exc.metadata,
+        )
         return _failed_step_result("staged_review_section_result.v1", task_id, step_id, exc.error_type, workflow)
 
 
@@ -229,12 +241,7 @@ def draft_review_section(
     step_id = f"draft:{section_id}"
     workflow_step(state, step_id)
     start_workflow_step(db_path, task_id, step_id)
-    generator = json_generator or single_request_json_generator(
-        "review_draft",
-        section_id,
-        max_tokens=mcp_review_draft_max_tokens(),
-        thinking=False,
-    )
+    generator = json_generator or staged_json_generator("review_draft", section_id)
     try:
         result = draft_review(
             db_path,
@@ -244,7 +251,15 @@ def draft_review_section(
             require_llm=require_llm,
             json_generator=generator,
         )
-        workflow = finish_workflow_step(db_path, task_id, step_id, status="completed")
+        section_drafts = result.get("section_drafts") or []
+        diagnostics = (section_drafts[0].get("llm_diagnostics") or {}) if section_drafts else {}
+        workflow = finish_workflow_step(
+            db_path,
+            task_id,
+            step_id,
+            status="completed",
+            diagnostics=diagnostics,
+        )
         if not workflow_steps_for_phase(workflow, "draft") or all(
             step.get("status") == "completed" for step in workflow_steps_for_phase(workflow, "draft")
         ):
@@ -258,7 +273,14 @@ def draft_review_section(
             )
         return {**result, "workflow": workflow}
     except LLMError as exc:
-        workflow = finish_workflow_step(db_path, task_id, step_id, status="failed", error_type=exc.error_type)
+        workflow = finish_workflow_step(
+            db_path,
+            task_id,
+            step_id,
+            status="failed",
+            error_type=exc.error_type,
+            diagnostics=exc.metadata,
+        )
         return _failed_step_result("review_draft_result.v1", task_id, step_id, exc.error_type, workflow)
 
 

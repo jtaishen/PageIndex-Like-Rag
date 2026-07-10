@@ -1900,7 +1900,7 @@ class IngestSearchTest(unittest.TestCase):
             ]
             prompts: list[str] = []
 
-            def fake_generate(system: str, user: str) -> dict:
+            def fake_generate(system: str, user: str, **_options: object) -> dict:
                 prompts.append(user)
                 return section_payloads[len(prompts) - 1]
 
@@ -1972,7 +1972,7 @@ class IngestSearchTest(unittest.TestCase):
             }
             captured: dict = {}
 
-            def fake_generate(_system: str, user: str) -> dict:
+            def fake_generate(_system: str, user: str, **_options: object) -> dict:
                 captured["user"] = user
                 return payload
 
@@ -2095,7 +2095,7 @@ class IngestSearchTest(unittest.TestCase):
             }
             calls = {"count": 0}
 
-            def fake_generate(_system: str, _user: str) -> dict:
+            def fake_generate(_system: str, _user: str, **_options: object) -> dict:
                 calls["count"] += 1
                 if calls["count"] == 2:
                     raise LLMError("timeout", error_type="request_timeout")
@@ -2958,13 +2958,10 @@ class IngestSearchTest(unittest.TestCase):
                 "rationale": ["实验查询应优先选择实验结果节点。"],
                 "warnings": [],
             }
-            query_payload = {"intent": "experiment", "focus_terms": ["实验"], "preferred_node_types": ["paragraph"], "target_sections": ["实验"], "warnings": []}
-            with mock.patch("kb_agent.query.generate_json_object", return_value=query_payload), mock.patch(
-                "kb_agent.tree_search.generate_json_object",
-                return_value=payload,
-            ):
+            with mock.patch("kb_agent.tree_search.generate_json_object", return_value=payload) as generate:
                 trace = tree_search(db_path, doc_id, "实验结果如何？", budget=3, use_llm=True)
 
+            generate.assert_called_once()
             self.assertEqual(trace["evidence"][0]["node_id"], target_id)
             self.assertEqual(trace["llm_decisions"]["selected_node_ids"], [target_id])
             self.assertTrue(trace["llm_used"])
@@ -2972,20 +2969,14 @@ class IngestSearchTest(unittest.TestCase):
             self.assertEqual(trace["llm_warning_count"], 0)
             self.assertFalse(trace["llm_error"])
 
-            with mock.patch("kb_agent.query.generate_json_object", return_value=query_payload), mock.patch(
-                "kb_agent.tree_search.generate_json_object",
-                side_effect=LLMError("boom"),
-            ):
+            with mock.patch("kb_agent.tree_search.generate_json_object", side_effect=LLMError("boom")):
                 fallback = tree_search(db_path, doc_id, "实验结果如何？", budget=2, use_llm=True)
             self.assertIn("llm_unavailable:boom", fallback["warnings"])
             self.assertFalse(fallback["llm_used"])
             self.assertEqual(fallback["fallback_reason"], "llm_unavailable:boom")
             self.assertTrue(fallback["evidence"])
 
-            with mock.patch("kb_agent.query.generate_json_object", return_value=query_payload), mock.patch(
-                "kb_agent.tree_search.generate_json_object",
-                side_effect=LLMError("boom"),
-            ):
+            with mock.patch("kb_agent.tree_search.generate_json_object", side_effect=LLMError("boom")):
                 with self.assertRaises(LLMError):
                     tree_search(db_path, doc_id, "实验结果如何？", budget=2, use_llm=True, require_llm=True)
 

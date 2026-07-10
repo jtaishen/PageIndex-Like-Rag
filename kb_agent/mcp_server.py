@@ -45,6 +45,11 @@ from .fact_workflow import (
 from .facts import extract_facts, fact_search, get_claims, get_entities, get_fact_graph, get_relations
 from .feedback import build_eval_set_from_feedback, eval_dashboard, list_feedback, put_feedback
 from .ingest import sync_directory
+from .insight_workflow import (
+    extract_insight_batch_workflow,
+    finalize_insight_extraction_workflow,
+    prepare_insight_extraction_workflow,
+)
 from .insights import extract_doc_insights
 from .llm import llm_status
 from .knowledge_graph import (
@@ -88,10 +93,17 @@ if FastMCP is not None:
         path: str,
         force: bool = False,
         pdf_parser: Optional[str] = None,
+        use_llm_summary: bool = True,
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Scan a directory or file and update the local knowledge base index."""
-        return sync_directory(Path(path), resolve_db_path(db_path), force=force, pdf_parser=pdf_parser)
+        return sync_directory(
+            Path(path),
+            resolve_db_path(db_path),
+            force=force,
+            pdf_parser=pdf_parser,
+            doc_card_use_llm=use_llm_summary,
+        )
 
     @mcp.tool()
     def kb_search_docs(
@@ -483,7 +495,7 @@ if FastMCP is not None:
     @mcp.tool()
     def kb_classify_query(
         query: str,
-        use_llm: bool = True,
+        use_llm: bool = False,
         require_llm: bool = False,
     ) -> Dict[str, Any]:
         """Classify query intent and preferred tree-search targets."""
@@ -540,7 +552,7 @@ if FastMCP is not None:
     def kb_extract_claim_frames(
         doc_id: str,
         force: bool = False,
-        use_llm: bool = True,
+        use_llm: bool = False,
         require_llm: bool = False,
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -620,12 +632,12 @@ if FastMCP is not None:
     def kb_extract_doc_insights(
         doc_id: str,
         force: bool = False,
-        use_llm: bool = True,
+        use_llm: bool = False,
         require_llm: bool = False,
         search_mode: str = "hybrid",
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Extract or refresh innovation and citation-map artifacts for one document."""
+        """Compatibility entry for one-shot insight extraction; prefer the staged insight tools for LLM use."""
         return extract_doc_insights(
             resolve_db_path(db_path),
             doc_id,
@@ -633,6 +645,29 @@ if FastMCP is not None:
             use_llm=use_llm,
             require_llm=require_llm,
         )
+
+    @mcp.tool()
+    def kb_prepare_doc_insights(
+        doc_id: str,
+        force: bool = False,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Prepare resumable insight batches without calling the LLM."""
+        return prepare_insight_extraction_workflow(resolve_db_path(db_path), doc_id, force=force)
+
+    @mcp.tool()
+    def kb_extract_insight_batch(
+        task_id: str,
+        batch_id: str,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Extract one bounded insight batch with DeepSeek and persist safe progress diagnostics."""
+        return extract_insight_batch_workflow(resolve_db_path(db_path), task_id, batch_id)
+
+    @mcp.tool()
+    def kb_finalize_doc_insights(task_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+        """Merge completed insight batches and write canonical innovation and citation artifacts."""
+        return finalize_insight_extraction_workflow(resolve_db_path(db_path), task_id)
 
     @mcp.tool()
     def kb_get_innovations(doc_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
@@ -648,11 +683,11 @@ if FastMCP is not None:
     def kb_extract_facts(
         doc_id: str,
         force: bool = False,
-        use_llm: bool = True,
+        use_llm: bool = False,
         require_llm: bool = False,
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Extract grounded claims, entities, relations, and fact graph artifacts for one document."""
+        """Compatibility entry for one-shot fact extraction; prefer the staged fact tools for LLM use."""
         return extract_facts(
             resolve_db_path(db_path),
             doc_id,
@@ -676,7 +711,7 @@ if FastMCP is not None:
         batch_id: str,
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Extract one fact batch with exactly one bounded DeepSeek request."""
+        """Extract one bounded fact batch with DeepSeek; invalid JSON may be retried once."""
         return extract_fact_batch_workflow(resolve_db_path(db_path), task_id, batch_id)
 
     @mcp.tool()
@@ -730,12 +765,12 @@ if FastMCP is not None:
         query: str,
         doc_ids: Optional[List[str]] = None,
         top_k_docs: int = 5,
-        use_llm: bool = True,
+        use_llm: bool = False,
         require_llm: bool = False,
         search_mode: str = "hybrid",
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Compare candidate papers and write grounded comparison task artifacts."""
+        """Compatibility entry for one-shot comparison; prefer the staged comparison tools for LLM use."""
         return compare_papers(
             resolve_db_path(db_path),
             query,
@@ -769,7 +804,7 @@ if FastMCP is not None:
         dimension_id: str,
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Generate one comparison dimension with exactly one bounded DeepSeek request."""
+        """Generate one bounded comparison dimension; invalid JSON may be retried once."""
         return generate_compare_dimension(resolve_db_path(db_path), task_id, dimension_id)
 
     @mcp.tool()
@@ -782,12 +817,12 @@ if FastMCP is not None:
         topic: str,
         doc_ids: Optional[List[str]] = None,
         top_k_docs: int = 8,
-        use_llm: bool = True,
+        use_llm: bool = False,
         require_llm: bool = False,
         search_mode: str = "hybrid",
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Generate review planning artifacts with section-level evidence."""
+        """Compatibility entry for one-shot review planning; prefer the staged review tools for LLM use."""
         return generate_review_plan(
             resolve_db_path(db_path),
             topic,
@@ -821,7 +856,7 @@ if FastMCP is not None:
         section_id: str,
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Generate one review-outline section with exactly one bounded DeepSeek request."""
+        """Generate one bounded review-outline section; invalid JSON may be retried once."""
         return generate_review_outline_section(resolve_db_path(db_path), task_id, section_id)
 
     @mcp.tool()
@@ -842,11 +877,11 @@ if FastMCP is not None:
     def kb_draft_review(
         task_id: str,
         section_ids: Optional[List[str]] = None,
-        use_llm: bool = True,
+        use_llm: bool = False,
         require_llm: bool = False,
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Draft review sections from a generated review task and section evidence."""
+        """Compatibility entry for bulk drafting; prefer kb_draft_review_section for LLM use."""
         return draft_review(
             resolve_db_path(db_path),
             task_id,
@@ -862,7 +897,7 @@ if FastMCP is not None:
         require_llm: bool = True,
         db_path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Draft one review section with one bounded DeepSeek request and persist progress."""
+        """Draft one bounded review section with DeepSeek and persist progress."""
         return draft_review_section(
             resolve_db_path(db_path),
             task_id,

@@ -57,7 +57,7 @@ def sync_directory(
             report[result] = int(report[result]) + 1  # type: ignore[arg-type]
             if error:
                 report["errors"].append({"path": str(file_path), "error": error})  # type: ignore[union-attr]
-        conn.commit()
+            conn.commit()
     finally:
         conn.close()
     return report
@@ -86,8 +86,6 @@ def _sync_file(
     doc_id = stable_id("doc", str(file_path))
     version_id = stable_id("ver", doc_id, file_hash, parser_name, parser_version)
     artifact_dir = DATA_DIR / "parsed" / doc_id / version_id
-    db.delete_document_by_path(conn, str(file_path))
-
     try:
         parsed = parse_document(file_path, pdf_parser=pdf_parser)
         build_layout_blocks(parsed.blocks, parsed.parser_name or parsed.file_type)
@@ -113,8 +111,6 @@ def _sync_file(
             parser_name=parsed.parser_name,
             parser_version=parsed.parser_version,
         )
-        db.upsert_document(conn, record)
-        db.insert_nodes(conn, nodes)
         artifacts = _write_artifacts(
             doc_id,
             version_id,
@@ -125,6 +121,9 @@ def _sync_file(
             nodes,
             doc_card_use_llm=doc_card_use_llm,
         )
+        db.delete_document_by_path(conn, str(file_path))
+        db.upsert_document(conn, record)
+        db.insert_nodes(conn, nodes)
         db.insert_document_version(
             conn,
             version_id=version_id,
@@ -153,8 +152,9 @@ def _sync_file(
             parser_name=parser_name,
             parser_version=parser_version,
         )
-        db.upsert_document(conn, record)
         _write_failure_report(doc_id, version_id, artifact_dir, file_path, file_hash, parser_name, parser_version, error)
+        db.delete_document_by_path(conn, str(file_path))
+        db.upsert_document(conn, record)
         db.insert_document_version(
             conn,
             version_id=version_id,

@@ -82,6 +82,9 @@ class OpenCodeWorkflowTest(unittest.TestCase):
     def test_llm_heavy_workflows_use_resumable_staged_tools(self) -> None:
         expected_by_skill = {
             "paper-insight": {
+                "kb_prepare_doc_insights",
+                "kb_extract_insight_batch",
+                "kb_finalize_doc_insights",
                 "kb_prepare_fact_extraction",
                 "kb_extract_fact_batch",
                 "kb_finalize_fact_extraction",

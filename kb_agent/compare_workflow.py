@@ -14,7 +14,7 @@ from .workflow_state import (
     finish_workflow_step,
     get_workflow_state,
     set_workflow_phase,
-    single_request_json_generator,
+    staged_json_generator,
     start_workflow_step,
     workflow_step,
     workflow_steps_for_phase,
@@ -107,7 +107,7 @@ def generate_compare_dimension(
             for cell in dimension.get("cells") or []
             if cell.get("doc_id")
         }
-        generator = json_generator or single_request_json_generator("compare", dimension_id)
+        generator = json_generator or staged_json_generator("compare", dimension_id)
         built = build_comparison_dimension(
             str(matrix.get("query") or ""),
             dimension,
@@ -134,7 +134,13 @@ def generate_compare_dimension(
         matrix["source"] = "llm_staged_partial"
         matrix["status"] = "partial"
         write_json(task_dir / "comparison_matrix.json", matrix)
-        workflow = finish_workflow_step(db_path, task_id, step_id, status="completed")
+        workflow = finish_workflow_step(
+            db_path,
+            task_id,
+            step_id,
+            status="completed",
+            diagnostics=built.llm_diagnostics,
+        )
         return {
             "schema": "staged_compare_dimension_result.v1",
             "task_id": task_id,
@@ -146,13 +152,22 @@ def generate_compare_dimension(
             "artifact_path": str(artifact_path),
         }
     except LLMError as exc:
-        workflow = finish_workflow_step(db_path, task_id, step_id, status="failed", error_type=exc.error_type)
+        workflow = finish_workflow_step(
+            db_path,
+            task_id,
+            step_id,
+            status="failed",
+            error_type=exc.error_type,
+            diagnostics=exc.metadata,
+        )
         return {
             "schema": "staged_compare_dimension_result.v1",
             "task_id": task_id,
             "dimension_id": dimension_id,
             "status": "failed",
             "error_type": exc.error_type,
+            "retryable": True,
+            "recovery": {"action": "retry_same_step", "completed_steps_preserved": True},
             "workflow": workflow,
         }
 

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from . import ingest_artifacts
+from .llm_policies import structured_llm_policy
 from .parse_quality import build_parse_quality
 from .text_quality import clean_research_text, is_research_noise_text
 
@@ -156,11 +157,14 @@ def doc_card_summaries(
             "summary_warnings": ["deepseek_summary_skipped:not_configured"],
         }
     try:
+        policy = structured_llm_policy("doc_card_summary")
         payload = json_generator(
             "你是论文知识库的文档卡片摘要器。只返回 JSON object，不要输出正文、证据长摘录或 prompt。",
             doc_card_summary_prompt(parsed, fallback),
-            timeout_seconds=20,
-            retry_count=1,
+            timeout_seconds=policy.timeout_seconds,
+            retry_count=policy.retry_count,
+            max_tokens=policy.max_tokens,
+            thinking=policy.thinking,
             operation="doc_card_summary",
             stage="ingest",
         )

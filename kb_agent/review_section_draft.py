@@ -135,7 +135,7 @@ def section_draft_llm_diagnostics(
 ) -> Dict[str, Any]:
     metadata = metadata or {}
     compaction = compaction or {}
-    return {
+    diagnostics = {
         "schema": "section_draft_llm_diagnostics.v1",
         "used": used,
         "retry_count": int(metadata.get("retry_count") or 0),
@@ -150,6 +150,19 @@ def section_draft_llm_diagnostics(
         "compaction_warnings": _string_list(compaction.get("warnings")),
         "compaction": compaction,
     }
+    for key in (
+        "duration_ms",
+        "finish_reason",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "reasoning_content_present",
+        "operation",
+        "stage",
+    ):
+        if key in metadata:
+            diagnostics[key] = metadata[key]
+    return diagnostics
 
 
 def _number_evidence(evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

@@ -49,6 +49,7 @@ from .claim_frame_verifier import (
     verify_claim_frames_payload as _verifier_claim_frames_payload,
 )
 from .llm import LLMError, generate_json_object
+from .llm_policies import structured_json_generator
 from .utils import unique_strings as _unique_strings, write_json
 
 
@@ -439,7 +440,12 @@ def _enhance_frames_with_llm(
     frames: List[Dict[str, Any]],
     units: List[Dict[str, Any]],
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    return _builder_enhance_frames_with_llm(card, frames, units, json_generator=generate_json_object)
+    generator = structured_json_generator("claim_frame", "enhance", json_generator=generate_json_object)
+
+    def generate(system_prompt: str, user_prompt: str, **_options: Any) -> Dict[str, object]:
+        return generator(system_prompt, user_prompt)
+
+    return _builder_enhance_frames_with_llm(card, frames, units, json_generator=generate)
 
 
 def _claim_frames_payload(

@@ -8,8 +8,9 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from . import db
 from .llm import LLMError, generate_json_object
+from .llm_policies import structured_json_generator
 from .models import EvidencePacket, SearchResult
-from .query import classify_query
+from .query import rule_query_profile
 from .query_log import insert_query_log
 from .search_core import (
     resolve_flat_search_mode as _resolve_flat_search_mode,
@@ -47,7 +48,7 @@ def tree_search(
             conn.commit()
             return trace
 
-        profile = classify_query(query, use_llm=use_llm, require_llm=require_llm)
+        profile = rule_query_profile(query)
         quality = _parse_quality(conn, doc_id)
         preferences = _memory_preferences(conn)
         flat_signals = _flat_candidate_signals(db_path, doc_id, query, budget, flat_mode)
@@ -375,7 +376,11 @@ def _llm_select_nodes(
             '{"selected_node_ids":[],"rationale":[],"warnings":[]}',
         ]
     )
-    payload = generate_json_object(system_prompt, user_prompt)
+    payload = structured_json_generator(
+        "tree_search",
+        "select_nodes",
+        json_generator=generate_json_object,
+    )(system_prompt, user_prompt)
     payload.setdefault("candidate_count", len(candidates))
     return payload
 

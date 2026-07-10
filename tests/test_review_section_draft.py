@@ -35,6 +35,12 @@ class ReviewSectionDraftTest(unittest.TestCase):
             "body_markdown": "任务规划章节需要结合动态约束和执行证据进行讨论。[E1]",
             "unsupported_claims": [],
             "warnings": [],
+            "_llm_metadata": {
+                "duration_ms": 321.5,
+                "finish_reason": "stop",
+                "completion_tokens": 180,
+                "thinking_mode": "disabled",
+            },
         }
 
         result = build_section_draft(
@@ -54,6 +60,8 @@ class ReviewSectionDraftTest(unittest.TestCase):
         self.assertEqual(draft["claim_plan"][0]["evidence"], ["E1"])
         self.assertEqual([item["ref_id"] for item in draft["used_evidence"]], ["E1"])
         self.assertTrue(draft["llm_diagnostics"]["used"])
+        self.assertEqual(draft["llm_diagnostics"]["duration_ms"], 321.5)
+        self.assertEqual(draft["llm_diagnostics"]["finish_reason"], "stop")
         self.assertEqual(draft["paragraph_support_report"]["supported_paragraph_count"], 1)
 
     def test_llm_draft_removes_unsupported_paragraphs(self) -> None:

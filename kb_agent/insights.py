@@ -3,10 +3,11 @@ from __future__ import annotations
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from .artifacts import get_artifact, get_doc_card, get_parse_quality, list_artifacts
 from .llm import LLMError, generate_json_object
+from .llm_policies import structured_json_generator
 from .utils import compact_whitespace, write_json
 
 
@@ -29,6 +30,7 @@ INSIGHT_NODE_TOKENS = (
 )
 LIMITATION_TOKENS = ("局限", "不足", "限制", "展望", "未来工作", "讨论")
 REFERENCE_MARK_RE = re.compile(r"\[(\d+(?:\s*(?:[-,，、]\s*)\d+)*)\]")
+JsonGenerator = Callable[[str, str], Dict[str, object]]
 
 
 def extract_doc_insights(
@@ -41,7 +43,7 @@ def extract_doc_insights(
 ) -> Dict[str, Any]:
     listing = list_artifacts(db_path, doc_id)
     artifact_dir = Path(str(listing["artifact_dir"]))
-    existing = _read_existing_v1(db_path, doc_id)
+    existing = read_existing_insights(db_path, doc_id)
     if existing and not force:
         return {
             "doc_id": doc_id,
@@ -52,18 +54,19 @@ def extract_doc_insights(
             "citation_map": existing["citation_map"],
         }
 
-    card = get_doc_card(db_path, doc_id)
-    quality = get_parse_quality(db_path, doc_id)
-    nodes = get_artifact(db_path, doc_id, "node_index.jsonl")["content"]
-    references = get_artifact(db_path, doc_id, "references.json")["content"]
-    selected_nodes = _select_insight_nodes(nodes)
+    inputs = load_insight_extraction_inputs(db_path, doc_id)
+    card = inputs["card"]
+    quality = inputs["quality"]
+    nodes = inputs["nodes"]
+    references = inputs["references"]
+    selected_nodes = inputs["selected_nodes"]
     warnings: List[str] = []
     llm_error = ""
 
     if use_llm:
         try:
-            llm_payload = _extract_innovation_with_llm(card, quality, selected_nodes)
-            innovation = _normalize_innovation_payload(
+            llm_payload = extract_innovation_with_llm(card, quality, selected_nodes)
+            innovation = normalize_innovation_payload(
                 llm_payload,
                 doc_id=doc_id,
                 version_id=str(listing["version_id"]),
@@ -97,7 +100,7 @@ def extract_doc_insights(
             warnings,
         )
 
-    citation_map = _build_citation_map(
+    citation_map = build_citation_map(
         doc_id,
         str(listing["version_id"]),
         card,
@@ -119,7 +122,23 @@ def extract_doc_insights(
     }
 
 
-def _read_existing_v1(db_path: Path, doc_id: str) -> Optional[Dict[str, Any]]:
+def load_insight_extraction_inputs(db_path: Path, doc_id: str) -> Dict[str, Any]:
+    listing = list_artifacts(db_path, doc_id)
+    nodes = get_artifact(db_path, doc_id, "node_index.jsonl")["content"]
+    return {
+        "listing": listing,
+        "doc_id": doc_id,
+        "version_id": str(listing["version_id"]),
+        "artifact_dir": Path(str(listing["artifact_dir"])),
+        "card": get_doc_card(db_path, doc_id),
+        "quality": get_parse_quality(db_path, doc_id),
+        "nodes": nodes,
+        "references": get_artifact(db_path, doc_id, "references.json")["content"],
+        "selected_nodes": _select_insight_nodes(nodes),
+    }
+
+
+def read_existing_insights(db_path: Path, doc_id: str) -> Optional[Dict[str, Any]]:
     try:
         innovation = get_artifact(db_path, doc_id, "innovation.json")["content"]
         citation_map = get_artifact(db_path, doc_id, "citation_map.json")["content"]
@@ -181,10 +200,13 @@ def _insight_score(kind: str, text: str) -> int:
     return score
 
 
-def _extract_innovation_with_llm(
+def extract_innovation_with_llm(
     card: Dict[str, Any],
     quality: Dict[str, Any],
     selected_nodes: List[Dict[str, Any]],
+    *,
+    json_generator: Optional[JsonGenerator] = None,
+    stage: str = "legacy",
 ) -> Dict[str, object]:
     system_prompt = (
         "你是一个严谨的论文结构化抽取助手。只能基于给定节点抽取信息，"
@@ -205,7 +227,12 @@ def _extract_innovation_with_llm(
             *_format_evidence_for_prompt(selected_nodes),
         ]
     )
-    return generate_json_object(system_prompt, user_prompt)
+    generator = json_generator or structured_json_generator(
+        "insight_extraction",
+        stage,
+        json_generator=generate_json_object,
+    )
+    return generator(system_prompt, user_prompt)
 
 
 def _format_evidence_for_prompt(nodes: List[Dict[str, Any]]) -> List[str]:
@@ -214,12 +241,12 @@ def _format_evidence_for_prompt(nodes: List[Dict[str, Any]]) -> List[str]:
         lines.append(f"[N{index}] node_id: {node['node_id']}")
         lines.append(f"node_path: {node['node_path']}")
         lines.append(f"page_range: {node['page_range']}")
-        lines.append(f"excerpt: {_excerpt(node['excerpt'], 1200)}")
+        lines.append(f"excerpt: {_excerpt(node['excerpt'], 360)}")
         lines.append("")
     return lines
 
 
-def _normalize_innovation_payload(
+def normalize_innovation_payload(
     payload: Dict[str, object],
     *,
     doc_id: str,
@@ -308,7 +335,7 @@ def _rule_based_innovation(
     }
 
 
-def _build_citation_map(
+def build_citation_map(
     doc_id: str,
     version_id: str,
     card: Dict[str, Any],

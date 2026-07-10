@@ -4,6 +4,7 @@ import re
 from typing import Any, Dict, Iterable, List, Optional
 
 from .llm import LLMError, generate_json_object
+from .llm_policies import structured_json_generator
 from .utils import compact_whitespace, string_list as _string_list, unique_strings as _unique_strings
 
 
@@ -114,6 +115,11 @@ def focus_terms(query: str, extra_terms: Optional[Iterable[str]] = None, limit: 
     return result or [compact_whitespace(query)]
 
 
+def rule_query_profile(query: str) -> Dict[str, Any]:
+    """Return the deterministic profile used before optional LLM tree routing."""
+    return _rule_based_profile(query)
+
+
 def _rule_based_profile(query: str) -> Dict[str, Any]:
     normalized = compact_whitespace(query)
     intent = _detect_intent(normalized)
@@ -161,7 +167,11 @@ def _classify_with_llm(query: str, base: Dict[str, Any]) -> Dict[str, object]:
             '{"intent":"","focus_terms":[],"preferred_node_types":[],"target_sections":[],"filters":{},"warnings":[]}',
         ]
     )
-    return generate_json_object(system_prompt, user_prompt)
+    return structured_json_generator(
+        "query_classification",
+        "classify",
+        json_generator=generate_json_object,
+    )(system_prompt, user_prompt)
 
 
 def _normalize_llm_profile(query: str, base: Dict[str, Any], payload: Dict[str, object]) -> Dict[str, Any]:

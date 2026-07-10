@@ -12,6 +12,9 @@ const OBSERVED_TOOLS = new Set([
   "kb_generate_review_outline_section",
   "kb_finalize_review_outline",
   "kb_draft_review_section",
+  "kb_prepare_doc_insights",
+  "kb_extract_insight_batch",
+  "kb_finalize_doc_insights",
   "kb_prepare_fact_extraction",
   "kb_extract_fact_batch",
   "kb_finalize_fact_extraction",
@@ -183,6 +186,9 @@ function summarizeMetrics(tool, safe, coverage) {
     tool === "kb_generate_review_outline_section" ||
     tool === "kb_finalize_review_outline" ||
     tool === "kb_draft_review_section" ||
+    tool === "kb_prepare_doc_insights" ||
+    tool === "kb_extract_insight_batch" ||
+    tool === "kb_finalize_doc_insights" ||
     tool === "kb_prepare_fact_extraction" ||
     tool === "kb_extract_fact_batch" ||
     tool === "kb_finalize_fact_extraction" ||

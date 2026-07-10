@@ -15,6 +15,7 @@ TASK_ARTIFACT_WHITELIST = {
     "manifest.json",
     "workflow_state.json",
     "fact_extraction_plan.json",
+    "insight_extraction_plan.json",
     "selected_papers.json",
     "comparison_matrix.json",
     "review_outline.json",
@@ -58,6 +59,9 @@ def valid_task_artifact_name(name: str) -> bool:
     if name.startswith("fact_batches/") and name.endswith(".json"):
         parts = Path(name).parts
         return len(parts) == 2 and parts[0] == "fact_batches" and ".." not in parts
+    if name.startswith("insight_batches/") and name.endswith(".json"):
+        parts = Path(name).parts
+        return len(parts) == 2 and parts[0] == "insight_batches" and ".." not in parts
     return False
 
 

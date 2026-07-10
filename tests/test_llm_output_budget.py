@@ -98,6 +98,44 @@ class LLMOutputBudgetTest(unittest.TestCase):
         self.assertEqual(raised.exception.metadata["finish_reason"], "length")
         self.assertEqual(raised.exception.metadata["completion_tokens"], 900)
         self.assertTrue(raised.exception.metadata["reasoning_content_present"])
+        self.assertEqual(raised.exception.metadata["max_tokens"], 900)
+
+    def test_truncated_content_preserves_safe_response_diagnostics(self) -> None:
+        settings = LLMSettings(
+            api_key="test-key",
+            base_url="https://example.test/v1",
+            model="test-model",
+            temperature=0,
+            max_tokens=1200,
+        )
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"role": "assistant", "content": '{"items":[', "reasoning_content": ""},
+                    }
+                ],
+                "usage": {"prompt_tokens": 240, "completion_tokens": 1200, "total_tokens": 1440},
+            }
+        ).encode("utf-8")
+
+        with mock.patch("kb_agent.llm.urllib.request.urlopen", return_value=response):
+            with self.assertRaises(LLMError) as raised:
+                generate_json_object(
+                    "system",
+                    "user",
+                    settings=settings,
+                    max_tokens=1200,
+                    thinking=False,
+                    retry_count=0,
+                )
+
+        self.assertEqual(raised.exception.error_type, "truncated_json")
+        self.assertEqual(raised.exception.metadata["finish_reason"], "length")
+        self.assertEqual(raised.exception.metadata["completion_tokens"], 1200)
+        self.assertEqual(raised.exception.metadata["thinking_mode"], "disabled")
 
 
 if __name__ == "__main__":

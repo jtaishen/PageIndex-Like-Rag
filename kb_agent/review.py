@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .llm import generate_json_object
+from .llm_policies import structured_json_generator
 from .review_quality import assemble_review_markdown, build_citation_check, build_review_report
 from .review_section_draft import (
     build_section_draft,
@@ -37,7 +38,11 @@ def draft_review(
     warnings: List[str] = []
     llm_error = ""
     paths: Dict[str, str] = {}
-    generator = json_generator or generate_json_object
+    generator = json_generator or structured_json_generator(
+        "review_draft",
+        "legacy_sections",
+        json_generator=generate_json_object,
+    )
     for section in sections:
         evidence_artifact = _read_section_evidence(task_dir, str(section["section_id"]))
         numbered_evidence, compaction = prepare_numbered_draft_evidence(

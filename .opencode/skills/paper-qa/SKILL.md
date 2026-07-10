@@ -12,8 +12,8 @@ description: 证据优先论文问答 workflow；用于回答单篇或多篇论�
 ## 必调工具顺序
 
 1. `kb_search_docs`：路由候选论文，默认 `search_mode="hybrid"`；用户要求树检索或证据更强时可用 `search_mode="tree"`。
-2. `kb_classify_query`：判断 query intent，决定是否偏向方法、实验、局限、引用或比较。
-3. `kb_tree_search`：在候选 doc 内找章节、段落、图表或表格证据节点；默认使用规则树检索，只有用户明确要求 LLM 路径时才对单篇论文、较小 budget 使用 LLM。
+2. `kb_classify_query`（`use_llm=false`）：用稳定规则判断 query intent，避免为同一个 Tree Search 额外发起一次模型调用。
+3. `kb_tree_search`（`use_llm=true`）：先由规则意图和 value function 形成候选，再让 DeepSeek 对最相关单篇论文做一次节点选择；多篇论文按相关性顺序执行，不并发调用。
 4. `kb_get_evidence`：读取最终 evidence packet。
 5. `kb_answer`：只基于 evidence 生成回答；优先查看返回的 `answer_plan.answerability` 和 `answer_policy`，证据不足时必须说明不足。
 
@@ -27,7 +27,7 @@ description: 证据优先论文问答 workflow；用于回答单篇或多篇论�
 
 - 至少拿到一个带 `doc_id`、`node_id`、`node_path` 或 `page_range` 的证据来源后再回答。
 - 如果没有足够证据，停止生成结论，改为说明缺口和建议下一步检索。
-- 如果 `kb_tree_search use_llm=true` 超时，停止重试 LLM 树检索，改用规则 `kb_tree_search` 或 `search_mode="hybrid"` 获取证据。
+- 如果 `kb_tree_search` 的 LLM 调用超时，停止重复调用同一 LLM 步骤，改用 `use_llm=false` 的规则树检索获取证据，并明确标记回退原因。
 - 对多篇候选论文不要并发运行 LLM tree search；需要 LLM 时一次只增强一篇最相关论文。
 
 ## 输出要求
@@ -41,7 +41,7 @@ description: 证据优先论文问答 workflow；用于回答单篇或多篇论�
 
 ## 禁止事项
 
-- 不对多篇论文并发执行 `kb_tree_search use_llm=true`。
+- 不对多篇论文并发执行 `kb_tree_search` 的 LLM 路径。
 - 不把 LLM tree search 当成获取证据的唯一入口；超时后必须用规则树检索或 hybrid 检索继续拿 evidence。
 - 不基于聊天记忆或模型常识补写论文结论。
 - 不把论文正文、长 excerpt、完整 evidence packet 或完整 prompt 写入 memory、feedback、query log 或报告摘要。

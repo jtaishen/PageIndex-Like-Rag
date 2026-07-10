@@ -19,6 +19,7 @@ from .claim_alignment import (
 from .fact_audit import fact_audit_summary
 from .knowledge_graph import graph_summary
 from .llm import generate_json_object
+from .llm_policies import structured_json_generator
 from .query_log import write_query_log
 from .task_compare import build_comparison_matrix
 from .task_artifacts import (
@@ -147,7 +148,11 @@ def compare_papers(
         warnings=warnings,
         use_llm=use_llm,
         require_llm=require_llm,
-        json_generator=generate_json_object,
+        json_generator=structured_json_generator(
+            "compare",
+            "legacy_dimensions",
+            json_generator=generate_json_object,
+        ),
     )
     matrix = comparison.matrix
     llm_error = comparison.llm_error
@@ -261,7 +266,11 @@ def generate_review_plan(
         use_llm=use_llm,
         require_llm=require_llm,
         prefer_section_llm=prefer_section_llm,
-        json_generator=generate_json_object,
+        json_generator=structured_json_generator(
+            "review_outline",
+            "legacy_outline",
+            json_generator=generate_json_object,
+        ),
     )
     outline = review_plan.outline
     llm_error = review_plan.llm_error

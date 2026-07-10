@@ -30,6 +30,7 @@ from .fact_sources import (
 )
 from .insights import extract_doc_insights
 from .llm import LLMError, generate_json_object
+from .llm_policies import structured_json_generator
 from .utils import unique_strings as _unique_strings, write_json
 
 
@@ -88,7 +89,11 @@ def extract_facts(
                 table_summaries,
                 node_by_id,
                 warnings,
-                json_generator=generate_json_object,
+                json_generator=structured_json_generator(
+                    "fact_extraction",
+                    "legacy_batches",
+                    json_generator=generate_json_object,
+                ),
             )
         except LLMError as exc:
             if require_llm:
