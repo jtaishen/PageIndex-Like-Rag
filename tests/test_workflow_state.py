@@ -59,6 +59,21 @@ class WorkflowStateTest(unittest.TestCase):
             stage="background",
         )
 
+    def test_single_request_generator_can_bound_output_tokens(self) -> None:
+        with mock.patch(
+            "kb_agent.workflow_state.generate_json_object",
+            return_value={"ok": True},
+        ) as generate:
+            result = single_request_json_generator(
+                "review_draft",
+                "method_paradigms",
+                max_tokens=900,
+            )("system", "user")
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(generate.call_args.kwargs["max_tokens"], 900)
+        self.assertEqual(generate.call_args.kwargs["retry_count"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

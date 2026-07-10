@@ -1126,6 +1126,10 @@ uv run python -m kb_agent.cli memory-compile "继续写综述" --intent review -
 uv run python -m kb_agent.cli resume-task
 ```
 
+## v0.60 Staged 综述草稿超时修复
+
+v0.60 根据真实综述任务中的章节超时结果，将 staged MCP 单步默认超时调整为 45 秒，并为综述草稿设置独立的 900-token 输出上限。草稿提示词要求 2 至 3 个短段落，避免单节继承全局长输出配置；超时结果会明确提示只重试失败章节，已完成章节保持不变，存在 failed/pending step 时不能宣称任务完成。
+
 ## v0.59 OpenCode 长流程 Staged MCP
 
 v0.59 将交互式 `facts / compare / review` 从单次长 MCP 请求改为可恢复的 staged workflow。准备步骤只生成 evidence-first 任务工件；每个 fact batch、比较维度、综述大纲章节和综述草稿章节最多发出一次 DeepSeek 请求，完成状态写入 `workflow_state.json`。单步失败后可从对应 pending step 恢复，不会重复已完成的模型调用，也不会用规则结果伪装成 LLM 成功。
@@ -1140,7 +1144,7 @@ review:  kb_prepare_review -> kb_generate_review_outline_section -> kb_finalize_
 status:  kb_get_workflow_status
 ```
 
-旧的同步 CLI 和 MCP 工具继续保留兼容。staged 单步默认使用 `KB_MCP_LLM_STEP_TIMEOUT_SECONDS=35`，并关闭单步内 JSON 重试，从调用结构上避开 MCP 默认约 60 秒请求上限。
+旧的同步 CLI 和 MCP 工具继续保留兼容。staged 单步默认使用 `KB_MCP_LLM_STEP_TIMEOUT_SECONDS=45`，并关闭单步内 JSON 重试，从调用结构上避开 MCP 默认约 60 秒请求上限。综述草稿单步另外使用 `KB_MCP_REVIEW_DRAFT_MAX_TOKENS=900` 限制输出规模；请求超时后只需重试失败章节，已经完成的章节会保留，所有章节完成前 workflow 不会进入 completed。
 
 ## PDF 和 MCP 可选依赖
 
@@ -1196,7 +1200,8 @@ DEEPSEEK_MAX_TOKENS=3000
 DEEPSEEK_TIMEOUT_SECONDS=45
 DEEPSEEK_PROBE_TIMEOUT_SECONDS=15
 DEEPSEEK_JSON_RETRY_COUNT=1
-KB_MCP_LLM_STEP_TIMEOUT_SECONDS=35
+KB_MCP_LLM_STEP_TIMEOUT_SECONDS=45
+KB_MCP_REVIEW_DRAFT_MAX_TOKENS=900
 KB_BASELINE_LLM_TIMEOUT_SECONDS=420
 KB_BASELINE_LLM_STAGE_TIMEOUT_SECONDS=120
 KB_LLM_FACT_BATCH_SIZE=6
@@ -1271,7 +1276,7 @@ uv run --extra mcp python -m kb_agent.mcp_server
 
 综述、compare 和 facts 的交互式 LLM 流程采用 staged MCP：准备步骤不调用模型，每个章节、比较维度或 fact batch 最多发出一次 DeepSeek 请求，随后将完成状态写入 `workflow_state.json`。`kb_get_workflow_status` 返回当前 phase、completed steps、pending steps 和失败类型；连接恢复后只重试失败 step，不重复已经完成的模型调用。
 
-旧的 `kb_generate_review`、`kb_draft_review` 和 `kb_extract_facts` 继续保留，供 CLI、自动化脚本和兼容调用使用；OpenCode agent 默认使用 staged 工具，避免把多次模型请求塞进单个 60 秒左右的 MCP 调用。每个 staged LLM step 默认使用 `KB_MCP_LLM_STEP_TIMEOUT_SECONDS=35`，并关闭该 step 内的 JSON 重试；结构化失败会明确记录，不会用规则结果伪装为 LLM 成功。
+旧的 `kb_generate_review`、`kb_draft_review` 和 `kb_extract_facts` 继续保留，供 CLI、自动化脚本和兼容调用使用；OpenCode agent 默认使用 staged 工具，避免把多次模型请求塞进单个 60 秒左右的 MCP 调用。每个 staged LLM step 默认使用 `KB_MCP_LLM_STEP_TIMEOUT_SECONDS=45`，并关闭该 step 内的 JSON 重试；综述草稿再通过 `KB_MCP_REVIEW_DRAFT_MAX_TOKENS=900` 控制单节输出规模。结构化失败会明确记录，不会用规则结果伪装为 LLM 成功。
 
 当用户明确指出某次结果好坏时，可追加：
 

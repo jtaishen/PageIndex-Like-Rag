@@ -123,7 +123,12 @@ def deepseek_json_retry_count() -> int:
 
 def mcp_llm_step_timeout_seconds() -> int:
     """Bound one staged MCP LLM request below the client's request timeout."""
-    return _env_int("KB_MCP_LLM_STEP_TIMEOUT_SECONDS", 35)
+    return _env_int("KB_MCP_LLM_STEP_TIMEOUT_SECONDS", 45)
+
+
+def mcp_review_draft_max_tokens() -> int:
+    """Keep one review-draft response concise enough for an interactive MCP step."""
+    return _env_int("KB_MCP_REVIEW_DRAFT_MAX_TOKENS", 900)
 
 
 def baseline_llm_timeout_seconds() -> int:

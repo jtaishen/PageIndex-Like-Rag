@@ -111,17 +111,27 @@ def workflow_steps_for_phase(state: Dict[str, Any], phase: str) -> List[Dict[str
     return [step for step in state.get("steps") or [] if str(step.get("phase") or "") == phase]
 
 
-def single_request_json_generator(operation: str, stage: str) -> JsonGenerator:
+def single_request_json_generator(
+    operation: str,
+    stage: str,
+    *,
+    max_tokens: Optional[int] = None,
+) -> JsonGenerator:
     """Create a JSON generator that can issue only one bounded LLM request."""
 
     def generate(system_prompt: str, user_prompt: str) -> Dict[str, object]:
+        options: Dict[str, Any] = {
+            "timeout_seconds": mcp_llm_step_timeout_seconds(),
+            "retry_count": 0,
+            "operation": operation,
+            "stage": stage,
+        }
+        if max_tokens is not None:
+            options["max_tokens"] = max_tokens
         return generate_json_object(
             system_prompt,
             user_prompt,
-            timeout_seconds=mcp_llm_step_timeout_seconds(),
-            retry_count=0,
-            operation=operation,
-            stage=stage,
+            **options,
         )
 
     return generate

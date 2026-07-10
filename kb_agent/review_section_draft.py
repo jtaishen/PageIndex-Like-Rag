@@ -140,6 +140,7 @@ def section_draft_llm_diagnostics(
         "used": used,
         "retry_count": int(metadata.get("retry_count") or 0),
         "repair_used": bool(metadata.get("repair_used")),
+        "max_tokens": int(metadata.get("max_tokens") or 0),
         "error_type": (getattr(error, "error_type", "") if error else str(metadata.get("error_type") or "")),
         "fallback_reason": fallback_reason,
         "evidence_count": evidence_count,
@@ -303,6 +304,7 @@ def _draft_section_with_llm(
         "你是严谨的中文论文综述写作助手。只能基于给定 evidence 写章节草稿。"
         "正文中每个自然段至少必须包含一个 [E1]、[E2] 这样的证据标记。"
         "不能被证据支持的内容必须放入 unsupported_claims，不允许写入正文。"
+        "正文写成 2 至 3 个简洁自然段，总长度不超过 500 个中文字符；claim_plan 最多 4 项。"
         "不要编造论文内容。必须返回 JSON object，不要返回 Markdown 代码块。"
     )
     user_prompt = "\n".join(

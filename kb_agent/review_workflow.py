@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from .config import mcp_review_draft_max_tokens
 from .llm import LLMError
 from .review import draft_review
 from .task_artifacts import get_task_artifact, task_state_root, update_task_status
@@ -228,7 +229,11 @@ def draft_review_section(
     step_id = f"draft:{section_id}"
     workflow_step(state, step_id)
     start_workflow_step(db_path, task_id, step_id)
-    generator = json_generator or single_request_json_generator("review_draft", section_id)
+    generator = json_generator or single_request_json_generator(
+        "review_draft",
+        section_id,
+        max_tokens=mcp_review_draft_max_tokens(),
+    )
     try:
         result = draft_review(
             db_path,
@@ -282,11 +287,18 @@ def _failed_step_result(
     error_type: str,
     workflow: Dict[str, Any],
 ) -> Dict[str, Any]:
+    retryable = error_type in {"request_timeout", "request_failed", "invalid_json", "truncated_json"}
     return {
         "schema": schema,
         "task_id": task_id,
         "step_id": step_id,
         "status": "failed",
         "error_type": error_type,
+        "retryable": retryable,
+        "recovery": {
+            "action": "retry_same_step" if retryable else "inspect_configuration",
+            "completed_steps_preserved": True,
+            "finalization_blocked": True,
+        },
         "workflow": workflow,
     }

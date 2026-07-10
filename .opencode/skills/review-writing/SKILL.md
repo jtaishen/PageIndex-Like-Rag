@@ -32,7 +32,7 @@ description: 综述规划与草稿 workflow；用于生成综述大纲、章节�
 ## 停止条件
 
 - 用户没有确认候选论文时，不直接调用 `kb_generate_review`。
-- 单个 staged step 失败时，读取 `kb_get_workflow_status` 确认 `error_type`；修正模型 profile 或连接后只重试该 step，不重建整个任务。
+- 单个 staged step 失败时，读取 `kb_get_workflow_status` 确认 `error_type`；可以先继续其他待处理章节，但最终必须只重试失败 step，不重建整个任务，也不能在 failed/pending step 尚存时宣称综述草稿已完成。
 - 如果用户只是要“看看能做什么”或组会演示，先展示候选文献、outline、section evidence 和 open questions，不直接生成长草稿。
 - 如果 `kb_check_review_citations` 有 unsupported paragraphs，停止组装或明确标记需修改。
 - 如果关键 ClaimFrame 的 `citation_risk` 为 `needs_more_evidence` 或 `conflicting_evidence`，停止当作强结论使用并给出修订动作。

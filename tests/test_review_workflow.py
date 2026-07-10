@@ -115,6 +115,9 @@ class ReviewWorkflowTest(unittest.TestCase):
             )
             self.assertEqual(step["status"], "failed")
             self.assertEqual(step["attempt_count"], 1)
+            self.assertTrue(failed["retryable"])
+            self.assertEqual(failed["recovery"]["action"], "retry_same_step")
+            self.assertTrue(failed["recovery"]["completed_steps_preserved"])
 
 
 def _sync_review_samples(root: Path) -> tuple[Path, list[str]]:

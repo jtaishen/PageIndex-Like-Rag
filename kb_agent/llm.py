@@ -213,6 +213,7 @@ def generate_json_object(
     *,
     timeout_seconds: Optional[int] = None,
     retry_count: Optional[int] = None,
+    max_tokens: Optional[int] = None,
     operation: str = "",
     stage: str = "",
 ) -> Dict[str, object]:
@@ -231,8 +232,13 @@ def generate_json_object(
     )
     timeout = options.timeout_seconds or deepseek_timeout_seconds()
     retries = max(0, options.retry_count if options.retry_count is not None else deepseek_json_retry_count())
+    request_max_tokens = (
+        min(resolved.max_tokens, max_tokens)
+        if max_tokens is not None and max_tokens > 0
+        else resolved.max_tokens
+    )
     started = time.time()
-    body = _chat_body(resolved, messages)
+    body = _chat_body(resolved, messages, max_tokens=max_tokens)
     try:
         content = _chat_completion_content(body, resolved, timeout=timeout, operation=options.operation, stage=options.stage)
     except LLMError as exc:
@@ -255,6 +261,7 @@ def generate_json_object(
             "error_type": "",
             "operation": options.operation,
             "stage": options.stage,
+            "max_tokens": request_max_tokens,
             "duration_ms": round((time.time() - started) * 1000, 3),
         }
         return payload
@@ -283,7 +290,7 @@ def generate_json_object(
         ]
         retry_error: Optional[LLMError] = None
         for retry_index in range(1, retries + 1):
-            retry_body = _chat_body(resolved, retry_messages)
+            retry_body = _chat_body(resolved, retry_messages, max_tokens=max_tokens)
             try:
                 retry_content = _chat_completion_content(
                     retry_body,
@@ -317,17 +324,26 @@ def generate_json_object(
             "error_type": "",
             "operation": options.operation,
             "stage": options.stage,
+            "max_tokens": request_max_tokens,
             "duration_ms": round((time.time() - started) * 1000, 3),
         }
         return payload
 
 
-def _chat_body(resolved: LLMSettings, messages: List[Dict[str, str]]) -> Dict[str, object]:
+def _chat_body(
+    resolved: LLMSettings,
+    messages: List[Dict[str, str]],
+    *,
+    max_tokens: Optional[int] = None,
+) -> Dict[str, object]:
+    output_tokens = resolved.max_tokens
+    if max_tokens is not None and max_tokens > 0:
+        output_tokens = min(output_tokens, max_tokens)
     body: Dict[str, object] = {
         "model": resolved.model,
         "messages": messages,
         "temperature": resolved.temperature,
-        "max_tokens": resolved.max_tokens,
+        "max_tokens": output_tokens,
         "stream": False,
     }
     thinking = os.environ.get("DEEPSEEK_THINKING", "").strip().lower()
